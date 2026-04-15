@@ -1,0 +1,54 @@
+{
+  "extensionName": {
+    "message": "AI MailPilot",
+    "description": "Name of the extension"
+  },
+  "extensionDescription": {
+    "message": "Intelligent email organization powered by local AI. Categorize, search, and chat with your inbox privately.",
+    "description": "Description of the extension"
+  },
+  "sidebarTitle": {
+    "message": "AI MailPilot",
+    "description": "Title shown in the sidebar"
+  },
+  "categoriesTab": {
+    "message": "Categories",
+    "description": "Label for the categories tab"
+  },
+  "chatTab": {
+    "message": "Chat",
+    "description": "Label for the chat tab"
+  },
+  "indexFolder": {
+    "message": "Index Folder",
+    "description": "Button to start indexing a folder"
+  },
+  "discoverCategories": {
+    "message": "Discover Categories",
+    "description": "Button to start clustering"
+  },
+  "askPlaceholder": {
+    "message": "Ask your inbox...",
+    "description": "Placeholder text in the chat input"
+  },
+  "noCategoriesYet": {
+    "message": "No categories yet. Index a folder to get started.",
+    "description": "Placeholder when no categories exist"
+  },
+  "connected": {
+    "message": "Connected",
+    "description": "Core server connection status"
+  },
+  "disconnected": {
+    "message": "Disconnected",
+    "description": "Core server disconnection status"
+  },
+  "categorizeEmail": {
+    "message": "Categorize with AI MailPilot",
+    "description": "Context menu item to categorize an email"
+  },
+  "findSimilar": {
+    "message": "Find Similar Emails",
+    "description": "Context menu item to find similar emails"
+  }
+}

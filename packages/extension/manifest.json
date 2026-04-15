@@ -1,0 +1,68 @@
+{
+  "manifest_version": 2,
+  "name": "AI MailPilot",
+  "version": "0.1.0",
+  "description": "Intelligent email organization powered by local AI. Categorize, search, and chat with your inbox privately.",
+  "author": "Muhammad Noor Ul Ain",
+  "homepage_url": "https://github.com/muhammadnoorulainroy/ai-mailpilot",
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ai-mailpilot@muhammadnoorulainroy",
+      "strict_min_version": "115.0"
+    }
+  },
+
+  "permissions": [
+    "messagesRead",
+    "messagesTagsList",
+    "messagesUpdate",
+    "messagesMove",
+    "accountsRead",
+    "storage"
+  ],
+
+  "background": {
+    "scripts": ["background/background.js"],
+    "type": "module"
+  },
+
+  "sidebar_action": {
+    "default_title": "AI MailPilot",
+    "default_panel": "sidebar/sidebar.html",
+    "default_icon": "assets/icons/mailpilot-32.png"
+  },
+
+  "browser_action": {
+    "default_title": "AI MailPilot",
+    "default_icon": {
+      "16": "assets/icons/mailpilot-16.png",
+      "32": "assets/icons/mailpilot-32.png"
+    }
+  },
+
+  "options_ui": {
+    "page": "settings/settings.html",
+    "open_in_tab": true
+  },
+
+  "menus": {
+    "categorize_email": {
+      "title": "Categorize with AI MailPilot",
+      "contexts": ["message_list"]
+    },
+    "find_similar": {
+      "title": "Find Similar Emails",
+      "contexts": ["message_list"]
+    }
+  },
+
+  "default_locale": "en",
+
+  "icons": {
+    "16": "assets/icons/mailpilot-16.png",
+    "32": "assets/icons/mailpilot-32.png",
+    "48": "assets/icons/mailpilot-48.png",
+    "128": "assets/icons/mailpilot-128.png"
+  }
+}

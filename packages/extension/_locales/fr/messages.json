@@ -1,0 +1,54 @@
+{
+  "extensionName": {
+    "message": "AI MailPilot",
+    "description": "Nom de l'extension"
+  },
+  "extensionDescription": {
+    "message": "Organisation intelligente des emails par IA locale. Categorisez, recherchez et discutez avec votre boite de reception en toute confidentialite.",
+    "description": "Description de l'extension"
+  },
+  "sidebarTitle": {
+    "message": "AI MailPilot",
+    "description": "Titre affiche dans la barre laterale"
+  },
+  "categoriesTab": {
+    "message": "Categories",
+    "description": "Libelle de l'onglet categories"
+  },
+  "chatTab": {
+    "message": "Discussion",
+    "description": "Libelle de l'onglet discussion"
+  },
+  "indexFolder": {
+    "message": "Indexer le dossier",
+    "description": "Bouton pour demarrer l'indexation d'un dossier"
+  },
+  "discoverCategories": {
+    "message": "Decouvrir les categories",
+    "description": "Bouton pour demarrer le clustering"
+  },
+  "askPlaceholder": {
+    "message": "Interrogez votre boite de reception...",
+    "description": "Texte indicatif dans le champ de discussion"
+  },
+  "noCategoriesYet": {
+    "message": "Aucune categorie pour le moment. Indexez un dossier pour commencer.",
+    "description": "Message affiche quand aucune categorie n'existe"
+  },
+  "connected": {
+    "message": "Connecte",
+    "description": "Etat de connexion au serveur"
+  },
+  "disconnected": {
+    "message": "Deconnecte",
+    "description": "Etat de deconnexion du serveur"
+  },
+  "categorizeEmail": {
+    "message": "Categoriser avec AI MailPilot",
+    "description": "Option du menu contextuel pour categoriser un email"
+  },
+  "findSimilar": {
+    "message": "Trouver des emails similaires",
+    "description": "Option du menu contextuel pour trouver des emails similaires"
+  }
+}

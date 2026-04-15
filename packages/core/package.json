@@ -1,0 +1,32 @@
+{
+  "name": "@ai-mailpilot/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI MailPilot Core Server - embedding engine, clustering, categorization, RAG, MCP interface",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@ai-mailpilot/shared": "*",
+    "fastify": "^5.0.0",
+    "@fastify/cors": "^10.0.0",
+    "imapflow": "^1.0.0",
+    "better-sqlite3": "^11.0.0",
+    "mailparser": "^3.7.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "vitest": "^2.0.0"
+  },
+  "license": "MIT"
+}

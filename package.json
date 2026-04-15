@@ -1,0 +1,49 @@
+{
+  "name": "ai-mailpilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI-powered email intelligence platform - semantic organization, RAG chat, and MCP interface for Thunderbird, powered by local AI.",
+  "workspaces": [
+    "packages/shared",
+    "packages/core",
+    "packages/extension",
+    "packages/cli"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev:core": "npm run dev -w @ai-mailpilot/core",
+    "dev:extension": "npm run dev -w @ai-mailpilot/extension",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "eslint packages/shared/src packages/core/src packages/extension/src",
+    "lint:fix": "eslint packages/shared/src packages/core/src packages/extension/src --fix",
+    "format": "prettier --write packages/shared/src packages/core/src packages/extension/src",
+    "format:check": "prettier --check packages/shared/src packages/core/src packages/extension/src",
+    "clean": "npm run clean --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "eslint": "^9.0.0",
+    "@eslint/js": "^9.0.0",
+    "typescript-eslint": "^8.0.0",
+    "prettier": "^3.3.0",
+    "rimraf": "^6.0.0"
+  },
+  "keywords": [
+    "thunderbird",
+    "email",
+    "ai",
+    "local-ai",
+    "ollama",
+    "mcp",
+    "embeddings",
+    "clustering",
+    "rag",
+    "privacy"
+  ],
+  "author": "Muhammad Noor Ul Ain",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
