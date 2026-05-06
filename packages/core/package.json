@@ -15,11 +15,13 @@
   },
   "dependencies": {
     "@ai-mailpilot/shared": "*",
-    "fastify": "^5.0.0",
     "@fastify/cors": "^10.0.0",
-    "imapflow": "^1.0.0",
     "better-sqlite3": "^11.0.0",
-    "mailparser": "^3.7.0"
+    "env-paths": "^4.0.0",
+    "fastify": "^5.0.0",
+    "pino": "^10.3.1",
+    "sqlite-vec": "^0.1.9",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
