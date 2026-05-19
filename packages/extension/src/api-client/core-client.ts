@@ -6,6 +6,9 @@ import type {
   CreateAccountRequest,
   PushEmailsRequest,
   PushEmailsResponse,
+  EmbedRunRequest,
+  EmbedRunResponse,
+  EmbedProgressResponse,
 } from '@ai-mailpilot/shared';
 
 const TOKEN_KEY = 'core_auth_token';
@@ -77,6 +80,14 @@ export class CoreClient {
 
   pushEmails(req: PushEmailsRequest): Promise<PushEmailsResponse> {
     return this.request('/emails/push', { method: 'POST', body: JSON.stringify(req) });
+  }
+
+  runEmbed(req: EmbedRunRequest): Promise<EmbedRunResponse> {
+    return this.request('/embed/run', { method: 'POST', body: JSON.stringify(req) });
+  }
+
+  embedProgress(): Promise<EmbedProgressResponse> {
+    return this.request('/embed/progress');
   }
 }
 

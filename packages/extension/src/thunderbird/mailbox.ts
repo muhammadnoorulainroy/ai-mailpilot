@@ -8,6 +8,12 @@ export interface MailboxAccount {
   kind: AccountKind;
 }
 
+export interface MailboxFolder {
+  path: string;
+  name: string;
+  type?: string;
+}
+
 export async function listAccounts(): Promise<MailboxAccount[]> {
   const tbAccounts = await browser.accounts.list(true);
   return tbAccounts
@@ -30,12 +36,6 @@ function guessKind(address: string): AccountKind {
   if (/\b(edu|ac\.|mines-|univ-|cnrs|inria)\b/.test(domain)) return 'institutional';
   if (/\b(gmail|yahoo|hotmail|outlook|protonmail|icloud)\b/.test(domain)) return 'personal';
   return 'work';
-}
-
-export interface MailboxFolder {
-  path: string;
-  name: string;
-  type?: string;
 }
 
 export async function listFolders(accountTbId: string): Promise<MailboxFolder[]> {
@@ -71,23 +71,59 @@ export async function fetchEmailsFromFolder(
   let page = await browser.messages.list(folder);
 
   while (items.length < maxMessages) {
-    for (const m of page.messages) {
+    for (const header of page.messages) {
       if (items.length >= maxMessages) break;
+
+      const { body, format } = await fetchBody(header.id);
+
       items.push({
-        messageId: m.headerMessageId,
+        messageId: header.headerMessageId,
         folder: folderPath,
-        subject: m.subject,
-        fromAddr: m.author,
-        date: m.date.getTime(),
+        subject: header.subject,
+        fromAddr: header.author,
+        date: header.date.getTime(),
         hasAttachments: false,
+        body,
+        bodyFormat: format,
       });
     }
+
     if (!page.id) break;
     page = await browser.messages.continueList(page.id);
     if (page.messages.length === 0) break;
   }
 
   return items;
+}
+
+async function fetchBody(
+  messageId: number,
+): Promise<{ body: string | undefined; format: 'text' | 'html' | undefined }> {
+  try {
+    const full = await browser.messages.getFull(messageId);
+    const plain = extractBody(full, 'text/plain');
+    if (plain) return { body: plain, format: 'text' };
+
+    const html = extractBody(full, 'text/html');
+    if (html) return { body: html, format: 'html' };
+
+    return { body: undefined, format: undefined };
+  } catch {
+    return { body: undefined, format: undefined };
+  }
+}
+
+function extractBody(part: TbMessagePart, mimeType: string): string | undefined {
+  if (part.contentType === mimeType && typeof part.body === 'string' && part.body.length > 0) {
+    return part.body;
+  }
+  if (part.parts) {
+    for (const sub of part.parts) {
+      const found = extractBody(sub, mimeType);
+      if (found) return found;
+    }
+  }
+  return undefined;
 }
 
 function findFolder(folders: Array<{ path: string; subFolders?: unknown }>, path: string): unknown {

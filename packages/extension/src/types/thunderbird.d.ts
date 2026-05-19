@@ -34,6 +34,14 @@ interface TbMessageList {
   messages: TbMessageHeader[];
 }
 
+interface TbMessagePart {
+  contentType?: string;
+  body?: string;
+  headers?: Record<string, string[]>;
+  partName?: string;
+  parts?: TbMessagePart[];
+}
+
 declare namespace browser {
   namespace menus {
     function create(properties: {
@@ -65,10 +73,7 @@ declare namespace browser {
   namespace messages {
     function list(folder: TbFolder): Promise<TbMessageList>;
     function continueList(messageListId: string): Promise<TbMessageList>;
-    function getFull(messageId: number): Promise<{
-      headers: Record<string, string[]>;
-      parts?: Array<{ body?: string; parts?: unknown[] }>;
-    }>;
+    function getFull(messageId: number): Promise<TbMessagePart>;
     function update(messageId: number, properties: Record<string, unknown>): Promise<void>;
     function move(messageIds: number[], destination: TbFolder): Promise<void>;
   }
