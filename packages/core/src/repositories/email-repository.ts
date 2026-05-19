@@ -1,5 +1,7 @@
 import type { Database } from 'better-sqlite3';
 
+export type EmailBodyFormat = 'text' | 'html';
+
 export interface EmailRow {
   messageId: string;
   accountId: string;
@@ -8,6 +10,8 @@ export interface EmailRow {
   fromAddr: string | null;
   date: number | null;
   hasAttachments: boolean;
+  body: string | null;
+  bodyFormat: EmailBodyFormat;
   indexedAt: number;
 }
 
@@ -19,6 +23,8 @@ export interface UpsertEmailInput {
   fromAddr?: string;
   date?: number;
   hasAttachments?: boolean;
+  body?: string;
+  bodyFormat?: EmailBodyFormat;
 }
 
 export interface ListEmailsOptions {
@@ -27,6 +33,19 @@ export interface ListEmailsOptions {
   limit?: number;
   offset?: number;
   sinceDate?: number;
+}
+
+interface EmailDbRow {
+  message_id: string;
+  account_id: string;
+  folder: string;
+  subject: string | null;
+  from_addr: string | null;
+  date: number | null;
+  has_attachments: number;
+  body: string | null;
+  body_format: string | null;
+  indexed_at: number;
 }
 
 export class EmailRepository {
@@ -42,19 +61,23 @@ export class EmailRepository {
       fromAddr: input.fromAddr ?? null,
       date: input.date ?? null,
       hasAttachments: input.hasAttachments ?? false,
+      body: input.body ?? null,
+      bodyFormat: input.bodyFormat ?? 'text',
       indexedAt: now,
     };
 
     this.db
       .prepare(
-        `INSERT INTO emails (message_id, account_id, folder, subject, from_addr, date, has_attachments, indexed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO emails (message_id, account_id, folder, subject, from_addr, date, has_attachments, body, body_format, indexed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (message_id, account_id) DO UPDATE SET
            folder = excluded.folder,
            subject = excluded.subject,
            from_addr = excluded.from_addr,
            date = excluded.date,
-           has_attachments = excluded.has_attachments`,
+           has_attachments = excluded.has_attachments,
+           body = COALESCE(excluded.body, emails.body),
+           body_format = COALESCE(excluded.body_format, emails.body_format)`,
       )
       .run(
         row.messageId,
@@ -64,6 +87,8 @@ export class EmailRepository {
         row.fromAddr,
         row.date,
         row.hasAttachments ? 1 : 0,
+        row.body,
+        row.bodyFormat,
         row.indexedAt,
       );
 
@@ -82,23 +107,8 @@ export class EmailRepository {
 
   findById(messageId: string, accountId: string): EmailRow | null {
     const row = this.db
-      .prepare(
-        `SELECT message_id, account_id, folder, subject, from_addr, date, has_attachments, indexed_at
-         FROM emails WHERE message_id = ? AND account_id = ?`,
-      )
-      .get(messageId, accountId) as
-      | {
-          message_id: string;
-          account_id: string;
-          folder: string;
-          subject: string | null;
-          from_addr: string | null;
-          date: number | null;
-          has_attachments: number;
-          indexed_at: number;
-        }
-      | undefined;
-
+      .prepare(this.selectSql('WHERE message_id = ? AND account_id = ?'))
+      .get(messageId, accountId) as EmailDbRow | undefined;
     return row ? this.fromRow(row) : null;
   }
 
@@ -122,31 +132,61 @@ export class EmailRepository {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, account_id, folder, subject, from_addr, date, has_attachments, indexed_at
-         FROM emails
-         WHERE ${filters.join(' AND ')}
+        `${this.selectSql(`WHERE ${filters.join(' AND ')}`)}
          ORDER BY COALESCE(date, indexed_at) DESC
          LIMIT ? OFFSET ?`,
       )
-      .all(...params) as Array<{
-      message_id: string;
-      account_id: string;
-      folder: string;
-      subject: string | null;
-      from_addr: string | null;
-      date: number | null;
-      has_attachments: number;
-      indexed_at: number;
-    }>;
+      .all(...params) as EmailDbRow[];
 
     return rows.map((r) => this.fromRow(r));
+  }
+
+  /**
+   * Returns emails that have a body but no embedding for the given model.
+   * Used by the embedding orchestrator.
+   */
+  findUnembedded(accountId: string, modelId: string, limit = 50): EmailRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT e.message_id, e.account_id, e.folder, e.subject, e.from_addr, e.date,
+                e.has_attachments, e.body, e.body_format, e.indexed_at
+           FROM emails e
+           LEFT JOIN email_embedding_index ei
+             ON ei.message_id = e.message_id
+            AND ei.account_id = e.account_id
+            AND ei.model_id = ?
+          WHERE e.account_id = ?
+            AND e.body IS NOT NULL
+            AND ei.rowid IS NULL
+          ORDER BY COALESCE(e.date, e.indexed_at) DESC
+          LIMIT ?`,
+      )
+      .all(modelId, accountId, limit) as EmailDbRow[];
+
+    return rows.map((r) => this.fromRow(r));
+  }
+
+  countUnembedded(accountId: string, modelId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM emails e
+          LEFT JOIN email_embedding_index ei
+            ON ei.message_id = e.message_id
+           AND ei.account_id = e.account_id
+           AND ei.model_id = ?
+         WHERE e.account_id = ?
+           AND e.body IS NOT NULL
+           AND ei.rowid IS NULL`,
+      )
+      .get(modelId, accountId) as { c: number };
+    return row.c;
   }
 
   count(accountId: string, folder?: string): number {
     const sql = folder
       ? 'SELECT COUNT(*) as c FROM emails WHERE account_id = ? AND folder = ?'
       : 'SELECT COUNT(*) as c FROM emails WHERE account_id = ?';
-    const params: (string | undefined)[] = folder ? [accountId, folder] : [accountId];
+    const params: string[] = folder ? [accountId, folder] : [accountId];
     const row = this.db.prepare(sql).get(...params) as { c: number };
     return row.c;
   }
@@ -158,16 +198,14 @@ export class EmailRepository {
     return result.changes > 0;
   }
 
-  private fromRow(row: {
-    message_id: string;
-    account_id: string;
-    folder: string;
-    subject: string | null;
-    from_addr: string | null;
-    date: number | null;
-    has_attachments: number;
-    indexed_at: number;
-  }): EmailRow {
+  private selectSql(whereClause: string): string {
+    return `SELECT message_id, account_id, folder, subject, from_addr, date,
+                   has_attachments, body, body_format, indexed_at
+              FROM emails
+              ${whereClause}`;
+  }
+
+  private fromRow(row: EmailDbRow): EmailRow {
     return {
       messageId: row.message_id,
       accountId: row.account_id,
@@ -176,6 +214,8 @@ export class EmailRepository {
       fromAddr: row.from_addr,
       date: row.date,
       hasAttachments: row.has_attachments === 1,
+      body: row.body,
+      bodyFormat: (row.body_format as EmailBodyFormat | null) ?? 'text',
       indexedAt: row.indexed_at,
     };
   }

@@ -139,4 +139,14 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'email_body',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE emails ADD COLUMN body TEXT;
+        ALTER TABLE emails ADD COLUMN body_format TEXT DEFAULT 'text';
+      `);
+    },
+  },
 ];
