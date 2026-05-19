@@ -7,17 +7,22 @@ import { createLlmClient, type LlmClient } from './llm/client.js';
 import { AccountRepository } from './repositories/account-repository.js';
 import { EmailRepository } from './repositories/email-repository.js';
 import { EmbeddingRepository } from './repositories/embedding-repository.js';
+import { TriageRepository } from './repositories/triage-repository.js';
 import { EmbeddingOrchestrator } from './services/embedding-orchestrator.js';
+import { TriageService } from './services/triage-service.js';
+import { TriageOrchestrator } from './services/triage-orchestrator.js';
 import { getLogger } from './util/logger.js';
 
 export interface Repositories {
   accounts: AccountRepository;
   emails: EmailRepository;
   embeddings: EmbeddingRepository;
+  triage: TriageRepository;
 }
 
 export interface Services {
   embedding: EmbeddingOrchestrator;
+  triage: TriageOrchestrator;
 }
 
 export interface AppContext {
@@ -39,10 +44,14 @@ export function buildContext(): AppContext {
     accounts: new AccountRepository(db),
     emails: new EmailRepository(db),
     embeddings: new EmbeddingRepository(db),
+    triage: new TriageRepository(db),
   };
+
+  const triageService = new TriageService(llm, logger);
 
   const services: Services = {
     embedding: new EmbeddingOrchestrator(llm, repos.emails, repos.embeddings, logger),
+    triage: new TriageOrchestrator(triageService, repos.triage, logger),
   };
 
   logger.info({ llmBaseUrl: config.llm.baseUrl }, 'context initialized');

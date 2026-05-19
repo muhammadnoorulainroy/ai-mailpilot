@@ -92,6 +92,37 @@ export interface EmbedProgressResponse {
   completedAt?: number;
 }
 
+export type TriageBucket = 'urgent' | 'summarize' | 'spam' | 'personal';
+
+export interface TriageRunRequest {
+  accountId: string;
+  modelId?: string;
+}
+
+export interface TriageRunResponse {
+  status: 'started' | 'already_running';
+  pending: number;
+  modelId: string;
+}
+
+export interface TriageProgressResponse {
+  status: 'idle' | 'running' | 'completed' | 'error';
+  accountId: string | null;
+  modelId: string | null;
+  total: number;
+  processed: number;
+  failed: number;
+  buckets: Record<TriageBucket, number>;
+  error?: string;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+export interface TriageSummaryResponse {
+  accountId: string;
+  buckets: Record<TriageBucket, number>;
+}
+
 export interface IndexFolderRequest {
   folder: string;
 }

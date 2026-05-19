@@ -6,6 +6,7 @@ import { registerAccountRoutes } from './routes/accounts.js';
 import { registerEmailRoutes } from './routes/emails.js';
 import { registerConfigRoutes } from './routes/config.js';
 import { registerEmbedRoutes } from './routes/embed.js';
+import { registerTriageRoutes } from './routes/triage.js';
 
 const ctx = buildContext();
 
@@ -46,6 +47,7 @@ await server.register(
     await registerEmailRoutes(scoped, ctx);
     await registerConfigRoutes(scoped, ctx);
     await registerEmbedRoutes(scoped, ctx);
+    await registerTriageRoutes(scoped, ctx);
   },
   { prefix: API_PREFIX },
 );
