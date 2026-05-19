@@ -19,7 +19,8 @@
     "messagesUpdate",
     "messagesMove",
     "accountsRead",
-    "storage"
+    "storage",
+    "menus"
   ],
 
   "background": {
@@ -27,14 +28,8 @@
     "type": "module"
   },
 
-  "sidebar_action": {
-    "default_title": "AI MailPilot",
-    "default_panel": "sidebar/sidebar.html",
-    "default_icon": "assets/icons/mailpilot-32.png"
-  },
-
   "browser_action": {
-    "default_title": "AI MailPilot",
+    "default_title": "AI MailPilot - Sync inbox",
     "default_icon": {
       "16": "assets/icons/mailpilot-16.png",
       "32": "assets/icons/mailpilot-32.png"
@@ -42,19 +37,8 @@
   },
 
   "options_ui": {
-    "page": "settings/settings.html",
+    "page": "sidebar/sidebar.html",
     "open_in_tab": true
-  },
-
-  "menus": {
-    "categorize_email": {
-      "title": "Categorize with AI MailPilot",
-      "contexts": ["message_list"]
-    },
-    "find_similar": {
-      "title": "Find Similar Emails",
-      "contexts": ["message_list"]
-    }
   },
 
   "default_locale": "en",
