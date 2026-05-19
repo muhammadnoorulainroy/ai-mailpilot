@@ -1,5 +1,5 @@
 export interface ModelPreset {
-  id: 'lightweight' | 'recommended' | 'maximum' | 'custom';
+  id: 'lightweight' | 'recommended' | 'institutional' | 'maximum' | 'custom';
   label: string;
   description: string;
   embeddingModel: string;
@@ -28,7 +28,7 @@ export interface ImapConfig {
 export const DEFAULT_CONFIG: AppConfig = {
   ollamaUrl: 'http://localhost:11434',
   embeddingModel: 'bge-m3',
-  generationModel: 'mistral:7b',
+  generationModel: 'qwen3:8b',
   autoIndex: false,
   indexedFolders: ['INBOX'],
   imap: {

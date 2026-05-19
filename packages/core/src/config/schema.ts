@@ -12,7 +12,7 @@ export const LlmConfigSchema = z.object({
   baseUrl: z.string().url().default('http://localhost:11434/v1'),
   apiKey: z.string().optional(),
   embeddingModel: z.string().default('bge-m3'),
-  generationModel: z.string().default('mistral:7b'),
+  generationModel: z.string().default('qwen3:8b'),
   embeddingDimensions: z.number().int().positive().default(1024),
 });
 
