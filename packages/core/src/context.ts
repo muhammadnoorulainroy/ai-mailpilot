@@ -4,13 +4,21 @@ import { loadConfig } from './config/config.js';
 import type { AppConfig } from './config/schema.js';
 import { openDatabase } from './db/database.js';
 import { createLlmClient, type LlmClient } from './llm/client.js';
+import { AccountRepository } from './repositories/account-repository.js';
+import { EmailRepository } from './repositories/email-repository.js';
 import { getLogger } from './util/logger.js';
+
+export interface Repositories {
+  accounts: AccountRepository;
+  emails: EmailRepository;
+}
 
 export interface AppContext {
   config: AppConfig;
   db: Database;
   llm: LlmClient;
   logger: Logger;
+  repos: Repositories;
 }
 
 export function buildContext(): AppContext {
@@ -19,7 +27,12 @@ export function buildContext(): AppContext {
   const db = openDatabase();
   const llm = createLlmClient(config.llm);
 
+  const repos: Repositories = {
+    accounts: new AccountRepository(db),
+    emails: new EmailRepository(db),
+  };
+
   logger.info({ llmBaseUrl: config.llm.baseUrl }, 'context initialized');
 
-  return { config, db, llm, logger };
+  return { config, db, llm, logger, repos };
 }
