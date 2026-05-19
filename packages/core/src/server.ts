@@ -2,6 +2,9 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { CORE_SERVER_PORT, CORE_SERVER_HOST, API_PREFIX } from '@ai-mailpilot/shared';
 import { buildContext } from './context.js';
+import { registerAccountRoutes } from './routes/accounts.js';
+import { registerEmailRoutes } from './routes/emails.js';
+import { registerConfigRoutes } from './routes/config.js';
 
 const ctx = buildContext();
 
@@ -35,6 +38,15 @@ server.get(`${API_PREFIX}/health`, async () => {
     locale: ctx.config.locale,
   };
 });
+
+await server.register(
+  async (scoped) => {
+    await registerAccountRoutes(scoped, ctx);
+    await registerEmailRoutes(scoped, ctx);
+    await registerConfigRoutes(scoped, ctx);
+  },
+  { prefix: API_PREFIX },
+);
 
 try {
   await server.listen({ port: CORE_SERVER_PORT, host: CORE_SERVER_HOST });

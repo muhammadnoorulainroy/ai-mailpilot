@@ -5,8 +5,36 @@ import type { EmailSummary } from './email.js';
 export interface HealthResponse {
   status: 'ok' | 'error';
   version: string;
-  ollama: { connected: boolean; models: string[] };
-  imap: { connected: boolean };
+  llm: {
+    connected: boolean;
+    models: string[];
+    baseUrl: string;
+  };
+  locale: string;
+}
+
+export type AccountKind = 'personal' | 'work' | 'institutional';
+
+export interface AccountDto {
+  id: string;
+  address: string;
+  displayName: string | null;
+  kind: AccountKind;
+  createdAt: number;
+}
+
+export interface CreateAccountRequest {
+  address: string;
+  displayName?: string;
+  kind: AccountKind;
+}
+
+export interface AccountListResponse {
+  accounts: AccountDto[];
+}
+
+export interface AccountResponse {
+  account: AccountDto;
 }
 
 export interface FolderListResponse {
@@ -18,6 +46,26 @@ export interface FolderInfo {
   path: string;
   totalMessages: number;
   unreadMessages: number;
+}
+
+export interface PushEmailItem {
+  messageId: string;
+  folder: string;
+  subject?: string;
+  fromAddr?: string;
+  date?: number;
+  body?: string;
+  hasAttachments?: boolean;
+}
+
+export interface PushEmailsRequest {
+  accountId: string;
+  emails: PushEmailItem[];
+}
+
+export interface PushEmailsResponse {
+  inserted: number;
+  total: number;
 }
 
 export interface IndexFolderRequest {
