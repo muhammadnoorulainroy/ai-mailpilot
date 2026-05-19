@@ -6,11 +6,18 @@ import { openDatabase } from './db/database.js';
 import { createLlmClient, type LlmClient } from './llm/client.js';
 import { AccountRepository } from './repositories/account-repository.js';
 import { EmailRepository } from './repositories/email-repository.js';
+import { EmbeddingRepository } from './repositories/embedding-repository.js';
+import { EmbeddingOrchestrator } from './services/embedding-orchestrator.js';
 import { getLogger } from './util/logger.js';
 
 export interface Repositories {
   accounts: AccountRepository;
   emails: EmailRepository;
+  embeddings: EmbeddingRepository;
+}
+
+export interface Services {
+  embedding: EmbeddingOrchestrator;
 }
 
 export interface AppContext {
@@ -19,6 +26,7 @@ export interface AppContext {
   llm: LlmClient;
   logger: Logger;
   repos: Repositories;
+  services: Services;
 }
 
 export function buildContext(): AppContext {
@@ -30,9 +38,14 @@ export function buildContext(): AppContext {
   const repos: Repositories = {
     accounts: new AccountRepository(db),
     emails: new EmailRepository(db),
+    embeddings: new EmbeddingRepository(db),
+  };
+
+  const services: Services = {
+    embedding: new EmbeddingOrchestrator(llm, repos.emails, repos.embeddings, logger),
   };
 
   logger.info({ llmBaseUrl: config.llm.baseUrl }, 'context initialized');
 
-  return { config, db, llm, logger, repos };
+  return { config, db, llm, logger, repos, services };
 }

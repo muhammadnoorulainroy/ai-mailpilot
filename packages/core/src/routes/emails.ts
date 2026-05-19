@@ -9,6 +9,7 @@ const PushEmailItem = z.object({
   fromAddr: z.string().optional(),
   date: z.number().int().optional(),
   body: z.string().optional(),
+  bodyFormat: z.enum(['text', 'html']).optional(),
   hasAttachments: z.boolean().optional(),
 });
 
@@ -46,6 +47,8 @@ export async function registerEmailRoutes(app: FastifyInstance, ctx: AppContext)
       fromAddr: e.fromAddr,
       date: e.date,
       hasAttachments: e.hasAttachments,
+      body: e.body,
+      bodyFormat: e.bodyFormat,
     }));
 
     const inserted = ctx.repos.emails.upsertBatch(items);

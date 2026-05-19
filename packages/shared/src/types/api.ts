@@ -55,6 +55,7 @@ export interface PushEmailItem {
   fromAddr?: string;
   date?: number;
   body?: string;
+  bodyFormat?: 'text' | 'html';
   hasAttachments?: boolean;
 }
 
@@ -66,6 +67,29 @@ export interface PushEmailsRequest {
 export interface PushEmailsResponse {
   inserted: number;
   total: number;
+}
+
+export interface EmbedRunRequest {
+  accountId: string;
+  modelId?: string;
+}
+
+export interface EmbedRunResponse {
+  status: 'started' | 'already_running';
+  pending: number;
+  modelId: string;
+}
+
+export interface EmbedProgressResponse {
+  status: 'idle' | 'running' | 'completed' | 'error';
+  accountId: string | null;
+  modelId: string | null;
+  total: number;
+  processed: number;
+  failed: number;
+  error?: string;
+  startedAt?: number;
+  completedAt?: number;
 }
 
 export interface IndexFolderRequest {
