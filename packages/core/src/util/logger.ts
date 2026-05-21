@@ -1,8 +1,16 @@
+/**
+ * Provides the shared pino logger used across the core package, writing to the
+ * log file and, outside production, to stdout.
+ */
 import pino, { type Logger } from 'pino';
 import { LOG_PATH, ensureDirs } from './paths.js';
 
 let _logger: Logger | null = null;
 
+/**
+ * Returns the shared pino logger, creating it on first call. Writes to the log
+ * file and also to stdout outside production.
+ */
 export function getLogger(): Logger {
   if (_logger) return _logger;
 
