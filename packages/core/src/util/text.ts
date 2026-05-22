@@ -4,6 +4,8 @@ const WHITESPACE = /\s+/g;
 const QUOTED_REPLY = /^>.*$/gm;
 const SIGNATURE_MARKER = /^-- ?$\n[\s\S]*$/m;
 
+const PRE_TRUNCATE_FACTOR = 4;
+
 export function stripHtml(html: string): string {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
@@ -16,8 +18,16 @@ export function normalizeWhitespace(text: string): string {
   return text.replace(WHITESPACE, ' ').trim();
 }
 
+function safeSlice(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let end = maxChars;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
 export function stripQuotesAndSignature(text: string): string {
-  return text.replace(SIGNATURE_MARKER, '').replace(QUOTED_REPLY, '');
+  return text.replace(/\r\n?/g, '\n').replace(SIGNATURE_MARKER, '').replace(QUOTED_REPLY, '');
 }
 
 export interface PreprocessOptions {
@@ -26,32 +36,36 @@ export interface PreprocessOptions {
   keepQuotes?: boolean;
 }
 
-export function preprocessForEmbedding(
-  raw: string,
-  opts: PreprocessOptions = {},
-): string {
+export function preprocessForEmbedding(raw: string, opts: PreprocessOptions = {}): string {
   const format = opts.format ?? 'text';
   const maxChars = opts.maxChars ?? 8000;
   const keepQuotes = opts.keepQuotes ?? false;
 
-  let text = format === 'html' ? stripHtml(raw) : raw;
+  let text =
+    raw.length > maxChars * PRE_TRUNCATE_FACTOR ? safeSlice(raw, maxChars * PRE_TRUNCATE_FACTOR) : raw;
+
+  if (format === 'html') text = stripHtml(text);
   if (!keepQuotes) text = stripQuotesAndSignature(text);
   text = normalizeWhitespace(text);
 
-  if (text.length > maxChars) text = text.slice(0, maxChars);
-  return text;
+  return safeSlice(text, maxChars);
 }
 
-export function buildEmbeddingInput(parts: {
-  subject?: string | null;
-  fromAddr?: string | null;
-  body?: string | null;
-  bodyFormat?: 'text' | 'html';
-}): string {
+const EMBEDDING_BODY_CHARS = 8000;
+
+export function buildEmbeddingInput(
+  parts: {
+    subject?: string | null;
+    fromAddr?: string | null;
+    body?: string | null;
+    bodyFormat?: 'text' | 'html';
+  },
+  maxChars: number = EMBEDDING_BODY_CHARS,
+): string {
   const subject = parts.subject?.trim() ?? '';
   const from = parts.fromAddr?.trim() ?? '';
   const body = parts.body
-    ? preprocessForEmbedding(parts.body, { format: parts.bodyFormat })
+    ? preprocessForEmbedding(parts.body, { format: parts.bodyFormat, maxChars })
     : '';
 
   const lines: string[] = [];
