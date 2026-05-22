@@ -419,4 +419,38 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 16,
+    name: 'triage_metadata_and_resolution',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE triage ADD COLUMN metadata TEXT;
+        ALTER TABLE triage ADD COLUMN action_required INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE triage ADD COLUMN deadline_at INTEGER;
+        ALTER TABLE triage ADD COLUMN dismissed_at INTEGER;
+        ALTER TABLE triage ADD COLUMN done_at INTEGER;
+        ALTER TABLE triage ADD COLUMN snoozed_until INTEGER;
+      `);
+    },
+  },
+  {
+    version: 17,
+    name: 'email_assistant_summaries',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE email_assistant_summaries (
+          message_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          provider TEXT NOT NULL CHECK (provider IN ('local', 'cloud')),
+          summary_json TEXT NOT NULL,
+          generated_at INTEGER NOT NULL,
+          PRIMARY KEY (message_id, account_id),
+          FOREIGN KEY (message_id, account_id) REFERENCES emails(message_id, account_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_email_assistant_account ON email_assistant_summaries(account_id);
+      `);
+    },
+  },
 ];
