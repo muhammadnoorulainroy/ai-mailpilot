@@ -76,6 +76,31 @@ export function buildEmbeddingInput(
   return lines.join('\n');
 }
 
+export function sanitizeFtsQuery(raw: string): string {
+  const tokens = raw.toLowerCase().match(/[\p{L}\p{N}]{2,}/gu);
+  if (!tokens) return '';
+  const unique = [...new Set(tokens)].slice(0, 16);
+  return unique.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+}
+
+export function normalizeForMatch(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+export function normalizeFilename(s: string): string {
+  return normalizeForMatch(
+    s
+      .normalize('NFD')
+      .replace(/\p{M}/gu, '')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2'),
+  );
+}
+
 function decodeEntity(entity: string): string {
   if (entity === '&amp;') return '&';
   if (entity === '&lt;') return '<';
