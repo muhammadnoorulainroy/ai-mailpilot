@@ -1,3 +1,12 @@
+/**
+ * Shared configuration type definitions, including model preset options used
+ * to pair embedding and generation models for the app.
+ */
+
+/**
+ * Predefined model configuration option pairing an embedding and generation
+ * model, with the minimum RAM needed to run them.
+ */
 export interface ModelPreset {
   id: 'lightweight' | 'recommended' | 'institutional' | 'maximum' | 'custom';
   label: string;
@@ -6,37 +15,3 @@ export interface ModelPreset {
   generationModel: string;
   minRamGb: number;
 }
-
-export interface AppConfig {
-  ollamaUrl: string;
-  embeddingModel: string;
-  generationModel: string;
-  autoIndex: boolean;
-  indexedFolders: string[];
-  imap: ImapConfig;
-  locale: 'en' | 'fr';
-}
-
-export interface ImapConfig {
-  host: string;
-  port: number;
-  user: string;
-  password: string;
-  tls: boolean;
-}
-
-export const DEFAULT_CONFIG: AppConfig = {
-  ollamaUrl: 'http://localhost:11434',
-  embeddingModel: 'bge-m3',
-  generationModel: 'qwen3:8b',
-  autoIndex: false,
-  indexedFolders: ['INBOX'],
-  imap: {
-    host: '',
-    port: 993,
-    user: '',
-    password: '',
-    tls: true,
-  },
-  locale: 'en',
-};

@@ -1,3 +1,7 @@
+/**
+ * Shared application constants, including server endpoints, model presets,
+ * embedding requirements, and clustering and retrieval defaults.
+ */
 import type { ModelPreset } from './types/config.js';
 
 export const CORE_SERVER_PORT = 3420;
@@ -6,19 +10,27 @@ export const CORE_SERVER_URL = `http://${CORE_SERVER_HOST}:${CORE_SERVER_PORT}`;
 export const OLLAMA_DEFAULT_URL = 'http://localhost:11434';
 export const API_PREFIX = '/api/v1';
 
+/**
+ * Required dimension for embedding vectors stored in sqlite-vec.
+ * All presets must use a 1024-dim model or insertion fails.
+ */
+export const REQUIRED_EMBEDDING_DIMENSIONS = 1024;
+
 export const MODEL_PRESETS: ModelPreset[] = [
   {
     id: 'lightweight',
-    label: 'Lightweight',
-    description: 'For machines with limited resources (4 GB RAM). Faster but less accurate.',
-    embeddingModel: 'nomic-embed-text',
+    label: 'Lightweight (smaller LLM)',
+    description:
+      'Smaller generation model for machines with limited RAM. Embedding still uses bge-m3 (required for 1024-dim storage).',
+    embeddingModel: 'bge-m3',
     generationModel: 'qwen3:4b',
-    minRamGb: 4,
+    minRamGb: 6,
   },
   {
     id: 'recommended',
     label: 'Recommended',
-    description: 'Best balance of quality and performance. Strong multilingual and structured output.',
+    description:
+      'Best balance of quality and performance. Strong multilingual and structured output.',
     embeddingModel: 'bge-m3',
     generationModel: 'qwen3:8b',
     minRamGb: 8,
@@ -26,7 +38,8 @@ export const MODEL_PRESETS: ModelPreset[] = [
   {
     id: 'institutional',
     label: 'Institutional (Mistral)',
-    description: 'Aligned with Mistral AI institutional partnership. Strong French language quality.',
+    description:
+      'Aligned with Mistral AI institutional partnership. Strong French language quality.',
     embeddingModel: 'bge-m3',
     generationModel: 'mistral:7b',
     minRamGb: 8,
@@ -42,7 +55,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
   {
     id: 'custom',
     label: 'Custom',
-    description: 'Choose your own models from Ollama.',
+    description: 'Choose your own models from Ollama. Embedding model MUST output 1024 dimensions.',
     embeddingModel: '',
     generationModel: '',
     minRamGb: 0,
