@@ -235,6 +235,58 @@ export interface TriageResolveResponse {
   ok: boolean;
 }
 
+/** Status of one attachment processed for the email assistant. */
+export interface EmailAssistantAttachmentDto {
+  filename: string;
+  status: 'pending' | 'extracted' | 'empty' | 'unsupported' | 'error' | 'not_indexed';
+  included: boolean;
+}
+
+/** Generated summary of a single email plus its attachments. */
+export interface EmailAssistantSummaryDto {
+  accountId: string;
+  messageId: string;
+  subject: string | null;
+  fromAddr: string | null;
+  date: number | null;
+  hasAttachments: boolean;
+  modelId: string;
+  provider: 'local' | 'cloud';
+  generatedAt: number;
+  cached: boolean;
+  summary: string;
+  keyPoints: string[];
+  actionRequired: boolean;
+  needsReply: boolean;
+  deadline: string | null;
+  suggestedAction: string | null;
+  attachmentSummary: string | null;
+  attachments: EmailAssistantAttachmentDto[];
+}
+
+/** Response wrapping an email assistant summary. */
+export interface EmailAssistantSummaryResponse {
+  summary: EmailAssistantSummaryDto;
+}
+
+/** Request to draft a reply for an email, with optional guidance and cloud consent. */
+export interface EmailAssistantDraftRequest {
+  accountId: string;
+  messageId: string;
+  prompt?: string;
+  confirmCloud?: boolean;
+}
+
+/** Generated reply draft for an email. */
+export interface EmailAssistantDraftResponse {
+  accountId: string;
+  messageId: string;
+  modelId: string;
+  provider: 'local' | 'cloud';
+  generatedAt: number;
+  draft: string;
+}
+
 /** Origin of a category. */
 export type CategorySource = 'auto' | 'user' | 'imported';
 
