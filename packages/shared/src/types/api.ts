@@ -156,6 +156,85 @@ export interface TriageSummaryResponse {
   buckets: Record<TriageBucket, number>;
 }
 
+/**
+ * Richer per-email triage metadata. Optional everywhere since old rows predate it and a
+ * model may omit fields, so the parser fills safe defaults.
+ */
+export interface TriageMetadata {
+  actionRequired: boolean;
+  needsReply: boolean;
+  deadlineAt: number | null;
+  importanceScore: number;
+  suggestedAction?: string | null;
+  shortSummary?: string | null;
+  confidence?: number | null;
+}
+
+/** Time range for the priority "Today's Focus" view. */
+export type PriorityRange = 'today' | 'week' | 'all';
+
+/** Request for the priority view, scoped to a range and the user's local day start. */
+export interface PriorityRequest {
+  accountId: string;
+  range: PriorityRange;
+  dayStartMs: number;
+}
+
+/** An email as rendered in the priority view, with triage metadata. */
+export interface PriorityEmailDto {
+  messageId: string;
+  folder: string;
+  subject: string | null;
+  fromAddr: string | null;
+  date: number | null;
+  hasAttachments: boolean;
+  bucket: TriageBucket;
+  reasoning: string | null;
+  classifiedAt: number;
+  actionRequired: boolean;
+  needsReply: boolean;
+  deadlineAt: number | null;
+  importanceScore: number;
+  suggestedAction: string | null;
+  shortSummary: string | null;
+}
+
+/** The priority view payload with counts and rendered sections. */
+export interface PriorityResponse {
+  accountId: string;
+  range: PriorityRange;
+  generatedAt: number;
+  counts: {
+    needsAction: number;
+    urgent: number;
+    important: number;
+    summaries: number;
+    lowPriority: number;
+    unclassified: number;
+  };
+  needsAction: PriorityEmailDto[];
+  important: PriorityEmailDto[];
+  summaries: PriorityEmailDto[];
+  carryover: PriorityEmailDto[];
+  lowPriority: PriorityEmailDto[];
+}
+
+/** Action taken on a triaged email in the focus view. */
+export type TriageResolution = 'dismiss' | 'done' | 'snooze' | 'reset';
+
+/** Request to resolve a triaged email. snoozedUntil is required for 'snooze'. */
+export interface TriageResolveRequest {
+  accountId: string;
+  messageId: string;
+  resolution: TriageResolution;
+  snoozedUntil?: number;
+}
+
+/** Result of resolving a triaged email. */
+export interface TriageResolveResponse {
+  ok: boolean;
+}
+
 /** Origin of a category. */
 export type CategorySource = 'auto' | 'user' | 'imported';
 
