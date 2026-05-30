@@ -458,3 +458,178 @@ const WANTS_OLD =
  * contains a year named in the query, else the oldest if the query asks for a previous one, else
  * the most recent. Only fires when 2+ versions of the same document family are present.
  */
+export function dedupeDocumentVersions(items: RetrievedEmail[], query: string): RetrievedEmail[] {
+  const yearInQuery = query.match(/\b(20\d{2})\b/)?.[1];
+  const wantsOld = WANTS_OLD.test(query);
+  const groups = new Map<string, RetrievedEmail[]>();
+  for (const it of items) {
+    if (!it.attachmentName) continue;
+    const sig = documentSignature(it.attachmentName);
+    if (sig.split(' ').length < 2) continue;
+    const g = groups.get(sig);
+    if (g) g.push(it);
+    else groups.set(sig, [it]);
+  }
+  const filenameHasYear = (name: string): boolean =>
+    !!yearInQuery &&
+    normalizeFilename(name)
+      .split(' ')
+      .some((t) => t === yearInQuery || (/^\d{6,8}$/.test(t) && t.startsWith(yearInQuery)));
+  const drop = new Set<RetrievedEmail>();
+  for (const group of groups.values()) {
+    const byDoc = new Map<string, { name: string; date: number; items: RetrievedEmail[] }>();
+    for (const it of group) {
+      const e = byDoc.get(it.attachmentName!);
+      if (e) {
+        e.items.push(it);
+        e.date = Math.max(e.date, it.date ?? 0);
+      } else {
+        byDoc.set(it.attachmentName!, {
+          name: it.attachmentName!,
+          date: it.date ?? 0,
+          items: [it],
+        });
+      }
+    }
+    if (byDoc.size <= 1) continue;
+    const versions = [...byDoc.values()];
+    const winner =
+      (yearInQuery && versions.find((v) => filenameHasYear(v.name))) ||
+      (wantsOld
+        ? versions.reduce((a, b) => (a.date <= b.date ? a : b))
+        : versions.reduce((a, b) => (a.date >= b.date ? a : b)));
+    for (const v of versions) if (v !== winner) for (const it of v.items) drop.add(it);
+  }
+  return drop.size > 0 ? items.filter((it) => !drop.has(it)) : items;
+}
+
+/**
+ * Score how strongly a query names a given filename: the summed length of the distinctive tokens
+ * they share. Generic doc words and years are ignored. Accent, case, and punctuation insensitive.
+ */
+export function filenameMatchScore(query: string, filename: string): number {
+  return filenameMatchDetail(query, filename).score;
+}
+
+/**
+ * Score the query against a filename and also return which distinctive tokens they shared, so a
+ * caller can tell a strong multi-token match from a single ambiguous token.
+ */
+function filenameMatchDetail(
+  query: string,
+  filename: string,
+): { score: number; matched: string[] } {
+  const qTokens = new Set(distinctiveTokens(query));
+  if (qTokens.size === 0) return { score: 0, matched: [] };
+  let score = 0;
+  const matched: string[] = [];
+  for (const ft of new Set(distinctiveTokens(filename))) {
+    if (qTokens.has(ft)) {
+      score += ft.length;
+      matched.push(ft);
+    }
+  }
+  return { score, matched };
+}
+
+/**
+ * If the query names a document, a doc-reference word plus a distinctive token shared with one of
+ * the candidate filenames, return the best-matching filename index and its score, else null. Ties
+ * are left to the caller, which breaks them by recency.
+ */
+export function matchNamedDocument(
+  query: string,
+  filenames: string[],
+): { index: number; score: number } | null {
+  if (!DOC_REFERENCE_CUE.test(query)) return null;
+  let bestIndex = -1;
+  let bestScore = 0;
+  filenames.forEach((name, i) => {
+    const score = filenameMatchScore(query, name);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  });
+  return bestScore >= NAMED_MATCH_MIN_SCORE ? { index: bestIndex, score: bestScore } : null;
+}
+
+const WANTS_DATES =
+  /\b(date|dates|p[ée]riode|validit|valable|valid|d[ée]but|\bfin\b|start|end|dur[ée]e|duration|garantie|effet|expir|deadline|[ée]ch[ée]ance)\b/i;
+const DATE_PATTERN = /\b\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{2,4}\b/g;
+const PERIOD_MARKERS =
+  /\b(valable|comprise\s+entre|date\s+d['e ]?effet|date\s+de\s+fin|effet\s+des\s+garanties|garanties?\s+(?:sont\s+)?accord|valid\s+(?:from|until)|p[ée]riode\s+comprise|du\s+\d.*\bau\s+\d)\b/i;
+
+const BILINGUAL_GROUPS: string[][] = [
+  ['evaluation summary', 'evaluation results', 'resume d evaluation', 'releve de notes', 'bilan'],
+  ['average', 'moyenne'],
+  ['final grade', 'note finale', 'overall grade'],
+  ['unjustified absence', 'absence non justifiee', 'absence injustifiee'],
+  ['insurance', 'assurance'],
+  ['home', 'housing', 'habitation', 'logement'],
+  ['contract', 'contrat'],
+  ['deadline', 'delai', 'echeance', 'date limite'],
+  ['meaning', 'means', 'signifie', 'veut dire'],
+  ['internship', 'stage'],
+  ['defense', 'soutenance'],
+  ['summary', 'resume'],
+  ['attachment', 'piece jointe'],
+];
+
+/**
+ * Append cross-language equivalents of any document/concept terms the query uses, so retrieval can
+ * match a document written in the other language. Retrieval only, the generation question is left
+ * as the user wrote it.
+ */
+export function expandQueryBilingual(query: string): string {
+  const norm = normalizeForMatch(query);
+  const additions: string[] = [];
+  for (const group of BILINGUAL_GROUPS) {
+    if (group.some((term) => norm.includes(normalizeForMatch(term)))) {
+      for (const term of group) {
+        if (!norm.includes(normalizeForMatch(term)) && !additions.includes(term)) {
+          additions.push(term);
+        }
+      }
+    }
+  }
+  return additions.length > 0 ? `${query} ${additions.join(' ')}` : query;
+}
+
+/**
+ * Rank chunks by how many distinct query content-tokens they contain, so the chunk holding the
+ * exact fact leads instead of a generic chunk. When the question asks about dates/period/validity,
+ * a chunk that actually contains a date or period marker is boosted, since the date values
+ * themselves do not lexically match the query. Cross-language terms are expanded. Stable on ties.
+ */
+export function rankChunksByLexicalOverlap<T extends { text: string }>(
+  chunks: T[],
+  query: string,
+): T[] {
+  const expanded = expandQueryBilingual(query);
+  const qTokens = [
+    ...new Set(
+      normalizeForMatch(expanded)
+        .split(' ')
+        .filter((t) => t.length >= 4),
+    ),
+  ];
+  const wantsDates = WANTS_DATES.test(expanded);
+  if (qTokens.length === 0 && !wantsDates) return chunks;
+  return chunks
+    .map((c, i) => {
+      const norm = normalizeForMatch(c.text);
+      let score = 0;
+      for (const t of qTokens) if (norm.includes(t)) score += 1;
+      if (wantsDates) {
+        const dates = c.text.match(DATE_PATTERN)?.length ?? 0;
+        if (dates > 0) score += Math.min(dates, 2) * 3;
+        if (PERIOD_MARKERS.test(c.text)) score += 2;
+      }
+      return { c, score, i };
+    })
+    .sort((a, b) => b.score - a.score || a.i - b.i)
+    .map((s) => s.c);
+}
+
+/** What the user wants from a chat turn: a grounded answer, a drafted message, or a summary. */
