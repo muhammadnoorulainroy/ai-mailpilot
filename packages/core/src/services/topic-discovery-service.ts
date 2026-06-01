@@ -190,3 +190,447 @@ interface StagedTopic {
  * purpose-based taxonomy, then computing embedding centroids and reconciling with existing
  * categories.
  */
+export class TopicDiscoveryService {
+  private running = false;
+
+  /** Wire up the repositories, LLM client, and logger the discovery run depends on. */
+  constructor(
+    private llm: LlmClient,
+    private emails: EmailRepository,
+    private embeddings: EmbeddingRepository,
+    private categories: CategoryRepository,
+    private logger: Logger,
+  ) {}
+
+  /**
+   * Run topic discovery for one account and rebuild its auto categories. Single-flight, two
+   * overlapping runs would clobber each other.
+   */
+  async discover(
+    accountId: string,
+    embeddingModelId: string,
+    generationModelId: string,
+  ): Promise<DiscoveryResult> {
+    if (this.running) {
+      throw new Error('topic discovery is already running');
+    }
+    this.running = true;
+    try {
+      return await this.runDiscovery(accountId, embeddingModelId, generationModelId);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
+   * The full discovery pipeline: sample subjects, request topics with vague-label and stricter
+   * retries, embed and merge them, reconcile with existing categories, then compute centroids and
+   * rebuild auto categories.
+   */
+  private async runDiscovery(
+    accountId: string,
+    embeddingModelId: string,
+    generationModelId: string,
+  ): Promise<DiscoveryResult> {
+    const senders = this.emails.listSenders(accountId);
+    const inboxSize = senders.length;
+    if (inboxSize === 0) {
+      return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
+    }
+    const freq = domainFrequency(senders);
+
+    const pool = this.buildDiscoveryPool(
+      accountId,
+      freq.slice(0, TOP_DOMAIN_COUNT).map(([d]) => d),
+    );
+    if (pool.length === 0) {
+      return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
+    }
+
+    const sample = mixedSampleBySender(pool, SAMPLE_SIZE);
+    this.logger.info(
+      { accountId, sampleSize: sample.length, pool: pool.length, inboxSize },
+      'topic discovery: sampling',
+    );
+
+    const sampleText = sample
+      .map((e, i) => {
+        const subject = (e.subject ?? '(no subject)').slice(0, 64);
+        const from = (e.fromAddr ?? 'unknown').slice(0, 40);
+        return `${i + 1}. "${subject}" - ${from}`;
+      })
+      .join('\n');
+
+    const topDomains = freq
+      .slice(0, 12)
+      .map(([d, c]) => `${d} (${c})`)
+      .join(', ');
+
+    const userPrompt =
+      `Inbox sample (${sample.length} emails):\n\n${sampleText}\n\n` +
+      `Highest-volume senders by domain: ${topDomains}\n\n` +
+      `Identify ${TARGET_TOPIC_COUNT} recurring topics. Make sure each high-volume sender above has a fitting topic.`;
+
+    let topics: DiscoveredTopic[];
+    try {
+      topics = await this.requestTopics(generationModelId, userPrompt);
+    } catch (err) {
+      if (err instanceof LlmApiError && err.nonRetryable) throw err;
+      this.logger.warn(
+        { accountId, err },
+        'topic discovery: first pass unusable, retrying with a stricter prompt',
+      );
+      try {
+        topics = await this.requestTopics(generationModelId, userPrompt + STRICTER_FEEDBACK);
+      } catch (retryErr) {
+        if (retryErr instanceof LlmApiError && retryErr.nonRetryable) throw retryErr;
+        this.logger.warn(
+          { accountId, err: retryErr },
+          'topic discovery: stricter retry produced no usable topics, keeping existing taxonomy',
+        );
+        return {
+          status: 'insufficient_categories',
+          topicsCreated: 0,
+          emailsSampled: sample.length,
+          centroidsComputed: 0,
+        };
+      }
+    }
+    const vague = topics.filter((t) => isVagueTopicLabel(t.label)).map((t) => t.label);
+    if (vague.length > 0) {
+      this.logger.info({ accountId, vague }, 'topic discovery: vague labels found, retrying');
+      const feedback =
+        `\n\nThe previous attempt produced these vague, banned labels: ${vague.join(', ')}. ` +
+        `Do NOT use them or any catch-all. Replace each with a concrete purpose-based topic.`;
+      try {
+        topics = await this.requestTopics(generationModelId, userPrompt + feedback);
+      } catch (err) {
+        this.logger.warn({ accountId, err }, 'topic discovery: retry failed, keeping first pass');
+      }
+    }
+
+    const insufficient = (): DiscoveryResult => ({
+      status: 'insufficient_categories',
+      topicsCreated: 0,
+      emailsSampled: sample.length,
+      centroidsComputed: 0,
+    });
+
+    const concrete = dedupeNearLabels(topics.filter((t) => !isVagueTopicLabel(t.label)));
+    const minCategories = minCategoriesFor(inboxSize);
+    if (concrete.length < minCategories) {
+      this.logger.warn(
+        { accountId, usable: concrete.length, min: minCategories },
+        'topic discovery: too few concrete categories, keeping existing taxonomy',
+      );
+      return insufficient();
+    }
+
+    const embedded: Array<{ topic: DiscoveredTopic; vec: Float32Array }> = [];
+    for (const topic of concrete) {
+      embedded.push({
+        topic,
+        vec: Float32Array.from(
+          await this.llm.embed(`${topic.label}: ${topic.description}`, embeddingModelId),
+        ),
+      });
+    }
+
+    const kept = mergeOverlappingTopics(embedded, brandTokens(freq));
+    if (kept.length < concrete.length) {
+      const keptSet = new Set(kept.map((k) => k.topic));
+      this.logger.info(
+        {
+          accountId,
+          before: concrete.length,
+          after: kept.length,
+          dropped: concrete.filter((c) => !keptSet.has(c)).map((c) => c.label),
+        },
+        'topic discovery: merged overlapping categories',
+      );
+    }
+    if (kept.length < minCategories) {
+      this.logger.warn(
+        { accountId, usable: kept.length, min: minCategories },
+        'topic discovery: too much overlap after merge, keeping existing taxonomy',
+      );
+      return insufficient();
+    }
+    this.logger.info(
+      { accountId, count: kept.length, labels: kept.map((k) => k.topic.label) },
+      'topic discovery: concrete topics accepted',
+    );
+
+    await this.reconcileWithExisting(accountId, embeddingModelId, kept);
+
+    const allEntries = this.embeddings.listForAccount(accountId, embeddingModelId);
+    const vectorsByMsg = new Map<string, Float32Array>();
+    for (const e of allEntries) vectorsByMsg.set(e.messageId, e.vector);
+
+    const staged: StagedTopic[] = [];
+    for (const { topic, vec } of kept) {
+      const matched = this.embeddings
+        .search(accountId, embeddingModelId, vec, 50)
+        .filter((h) => h.distance < ASSIGNMENT_THRESHOLD);
+
+      const matchedVectors: Float32Array[] = [];
+      for (const h of matched) {
+        const v = vectorsByMsg.get(h.messageId);
+        if (v) matchedVectors.push(v);
+      }
+
+      const centroid = matchedVectors.length > 0 ? meanNormalize(matchedVectors) : null;
+      staged.push(
+        centroid
+          ? {
+              label: topic.label,
+              description: topic.description,
+              centroid,
+              emailCount: matched.length,
+            }
+          : {
+              label: topic.label,
+              description: topic.description,
+              centroid: vec,
+              emailCount: 0,
+            },
+      );
+    }
+
+    const centroidsComputed = this.categories.reconcileAutoCategories(
+      accountId,
+      embeddingModelId,
+      staged,
+    );
+
+    return {
+      status: 'ok',
+      topicsCreated: staged.length,
+      emailsSampled: sample.length,
+      centroidsComputed,
+    };
+  }
+
+  /**
+   * Merge existing auto-category twins and fold each newly discovered twin into the existing category
+   * it duplicates, so re-discovery never leaves two categories for one purpose. User categories are
+   * never touched. Compares label-embeddings (the same signal mergeOverlappingTopics uses), not the
+   * collapsible email centroids. Mutates `kept` in place by renaming twin topics to the existing label.
+   */
+  private async reconcileWithExisting(
+    accountId: string,
+    embeddingModelId: string,
+    kept: Array<{ topic: DiscoveredTopic; vec: Float32Array }>,
+  ): Promise<void> {
+    const existing = this.categories.listForAccount(accountId).filter((c) => c.source === 'auto');
+    if (existing.length === 0) return;
+
+    const embedded: Array<{ id: string; label: string; vec: Float32Array; emailCount: number }> =
+      [];
+    for (const c of existing) {
+      const vec = Float32Array.from(
+        await this.llm.embed(`${c.label}: ${c.description ?? ''}`, embeddingModelId),
+      );
+      embedded.push({ id: c.id, label: c.label, vec, emailCount: c.emailCount });
+    }
+
+    const survivors: typeof embedded = [];
+    for (const cat of [...embedded].sort((a, b) => b.emailCount - a.emailCount)) {
+      const twin = survivors.find((s) => areTwins(s.label, s.vec, cat.label, cat.vec));
+      if (twin) {
+        this.categories.mergeInto(cat.id, twin.id);
+        this.logger.info(
+          { accountId, merged: cat.label, into: twin.label },
+          'topic discovery: merged existing semantic twin',
+        );
+      } else {
+        survivors.push(cat);
+      }
+    }
+
+    const claimed = new Set<string>();
+    for (const k of kept) {
+      const twin = survivors.find(
+        (e) => !claimed.has(e.id) && areTwins(e.label, e.vec, k.topic.label, k.vec),
+      );
+      if (twin && twin.label.trim().toLowerCase() !== k.topic.label.trim().toLowerCase()) {
+        claimed.add(twin.id);
+        this.logger.info(
+          { accountId, discovered: k.topic.label, reuse: twin.label },
+          'topic discovery: discovered topic reuses existing semantic twin',
+        );
+        k.topic = { ...k.topic, label: twin.label };
+      }
+    }
+  }
+
+  /**
+   * Assemble the candidate email pool to sample from, mixing recent, random historical,
+   * uncategorized, and per-top-domain examples, deduplicated by message id.
+   */
+  private buildDiscoveryPool(accountId: string, topDomains: string[]): EmailSummary[] {
+    const recent = this.emails.listSummaries({ accountId, limit: RECENT_POOL });
+    const historical = this.emails.listSummariesRandom(accountId, HISTORICAL_POOL);
+    const uncategorized = this.emails.listUncategorizedSummaries(accountId, UNCATEGORIZED_POOL);
+    const domainExamples: EmailSummary[] = [];
+    for (const domain of topDomains) {
+      domainExamples.push(
+        ...this.emails.listSummariesByDomain(accountId, domain, PER_DOMAIN_EXAMPLES),
+      );
+    }
+    return dedupeById([...recent, ...historical, ...domainExamples, ...uncategorized]);
+  }
+
+  /** Send one topic-discovery prompt to the LLM and parse the JSON answer into topics. */
+  private async requestTopics(model: string, userPrompt: string): Promise<DiscoveredTopic[]> {
+    const raw = await this.llm.chat({
+      model,
+      provider: 'main',
+      messages: [
+        { role: 'system', content: `/no_think\n${SYSTEM_PROMPT}` },
+        { role: 'user', content: userPrompt },
+      ],
+      responseFormat: 'json_object',
+      temperature: 0.2,
+      maxTokens: TOPIC_OUTPUT_TOKENS,
+      think: false,
+    });
+    return this.parseTopics(raw);
+  }
+
+  /**
+   * Parse the model's raw answer into topics, falling back to salvaging objects from a truncated
+   * response. Throws when fewer than two usable topics result.
+   */
+  private parseTopics(raw: string): DiscoveredTopic[] {
+    const cleaned = stripThink(raw);
+    try {
+      const result = TopicListSchema.safeParse(parseLlmJson(cleaned));
+      if (result.success) return result.data.topics;
+    } catch {}
+    const salvaged = salvageTopics(cleaned);
+    this.logger.info(
+      { rawLength: raw.length, salvaged: salvaged.length },
+      'topic discovery: strict parse failed, used salvage',
+    );
+    if (salvaged.length >= 2) return salvaged;
+    throw new Error('topic discovery: response had no usable topics');
+  }
+}
+
+const LABEL_STOPWORDS = new Set([
+  'and',
+  'the',
+  'your',
+  'my',
+  'our',
+  'of',
+  'for',
+  'to',
+  'from',
+  'a',
+  'an',
+  're',
+  'with',
+  'on',
+  'in',
+  'at',
+  'by',
+  'or',
+]);
+
+const VAGUE_TOKENS = new Set([
+  'support',
+  'help',
+  'helpdesk',
+  'assistance',
+  'assist',
+  'technical',
+  'notification',
+  'notifications',
+  'alert',
+  'alerts',
+  'update',
+  'updates',
+  'general',
+  'important',
+  'service',
+  'services',
+  'system',
+  'systems',
+  'account',
+  'accounts',
+  'announcement',
+  'announcements',
+  'info',
+  'information',
+  'news',
+  'message',
+  'messages',
+  'mail',
+  'mails',
+  'email',
+  'emails',
+  'misc',
+  'miscellaneous',
+  'other',
+  'others',
+  'uncategorized',
+  'various',
+  'status',
+  'communication',
+  'communications',
+  'correspondence',
+  'request',
+  'requests',
+  'inquiry',
+  'inquiries',
+  'query',
+  'queries',
+  'reminder',
+  'reminders',
+  'item',
+  'items',
+  'stuff',
+  'thing',
+  'things',
+  'customer',
+  'tech',
+  'center',
+  'centre',
+  'daily',
+  'weekly',
+  'monthly',
+  'quarterly',
+  'company',
+  'report',
+  'reports',
+  'inbox',
+  'action',
+  'actions',
+  'activity',
+  'recent',
+  'latest',
+  'online',
+  'portal',
+  'platform',
+  'summary',
+  'summaries',
+  'detail',
+  'details',
+  'digest',
+  'feed',
+  'hub',
+]);
+
+/** Lowercase word tokens of a label with common stopwords removed. */
+function significantTokens(label: string): string[] {
+  const tokens = label.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return tokens.filter((t) => !LABEL_STOPWORDS.has(t));
+}
+
+/**
+ * A label is vague when it has no concrete anchor: every significant word is a generic catch-all
+ * term. Pattern based, so variants like "Technical Assistance" or "Account Notifications" are
+ * caught without listing each one, while concrete categories are left alone.
+ */
