@@ -634,3 +634,237 @@ function significantTokens(label: string): string[] {
  * term. Pattern based, so variants like "Technical Assistance" or "Account Notifications" are
  * caught without listing each one, while concrete categories are left alone.
  */
+export function isVagueTopicLabel(label: string): boolean {
+  const significant = significantTokens(label);
+  if (significant.length === 0) return true;
+  return significant.every((t) => VAGUE_TOKENS.has(t));
+}
+
+/** Jaccard similarity between two token sets, the intersection size over the union size. */
+function jaccard(a: Set<string>, b: Set<string>): number {
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter += 1;
+  const union = a.size + b.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+/** True when a label significantly overlaps any of the given labels, used to reject near-twins of existing categories. */
+export function isNearDuplicateLabel(label: string, others: string[]): boolean {
+  const tok = new Set(significantTokens(label));
+  if (tok.size === 0) return false;
+  return others.some((o) => jaccard(tok, new Set(significantTokens(o))) >= 0.6);
+}
+
+const OVERLAP_PURPOSE = 0.9;
+const OVERLAP_SENDER = 0.8;
+
+const GENERIC_DOMAIN_LABELS = new Set([
+  'mail',
+  'email',
+  'mailer',
+  'smtp',
+  'news',
+  'info',
+  'no',
+  'noreply',
+  'reply',
+  'notification',
+  'notifications',
+  'em',
+  'send',
+  'sendgrid',
+  'mailgun',
+  'amazonses',
+]);
+
+const PURPOSE_DOMAIN_LABELS = new Set([
+  'bank',
+  'banking',
+  'job',
+  'jobs',
+  'career',
+  'careers',
+  'travel',
+  'insurance',
+  'health',
+  'shipping',
+  'delivery',
+  'security',
+  'developer',
+  'course',
+  'courses',
+  'invoice',
+  'invoices',
+  'receipt',
+  'receipts',
+  'shop',
+  'store',
+  'social',
+]);
+
+/** Brand tokens from the top sender domains, so a category named after a sender (GitHub) is detectable. */
+export function brandTokens(freq: Array<[string, number]>): Set<string> {
+  const brands = new Set<string>();
+  for (const [domain] of freq.slice(0, 15)) {
+    const parts = domain.split('.').filter(Boolean);
+    const brand = (parts.length >= 2 ? parts[parts.length - 2]! : (parts[0] ?? '')).toLowerCase();
+    if (
+      brand.length >= 3 &&
+      !GENERIC_DOMAIN_LABELS.has(brand) &&
+      !PURPOSE_DOMAIN_LABELS.has(brand)
+    ) {
+      brands.add(brand);
+    }
+  }
+  return brands;
+}
+
+/** True when a label contains a brand token, marking it as named after a sender rather than a purpose. */
+function isSenderSpecific(label: string, brands: Set<string>): boolean {
+  return significantTokens(label).some((t) => brands.has(t));
+}
+
+/**
+ * Drop overlapping/twin categories by embedding similarity. Purpose-based topics are preferred over
+ * sender-specific ones, so when an overlapping pair collapses the purpose label survives. A
+ * candidate is dropped when it is too similar to an already-kept topic. A sender-specific candidate
+ * merges at a lower similarity than two purpose-based categories.
+ */
+export function mergeOverlappingTopics<T extends { topic: { label: string }; vec: Float32Array }>(
+  embedded: T[],
+  brands: Set<string>,
+): T[] {
+  const ordered = embedded
+    .map((e, i) => ({ e, i, sender: isSenderSpecific(e.topic.label, brands) }))
+    .sort((a, b) => (a.sender === b.sender ? a.i - b.i : a.sender ? 1 : -1));
+
+  const kept: T[] = [];
+  for (const { e, sender } of ordered) {
+    const overlaps = kept.some((k) => {
+      const sim = cosineFromL2Distance(l2Distance(e.vec, k.vec));
+      const threshold =
+        sender || isSenderSpecific(k.topic.label, brands) ? OVERLAP_SENDER : OVERLAP_PURPOSE;
+      return sim >= threshold;
+    });
+    if (!overlaps) kept.push(e);
+  }
+  return kept;
+}
+
+/** Drop near-duplicate labels by significant-word overlap so the taxonomy has no twins. */
+export function dedupeNearLabels<T extends { label: string }>(topics: T[]): T[] {
+  const kept: T[] = [];
+  const keptTokens: Set<string>[] = [];
+  for (const t of topics) {
+    const tok = new Set(significantTokens(t.label));
+    if (keptTokens.some((k) => jaccard(tok, k) >= 0.6)) continue;
+    kept.push(t);
+    keptTokens.push(tok);
+  }
+  return kept;
+}
+
+/** Keep the first occurrence of each message id, preserving order. */
+function dedupeById<T extends { messageId: string }>(arr: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const e of arr) {
+    if (seen.has(e.messageId)) continue;
+    seen.add(e.messageId);
+    out.push(e);
+  }
+  return out;
+}
+
+/** Sender domains across the inbox, most frequent first, as [domain, count] pairs. */
+export function domainFrequency(
+  senders: Array<{ fromAddr: string | null }>,
+): Array<[string, number]> {
+  const counts = new Map<string, number>();
+  for (const s of senders) {
+    const d = senderDomain(s.fromAddr);
+    if (d) counts.set(d, (counts.get(d) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+/**
+ * Sample for topic discovery: half sender-diverse for breadth, half frequency-weighted so
+ * high-volume senders like GitHub and job boards appear in proportion to their share of the inbox
+ * and get their own topic instead of being hidden behind one-per-domain breadth.
+ */
+export function mixedSampleBySender<T extends { fromAddr: string | null }>(
+  arr: T[],
+  n: number,
+): T[] {
+  if (arr.length <= n) return [...arr];
+
+  const half = Math.ceil(n / 2);
+  const diverse = diverseSampleBySender(arr, half);
+  const chosen = new Set<T>(diverse);
+
+  const rest = arr.filter((e) => !chosen.has(e));
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = rest[i]!;
+    rest[i] = rest[j]!;
+    rest[j] = tmp;
+  }
+
+  const result = [...diverse];
+  for (let i = 0; result.length < n && i < rest.length; i++) {
+    result.push(rest[i]!);
+  }
+  return result;
+}
+
+/** Lowercase sender domain extracted from a From header. */
+export function senderDomain(fromAddr: string | null): string {
+  if (!fromAddr) return '';
+  const at = fromAddr.lastIndexOf('@');
+  const tail = at === -1 ? fromAddr : fromAddr.slice(at + 1);
+  return tail
+    .toLowerCase()
+    .replace(/[>\s].*$/, '')
+    .trim();
+}
+
+/**
+ * Pick up to n emails that maximize distinct sender domains so the LLM sees the
+ * inbox's breadth instead of many copies of the loudest sender, which would bias the
+ * discovered topics. One email per domain is taken first in random order, then any
+ * shortfall is filled from the rest. Uniform-random within each tier.
+ */
+export function diverseSampleBySender<T extends { fromAddr: string | null }>(
+  arr: T[],
+  n: number,
+): T[] {
+  if (arr.length <= n) return [...arr];
+
+  const shuffled = [...arr];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = shuffled[i]!;
+    shuffled[i] = shuffled[j]!;
+    shuffled[j] = tmp;
+  }
+
+  const seen = new Set<string>();
+  const primary: T[] = [];
+  const leftovers: T[] = [];
+  for (const e of shuffled) {
+    const d = senderDomain(e.fromAddr);
+    if (d && !seen.has(d)) {
+      seen.add(d);
+      primary.push(e);
+    } else {
+      leftovers.push(e);
+    }
+  }
+
+  const result = primary.slice(0, n);
+  for (let i = 0; result.length < n && i < leftovers.length; i++) {
+    result.push(leftovers[i]!);
+  }
+  return result;
+}
