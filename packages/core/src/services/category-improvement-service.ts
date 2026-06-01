@@ -274,3 +274,729 @@ function stableMessageSample<T extends { messageId: string }>(items: T[], limit:
 }
 
 /** Suggests and applies taxonomy improvements for an account using its uncategorized email backlog. */
+export class CategoryImprovementService {
+  /** Wire up the repositories, LLM client, database, and logger this service depends on. */
+  constructor(
+    private db: Database,
+    private llm: LlmClient,
+    private emails: EmailRepository,
+    private embeddings: EmbeddingRepository,
+    private categories: CategoryRepository,
+    private logger: Logger,
+  ) {}
+
+  /**
+   * Propose taxonomy changes from the uncategorized backlog. Nothing is applied here. The suggestion
+   * LLM call runs on `provider` ('chat' = the cloud model when the user opted in, else 'main' local),
+   * exactly like Refine, embeddings/clustering always stay local. modelId is the cloud chat model when
+   * provider is 'chat', else the local generation model.
+   */
+  async suggest(
+    accountId: string,
+    embeddingModelId: string,
+    modelId: string,
+    provider: 'main' | 'chat' = 'main',
+  ): Promise<ImproveSuggestionsResponse> {
+    const uncategorizedCount = this.categories.countUncategorized(accountId);
+    if (uncategorizedCount < MIN_UNCATEGORIZED) {
+      return {
+        uncategorizedCount,
+        sampledCount: 0,
+        existingCategoryExpansions: [],
+        newCategories: [],
+        merges: [],
+      };
+    }
+
+    const uncategorized = this.listUncategorizedForImprove(accountId);
+    const vectorsByMsg = new Map<string, Float32Array>();
+    for (const e of this.embeddings.listForAccount(accountId, embeddingModelId)) {
+      vectorsByMsg.set(e.messageId, e.vector);
+    }
+    const sample = this.clusterFirstSample(uncategorized, vectorsByMsg, SAMPLE_SIZE);
+    const existing = this.categories.listForAccount(accountId);
+    const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
+
+    const existingText =
+      existing.length > 0
+        ? existing.map((c) => `- ${c.label}: ${c.description ?? ''}`).join('\n')
+        : '(none yet)';
+    const sampleText = sample
+      .map((e, i) => {
+        const subject = (e.subject ?? '(no subject)').slice(0, 64);
+        const from = (e.fromAddr ?? 'unknown').slice(0, 40);
+        const similar = e.clusterSize > 1 ? ` (~${e.clusterSize} similar)` : '';
+        return `${i + 1}. "${subject}" - ${from}${similar}`;
+      })
+      .join('\n');
+    const userPrompt =
+      `EXISTING CATEGORIES:\n${existingText}\n\n` +
+      `UNCATEGORIZED EMAILS (${sample.length} of ${uncategorizedCount}):\n${sampleText}\n\n` +
+      `Suggest new categories and merges as JSON.`;
+
+    const emptyWith = (warning: string): ImproveSuggestionsResponse => ({
+      uncategorizedCount,
+      sampledCount: sample.length,
+      existingCategoryExpansions: [],
+      newCategories: [],
+      merges: [],
+      warning,
+    });
+    const CONNECTIVITY_WARNING = 'The model could not be reached. Check Settings and try again.';
+    const PARSE_WARNING =
+      'Could not read the model output. Try again, or switch to a stronger model in Settings.';
+
+    let raw: string;
+    try {
+      raw = await this.requestSuggestions(modelId, userPrompt, provider);
+    } catch (err) {
+      this.logger.warn({ accountId, err }, 'improve categories: suggestion request failed');
+      return emptyWith(CONNECTIVITY_WARNING);
+    }
+
+    let parsed = salvageSuggestions(raw);
+    if (!parsed) {
+      try {
+        parsed = salvageSuggestions(
+          await this.requestSuggestions(modelId, userPrompt + STRICTER_SUGGEST_FEEDBACK, provider),
+        );
+      } catch (err) {
+        this.logger.warn({ accountId, err }, 'improve categories: stricter retry request failed');
+        return emptyWith(CONNECTIVITY_WARNING);
+      }
+    }
+    if (!parsed) {
+      this.logger.warn({ accountId }, 'improve categories: could not parse model suggestions');
+      return emptyWith(PARSE_WARNING);
+    }
+
+    const directExpansions = this.resolveExistingCategoryExpansions(
+      parsed.existingCategoryExpansions,
+      existing,
+      sample,
+      vectorsByMsg,
+      centroids,
+    );
+    const duplicateNewExpansions = this.expansionsFromDuplicateNewCategories(
+      parsed.newCategories,
+      existing,
+      sample,
+      vectorsByMsg,
+      centroids,
+    );
+    const existingCategoryExpansions = this.mergeExpansions([
+      ...directExpansions,
+      ...duplicateNewExpansions,
+    ]);
+    const newCategories = await this.scoreNewCategories(
+      accountId,
+      embeddingModelId,
+      parsed.newCategories,
+      existing,
+      uncategorized,
+      sample,
+    );
+    const merges = this.resolveMerges(parsed.merges, existing);
+
+    const diagnostics =
+      existingCategoryExpansions.length === 0 && newCategories.length === 0 && merges.length === 0
+        ? this.diagnoseBacklog(accountId, embeddingModelId, uncategorized, vectorsByMsg)
+        : undefined;
+
+    this.logger.info(
+      {
+        accountId,
+        expansions: existingCategoryExpansions.length,
+        suggested: newCategories.length,
+        merges: merges.length,
+        uncategorizedCount,
+      },
+      'improve categories: suggestions ready',
+    );
+    const usedMessageIds = new Set<string>([
+      ...existingCategoryExpansions.flatMap((x) => x.messageIds),
+      ...newCategories.flatMap((x) => x.messageIds ?? []),
+    ]);
+    const leaveUncategorized = this.resolveLeaveUncategorized(
+      parsed.leaveUncategorized,
+      sample,
+      usedMessageIds,
+    );
+    return {
+      uncategorizedCount,
+      sampledCount: sample.length,
+      existingCategoryExpansions,
+      newCategories,
+      merges,
+      leaveUncategorized,
+      diagnostics,
+    };
+  }
+
+  /**
+   * Explain an empty suggestion result by measuring how much of the backlog already sits near an
+   * existing centroid, recommending Refine when most do and a stronger model otherwise.
+   */
+  private diagnoseBacklog(
+    accountId: string,
+    embeddingModelId: string,
+    uncategorized: EmailSummary[],
+    vectorsByMsg: Map<string, Float32Array>,
+  ): ImproveSuggestionsResponse['diagnostics'] {
+    const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
+    if (centroids.length === 0) return undefined;
+    let withVector = 0;
+    let covered = 0;
+    for (const e of uncategorized) {
+      const v = vectorsByMsg.get(e.messageId);
+      if (!v) continue;
+      withVector += 1;
+      const nearest = Math.min(...centroids.map((c) => l2Distance(v, c.vector)));
+      if (nearest < ASSIGNMENT_THRESHOLD) covered += 1;
+    }
+    if (withVector === 0) return undefined;
+    const likely = covered / withVector >= 0.5;
+    return {
+      existingCategoriesLikelyCoverBacklog: likely,
+      recommendation: likely
+        ? 'Most uncategorized emails look like they fit your existing categories. Run "Refine (accurate AI)" to file them.'
+        : 'Many uncategorized emails do not clearly fit any category. Try a stronger model in Settings, or add categories manually.',
+    };
+  }
+
+  /** Read a stable, capped pool of uncategorized email summaries for clustering, preferring the stable reader when available. */
+  private listUncategorizedForImprove(accountId: string): EmailSummary[] {
+    const stableReader = this.emails as EmailRepository & {
+      listUncategorizedSummariesStable?: (accountId: string, limit: number) => EmailSummary[];
+    };
+    const scanned = stableReader.listUncategorizedSummariesStable
+      ? stableReader.listUncategorizedSummariesStable(accountId, UNCATEGORIZED_SCAN_LIMIT)
+      : this.emails.listUncategorizedSummaries(accountId, UNCATEGORIZED_POOL);
+    return stableMessageSample(scanned, UNCATEGORIZED_POOL);
+  }
+
+  /**
+   * Turn the model's existing-category expansions into concrete suggestions, matching labels to real
+   * categories and keeping only clusters whose evidence supports the expansion above the coverage floor.
+   */
+  private resolveExistingCategoryExpansions(
+    raw: SalvagedSuggestions['existingCategoryExpansions'],
+    existing: Array<{ id: string; label: string; description: string | null; emailCount: number }>,
+    sample: SampledBucket[],
+    vectorsByMsg: Map<string, Float32Array>,
+    centroids: CentroidEntry[],
+  ): SuggestedCategoryExpansion[] {
+    const out: SuggestedCategoryExpansion[] = [];
+    for (const item of raw) {
+      const cat = this.matchExistingCategory(item.category, existing);
+      if (!cat) continue;
+      const clusters = this.clustersForNumbers(item.clusterNumbers, sample).filter((cluster) =>
+        this.clusterSupportsExpansion(cluster, cat, vectorsByMsg, centroids),
+      );
+      const messageIds = uniqueIds(clusters.flatMap((c) => c.memberIds));
+      if (messageIds.length < MIN_NEW_CATEGORY_COVERAGE) continue;
+      out.push({
+        categoryId: cat.id,
+        categoryLabel: cat.label,
+        estimatedCount: messageIds.length,
+        sampleSubjects: sampleSubjects(clusters),
+        sampleSenders: sampleSenders(clusters),
+        reason: item.reason || `These uncategorized clusters fit ${cat.label}.`,
+        messageIds,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Catch proposed new categories that actually duplicate an existing one and rewrite them as
+   * expansions of the matching existing category instead.
+   */
+  private expansionsFromDuplicateNewCategories(
+    raw: SalvagedSuggestions['newCategories'],
+    existing: Array<{ id: string; label: string; description: string | null; emailCount: number }>,
+    sample: SampledBucket[],
+    vectorsByMsg: Map<string, Float32Array>,
+    centroids: CentroidEntry[],
+  ): SuggestedCategoryExpansion[] {
+    const out: SuggestedCategoryExpansion[] = [];
+    for (const item of raw) {
+      if (item.clusterNumbers.length === 0) continue;
+      const cat = this.matchExistingCategory(item.label, existing);
+      if (!cat) continue;
+      const clusters = this.clustersForNumbers(item.clusterNumbers, sample).filter((cluster) =>
+        this.clusterSupportsExpansion(cluster, cat, vectorsByMsg, centroids),
+      );
+      const messageIds = uniqueIds(clusters.flatMap((c) => c.memberIds));
+      if (messageIds.length < MIN_NEW_CATEGORY_COVERAGE) continue;
+      out.push({
+        categoryId: cat.id,
+        categoryLabel: cat.label,
+        estimatedCount: messageIds.length,
+        sampleSubjects: sampleSubjects(clusters),
+        sampleSenders: sampleSenders(clusters),
+        reason: `${item.label} is already covered by ${cat.label}; expand the existing category instead.`,
+        messageIds,
+      });
+    }
+    return out;
+  }
+
+  /** Combine expansions targeting the same category, unioning message ids and samples, sorted by estimated count. */
+  private mergeExpansions(items: SuggestedCategoryExpansion[]): SuggestedCategoryExpansion[] {
+    const byCategory = new Map<string, SuggestedCategoryExpansion>();
+    for (const item of items) {
+      const existing = byCategory.get(item.categoryId);
+      if (!existing) {
+        byCategory.set(item.categoryId, { ...item, messageIds: uniqueIds(item.messageIds) });
+        continue;
+      }
+      const messageIds = uniqueIds([...existing.messageIds, ...item.messageIds]);
+      byCategory.set(item.categoryId, {
+        ...existing,
+        estimatedCount: messageIds.length,
+        sampleSubjects: uniqueLimited([...existing.sampleSubjects, ...item.sampleSubjects], 3),
+        sampleSenders: uniqueLimited([...existing.sampleSenders, ...item.sampleSenders], 3),
+        reason: existing.reason,
+        messageIds,
+      });
+    }
+    return [...byCategory.values()].sort((a, b) => b.estimatedCount - a.estimatedCount);
+  }
+
+  /**
+   * Decide whether a cluster genuinely belongs in a category, accepting it on textual purpose evidence
+   * or, failing that, when its vector ranks the category highly enough by centroid similarity.
+   */
+  private clusterSupportsExpansion(
+    cluster: SampledBucket,
+    category: { id: string; label: string; description: string | null },
+    vectorsByMsg: Map<string, Float32Array>,
+    centroids: CentroidEntry[],
+  ): boolean {
+    const subjectAndSender = `${cluster.subject ?? ''} ${cluster.fromAddr ?? ''}`;
+    const evidence = purposeTextEvidence(subjectAndSender, category);
+    if (evidence.words > 0 || evidence.phrases > 0 || evidence.labelTokens > 0) return true;
+
+    const vector = vectorsByMsg.get(cluster.memberIds[0] ?? '');
+    if (!vector || centroids.length === 0) return false;
+    const ranked = rankCategories(vector, centroids);
+    const rank = ranked.findIndex((m) => m.categoryId === category.id);
+    if (rank < 0) return false;
+    const match = ranked[rank]!;
+    return (rank === 0 && match.confidence >= 0.55) || (rank <= 2 && match.confidence >= 0.7);
+  }
+
+  /**
+   * Build the leave-uncategorized summary from the model's clusters, excluding any messages already
+   * claimed by an expansion or new category so nothing is double counted.
+   */
+  private resolveLeaveUncategorized(
+    raw: SalvagedSuggestions['leaveUncategorized'],
+    sample: SampledBucket[],
+    usedMessageIds: ReadonlySet<string> = new Set(),
+  ): ImproveSuggestionsResponse['leaveUncategorized'] {
+    if (!raw) return undefined;
+    const clusters = this.clustersForNumbers(raw.clusterNumbers, sample).filter(
+      (c) => !c.memberIds.some((id) => usedMessageIds.has(id)),
+    );
+    const messageIds = uniqueIds(clusters.flatMap((c) => c.memberIds));
+    if (messageIds.length === 0) return undefined;
+    return {
+      estimatedCount: messageIds.length,
+      reason: raw.reason || 'These sampled clusters are mixed, one-off, or too ambiguous.',
+      sampleSubjects: sampleSubjects(clusters),
+    };
+  }
+
+  /**
+   * Resolve a label to an existing category, trying exact match, then near-duplicate label, then the
+   * highest-volume category sharing the same purpose signature.
+   */
+  private matchExistingCategory(
+    label: string,
+    existing: Array<{ id: string; label: string; description: string | null; emailCount: number }>,
+  ): { id: string; label: string; description: string | null } | null {
+    const norm = normalizeLabel(label);
+    const exact = existing.find((c) => normalizeLabel(c.label) === norm);
+    if (exact) return exact;
+    const near = existing.find((c) => isNearDuplicateLabel(label, [c.label]));
+    if (near) return near;
+    const sig = purposeSignature(label);
+    if (sig === null) return null;
+    const samePurpose = existing
+      .filter((c) => purposeSignature(c.label, c.description) === sig)
+      .sort((a, b) => b.emailCount - a.emailCount);
+    return samePurpose[0] ?? null;
+  }
+
+  /** Map 1-based cluster numbers from the prompt back to their sampled buckets, skipping out-of-range numbers. */
+  private clustersForNumbers(numbers: number[], sample: SampledBucket[]): SampledBucket[] {
+    const out: SampledBucket[] = [];
+    for (const n of numbers) {
+      const cluster = sample[n - 1];
+      if (cluster) out.push(cluster);
+    }
+    return out;
+  }
+
+  /**
+   * Send the system and user prompts to the LLM and return the raw reply. Disables thinking and
+   * prepends /no_think for the local provider to keep the JSON output clean.
+   */
+  private async requestSuggestions(
+    model: string,
+    userPrompt: string,
+    provider: 'main' | 'chat',
+  ): Promise<string> {
+    const local = provider === 'main';
+    return this.llm.chat({
+      model,
+      provider,
+      messages: [
+        { role: 'system', content: local ? `/no_think\n${SYSTEM_PROMPT}` : SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt },
+      ],
+      responseFormat: 'json_object',
+      temperature: 0,
+      think: local ? false : undefined,
+    });
+  }
+
+  /** Apply only what the user approved: create new categories with centroids, then merge. */
+  async apply(
+    accountId: string,
+    embeddingModelId: string,
+    approved: {
+      existingCategoryExpansions?: Array<{ categoryId: string; messageIds: string[] }>;
+      newCategories: Array<{ label: string; description: string; messageIds?: string[] }>;
+      merges: Array<{ sourceId: string; targetId: string }>;
+    },
+  ): Promise<ApplyImprovementsResponse> {
+    const vectorsByMsg = new Map<string, Float32Array>();
+    for (const e of this.embeddings.listForAccount(accountId, embeddingModelId)) {
+      vectorsByMsg.set(e.messageId, e.vector);
+    }
+
+    const stagedExpansions = (approved.existingCategoryExpansions ?? [])
+      .map((e) => {
+        const cat = this.categories.findById(e.categoryId);
+        if (!cat || cat.accountId !== accountId) return null;
+        const messageIds = uniqueIds(e.messageIds).filter((id) => vectorsByMsg.has(id));
+        if (messageIds.length === 0) return null;
+        return { categoryId: cat.id, messageIds };
+      })
+      .filter((e): e is { categoryId: string; messageIds: string[] } => e !== null);
+
+    const seen = new Set(
+      this.categories.listForAccount(accountId).map((c) => normalizeLabel(c.label)),
+    );
+    const staged: Array<{
+      label: string;
+      description: string;
+      centroid: Float32Array;
+      emailCount: number;
+      messageIds: string[];
+    }> = [];
+    for (const cat of approved.newCategories) {
+      if (isVagueTopicLabel(cat.label)) continue;
+      const norm = normalizeLabel(cat.label);
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      const messageIds = uniqueIds(cat.messageIds ?? []).filter((id) => vectorsByMsg.has(id));
+      let vectors = messageIds
+        .map((id) => vectorsByMsg.get(id))
+        .filter((v): v is Float32Array => v !== undefined);
+      let descVec: Float32Array | null = null;
+      if (vectors.length === 0) {
+        descVec = Float32Array.from(
+          await this.llm.embed(`${cat.label}: ${cat.description}`, embeddingModelId),
+        );
+        vectors = this.embeddings
+          .search(accountId, embeddingModelId, descVec, 50)
+          .filter((h) => h.distance < ASSIGNMENT_THRESHOLD)
+          .map((h) => vectorsByMsg.get(h.messageId))
+          .filter((v): v is Float32Array => v !== undefined);
+      }
+      const centroid =
+        (vectors.length > 0 ? meanNormalize(vectors) : null) ??
+        descVec ??
+        Float32Array.from(
+          await this.llm.embed(`${cat.label}: ${cat.description}`, embeddingModelId),
+        );
+      staged.push({
+        label: cat.label,
+        description: cat.description,
+        centroid,
+        emailCount: vectors.length,
+        messageIds,
+      });
+    }
+
+    const result = this.db.transaction((): ApplyImprovementsResponse => {
+      let expanded = 0;
+      for (const e of stagedExpansions) {
+        const assigned = this.assignStillUncategorized(
+          accountId,
+          e.categoryId,
+          e.messageIds,
+          'llm',
+        );
+        this.updateCentroidFromMessages(e.categoryId, embeddingModelId, assigned, vectorsByMsg);
+        expanded += assigned.length;
+      }
+
+      let created = 0;
+      for (const s of staged) {
+        const row = this.categories.create({
+          accountId,
+          label: s.label,
+          description: s.description,
+          source: 'auto',
+        });
+        const assigned = this.assignStillUncategorized(accountId, row.id, s.messageIds, 'llm');
+        if (assigned.length > 0) {
+          this.updateCentroidFromMessages(row.id, embeddingModelId, assigned, vectorsByMsg);
+        } else {
+          this.categories.saveCentroid(row.id, embeddingModelId, s.centroid, s.emailCount);
+        }
+        expanded += assigned.length;
+        created += 1;
+      }
+      let merged = 0;
+      for (const m of approved.merges) {
+        const src = this.categories.findById(m.sourceId);
+        const tgt = this.categories.findById(m.targetId);
+        if (!src || !tgt || src.id === tgt.id) continue;
+        if (src.accountId !== accountId || tgt.accountId !== accountId) continue;
+        this.categories.mergeInto(m.sourceId, m.targetId);
+        merged += 1;
+      }
+      return { expanded, created, merged };
+    })();
+
+    this.logger.info({ accountId, ...result }, 'improve categories: applied');
+    return result;
+  }
+
+  /**
+   * Auto-assign the given messages to a category, skipping ones missing, user-assigned, or already in
+   * that category, then clear their pending decisions. Returns the message ids actually assigned.
+   */
+  private assignStillUncategorized(
+    accountId: string,
+    categoryId: string,
+    messageIds: string[],
+    method: 'llm' | 'gate' | 'embed',
+  ): string[] {
+    const eligible: string[] = [];
+    const now = Date.now();
+    for (const messageId of uniqueIds(messageIds)) {
+      if (!this.emails.findById(messageId, accountId)) continue;
+      const existing = this.categories.getEmailCategories(messageId, accountId);
+      if (existing.some((a) => a.assignedBy === 'user')) continue;
+      if (existing.some((a) => a.categoryId === categoryId)) continue;
+      eligible.push(messageId);
+    }
+    if (eligible.length === 0) return [];
+    this.categories.addAutoAssignments(
+      accountId,
+      eligible.map((messageId) => ({
+        messageId,
+        accountId,
+        categoryId,
+        confidence: 0.95,
+        assignedBy: 'auto' as const,
+        assignedAt: now,
+        method,
+      })),
+    );
+    for (const messageId of eligible) this.categories.clearDecisionsForEmail(messageId, accountId);
+    return eligible;
+  }
+
+  /**
+   * Fold the given message vectors into a category's centroid, seeding a fresh normalized mean when
+   * none exists or otherwise weighting the running centroid by its email count before renormalizing.
+   */
+  private updateCentroidFromMessages(
+    categoryId: string,
+    embeddingModelId: string,
+    messageIds: string[],
+    vectorsByMsg: Map<string, Float32Array>,
+  ): void {
+    const vectors = messageIds
+      .map((id) => vectorsByMsg.get(id))
+      .filter((v): v is Float32Array => v !== undefined);
+    if (vectors.length === 0) return;
+
+    const current = this.categories.getCentroid(categoryId, embeddingModelId);
+    if (!current) {
+      const centroid = meanNormalize(vectors);
+      if (centroid)
+        this.categories.saveCentroid(categoryId, embeddingModelId, centroid, vectors.length);
+      return;
+    }
+
+    const sum = new Float32Array(current.vector.length);
+    for (let i = 0; i < sum.length; i++) sum[i] = current.vector[i]! * current.emailCount;
+    for (const vec of vectors) {
+      for (let i = 0; i < sum.length; i++) sum[i] += vec[i]!;
+    }
+    const total = current.emailCount + vectors.length;
+    let normSq = 0;
+    for (let i = 0; i < sum.length; i++) {
+      sum[i] /= total;
+      normSq += sum[i]! * sum[i]!;
+    }
+    const norm = Math.sqrt(normSq);
+    if (norm > 0) {
+      const inv = 1 / norm;
+      for (let i = 0; i < sum.length; i++) sum[i] *= inv;
+    }
+    this.categories.saveCentroid(categoryId, embeddingModelId, sum, total);
+  }
+
+  /**
+   * Cluster the uncategorized pool by sender and content and return the largest clusters as buckets,
+   * falling back to a mixed-by-sender sample when no vectors are available.
+   */
+  private clusterFirstSample(
+    uncategorized: EmailSummary[],
+    vectorsByMsg: Map<string, Float32Array>,
+    size: number,
+  ): SampledBucket[] {
+    const inputs: ClusterInput[] = [];
+    for (const e of uncategorized) {
+      const v = vectorsByMsg.get(e.messageId);
+      if (v) inputs.push({ messageId: e.messageId, fromAddr: e.fromAddr, vector: v });
+    }
+    if (inputs.length === 0) {
+      return mixedSampleBySender(uncategorized, size).map((e) => ({
+        subject: e.subject,
+        fromAddr: e.fromAddr,
+        clusterSize: 1,
+        memberIds: [e.messageId],
+      }));
+    }
+    const byId = new Map(uncategorized.map((e) => [e.messageId, e]));
+    return clusterBySenderAndContent(inputs, IMPROVE_CLUSTER_THRESHOLD)
+      .sort((a, b) => b.memberIds.length - a.memberIds.length)
+      .slice(0, size)
+      .map((cl) => {
+        const rep = byId.get(cl.representativeId);
+        return {
+          subject: rep?.subject ?? null,
+          fromAddr: rep?.fromAddr ?? null,
+          clusterSize: cl.memberIds.length,
+          memberIds: cl.memberIds,
+        };
+      });
+  }
+
+  /**
+   * Filter and score proposed new categories, dropping vague, duplicate, or already-covered labels,
+   * then estimating coverage from cluster hits or an embedding search and keeping those above the floor.
+   */
+  private async scoreNewCategories(
+    accountId: string,
+    embeddingModelId: string,
+    raw: Array<{ label: string; description: string; clusterNumbers: number[] }>,
+    existingCategories: Array<{
+      id: string;
+      label: string;
+      description: string | null;
+      emailCount: number;
+    }>,
+    uncategorized: Array<{ messageId: string; subject: string | null }>,
+    sample: SampledBucket[],
+  ): Promise<SuggestedCategory[]> {
+    const existingLabels = existingCategories.map((c) => normalizeLabel(c.label));
+    const existing = new Set(existingLabels);
+    const fresh = dedupeNearLabels(
+      raw.filter((c) => {
+        return (
+          !isVagueTopicLabel(c.label) &&
+          !existing.has(normalizeLabel(c.label)) &&
+          !isNearDuplicateLabel(c.label, existingLabels) &&
+          !this.matchExistingCategory(c.label, existingCategories)
+        );
+      }),
+    );
+    const existingCentroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
+    const uncatIds = new Set(uncategorized.map((e) => e.messageId));
+    const subjectById = new Map(uncategorized.map((e) => [e.messageId, e.subject]));
+
+    const out: SuggestedCategory[] = [];
+    for (const c of fresh) {
+      let vec: Float32Array;
+      try {
+        vec = Float32Array.from(
+          await this.llm.embed(`${c.label}: ${c.description}`, embeddingModelId),
+        );
+      } catch (err) {
+        this.logger.warn({ err, label: c.label }, 'improve: embed failed, suggestion skipped');
+        continue;
+      }
+      const dupOf = existingCentroids.find(
+        (ec) => cosineFromL2Distance(l2Distance(vec, ec.vector)) >= EXISTING_DUP_COSINE,
+      );
+      if (dupOf) {
+        this.logger.info(
+          { label: c.label, existing: dupOf.label },
+          'improve: dropped suggestion duplicating an existing category',
+        );
+        continue;
+      }
+      const clusterHits = this.clustersForNumbers(c.clusterNumbers, sample).flatMap(
+        (cluster) => cluster.memberIds,
+      );
+      const messageIds =
+        clusterHits.length > 0
+          ? uniqueIds(clusterHits).filter((id) => uncatIds.has(id))
+          : this.embeddings
+              .search(accountId, embeddingModelId, vec, COVERAGE_SEARCH_LIMIT)
+              .filter((h) => h.distance < ASSIGNMENT_THRESHOLD && uncatIds.has(h.messageId))
+              .map((h) => h.messageId);
+      if (messageIds.length < MIN_NEW_CATEGORY_COVERAGE) continue;
+      const samples =
+        clusterHits.length > 0
+          ? sampleSubjects(this.clustersForNumbers(c.clusterNumbers, sample))
+          : messageIds
+              .slice(0, 3)
+              .map((id) => subjectById.get(id) ?? '')
+              .filter((s): s is string => !!s);
+      out.push({
+        label: c.label,
+        description: c.description,
+        estimatedCount: messageIds.length,
+        sampleSubjects: samples,
+        messageIds,
+      });
+    }
+    out.sort((a, b) => b.estimatedCount - a.estimatedCount);
+    return out;
+  }
+
+  /** Resolve proposed merges to real category ids by label, dropping unknown labels and self-merges. */
+  private resolveMerges(
+    raw: Array<{ source: string; target: string; reason: string }>,
+    existing: Array<{ id: string; label: string }>,
+  ): SuggestedMerge[] {
+    const byLabel = new Map(existing.map((c) => [normalizeLabel(c.label), c]));
+    const out: SuggestedMerge[] = [];
+    for (const m of raw) {
+      const src = byLabel.get(normalizeLabel(m.source));
+      const tgt = byLabel.get(normalizeLabel(m.target));
+      if (!src || !tgt || src.id === tgt.id) continue;
+      out.push({
+        sourceId: src.id,
+        sourceLabel: src.label,
+        targetId: tgt.id,
+        targetLabel: tgt.label,
+        reason: m.reason,
+      });
+    }
+    return out;
+  }
+}
