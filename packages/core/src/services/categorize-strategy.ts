@@ -476,3 +476,117 @@ function groupEvidenceCount(
 }
 
 /** Breakdown of how strongly an email's text supports a category: purpose words, phrases, and label tokens. */
+export interface PurposeTextEvidence {
+  words: number;
+  phrases: number;
+  labelTokens: number;
+}
+
+/** Compute the purpose words, phrases, and label tokens a category has in the given email text. */
+export function purposeTextEvidence(
+  text: string,
+  category: { label: string; description: string | null },
+): PurposeTextEvidence {
+  const words = tokenizeWords(text);
+  const normalized = normalizeText(text);
+  return {
+    words: groupEvidenceCount(words, category),
+    phrases: phraseEvidenceStrength(normalized, category),
+    labelTokens: labelTokenSupport(words, category.label),
+  };
+}
+
+/** Whether the normalized text is short enough to apply the relaxed short-text evidence rules. */
+function isShortText(normalized: string): boolean {
+  return normalized.split(' ').filter(Boolean).length <= SHORT_TEXT_MAX_TOKENS;
+}
+
+interface EvidenceParts {
+  w: number;
+  p: number;
+  labeled: boolean;
+}
+/**
+ * Compute the per-category evidence parts for one email: purpose-word count, phrase count, and a
+ * short-text label-match flag that only applies when the text is short.
+ */
+function evidenceParts(
+  words: Set<string>,
+  normalized: string,
+  category: { label: string; description: string | null } | undefined,
+  short: boolean,
+): EvidenceParts {
+  return {
+    w: groupEvidenceCount(words, category),
+    p: phraseEvidenceStrength(normalized, category),
+    labeled:
+      short &&
+      !!category &&
+      labelTokenSupport(words, category.label) >= 1 &&
+      groupEvidenceCount(words, category) >= 1,
+  };
+}
+
+/** Whether the evidence parts amount to strong text support for a category. */
+function isStrongText(parts: EvidenceParts): boolean {
+  return parts.w >= ADJ_STRONG_TEXT_EVIDENCE || (parts.w >= 1 && parts.p >= 1);
+}
+/** Whether the evidence parts meet the minimum bar to count as any text support. */
+function isSupported(parts: EvidenceParts): boolean {
+  return parts.w >= ADJ_MIN_TEXT_SUPPORT || (parts.w >= 1 && parts.p >= 1) || parts.labeled;
+}
+/** Numeric strength of text support, weighting phrases more heavily, or zero when unsupported. */
+function supportMagnitude(parts: EvidenceParts): number {
+  if (!isSupported(parts)) return 0;
+  return parts.w + PHRASE_WEIGHT * parts.p + (parts.labeled ? ADJ_MIN_TEXT_SUPPORT : 0);
+}
+
+/** Count distinct purpose groups among the high-confidence embedding matches. */
+function distinctStrongPurposes(
+  ranked: CategoryMatch[],
+  evidence: AdjudicationEvidence | undefined,
+): number {
+  return new Set(
+    ranked
+      .filter((m) => m.confidence >= ADJ_STRONG_TOP_CONFIDENCE)
+      .map((m) => signatureOf(m.categoryId, evidence))
+      .filter((s): s is number => s !== null),
+  ).size;
+}
+
+/** Count of DISTINCT purpose words for the category found in the email text. */
+export function textEvidenceStrength(
+  text: string,
+  category: { label: string; description: string | null } | undefined,
+): number {
+  return evidenceCount(tokenizeWords(text), category);
+}
+
+/** Whether the email text lexically supports the category at all (at least one purpose word). */
+export function hasTextEvidence(
+  text: string,
+  category: { label: string; description: string | null } | undefined,
+): boolean {
+  return textEvidenceStrength(text, category) >= 1;
+}
+
+/**
+ * Index of the canonical purpose group a category's label/description best matches, or null when it
+ * matches none. Two categories sharing a signature are candidate twins (same broad purpose), used as
+ * a coarse filter that callers confirm with embedding/label similarity before merging.
+ */
+export function purposeSignature(label: string, description?: string | null): number | null {
+  const tokens = tokenizeWords(`${label} ${description ?? ''}`);
+  let best = -1;
+  let bestScore = 0;
+  for (let i = 0; i < PURPOSE_GROUPS.length; i++) {
+    const score = PURPOSE_GROUPS[i]!.reduce((n, g) => n + (tokens.has(g) ? 1 : 0), 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+/** Text and category lookup the adjudicator uses to score candidates against an email's content. */
