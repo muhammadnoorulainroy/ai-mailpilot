@@ -590,3 +590,308 @@ export function purposeSignature(label: string, description?: string | null): nu
 }
 
 /** Text and category lookup the adjudicator uses to score candidates against an email's content. */
+export interface AdjudicationEvidence {
+  text: string;
+  categoryById: Map<string, { label: string; description: string | null }>;
+}
+
+/** Result of adjudication: the chosen category ids and the reason code for the decision. */
+export interface Adjudication {
+  ids: string[];
+  reason:
+    | 'accepted_close_to_top'
+    | 'accepted_text_evidence'
+    | 'accepted_new_category'
+    | 'overridden_strong_embedding'
+    | 'overridden_by_text'
+    | 'rejected_low_rank'
+    | 'rejected_weak_all_around'
+    | 'none';
+}
+
+/**
+ * Adjudicate the LLM's category choice against embedding ranking and generic text evidence, so the
+ * correct category can win even when the LLM picked a different weak one. A second label is only added
+ * when it independently clears a high embedding confidence or has strong text evidence of its own.
+ */
+export function adjudicate(
+  chosenIds: string[],
+  ranked: CategoryMatch[],
+  evidence?: AdjudicationEvidence,
+): Adjudication {
+  if (chosenIds.length === 0) return { ids: [], reason: 'none' };
+  if (ranked.length === 0) {
+    return withSecondary(chosenIds[0]!, chosenIds, ranked, evidence, 'accepted_new_category');
+  }
+  const top = ranked[0]!;
+  const second = ranked[1];
+  const confById = new Map(ranked.map((m) => [m.categoryId, m.confidence]));
+
+  const selected = chosenIds[0]!;
+  const selectedConf = confById.get(selected);
+  const margin = top.confidence - (selectedConf ?? 0);
+
+  if (selectedConf === undefined) {
+    return withSecondary(selected, chosenIds, ranked, evidence, 'accepted_new_category');
+  }
+
+  const words = evidence ? tokenizeWords(evidence.text) : new Set<string>();
+  const normalized = evidence ? normalizeText(evidence.text) : '';
+  const short = isShortText(normalized);
+  const partsOf = (id: string): EvidenceParts =>
+    evidenceParts(words, normalized, evidence?.categoryById.get(id), short);
+  const openPartsOf = (id: string): EvidenceParts =>
+    evidenceParts(words, normalized, evidence?.categoryById.get(id), false);
+  const textSupport = (id: string): boolean => isSupported(partsOf(id));
+
+  if (selected === top.categoryId && top.confidence >= ADJ_WEAK_ALL_AROUND) {
+    return withSecondary(selected, chosenIds, ranked, evidence, 'accepted_close_to_top');
+  }
+
+  const winner = uniqueTextWinner(chosenIds, ranked, evidence);
+  if (winner) {
+    const reason = winner === selected ? 'accepted_text_evidence' : 'overridden_by_text';
+    return withSecondary(winner, chosenIds, ranked, evidence, reason);
+  }
+
+  if (top.confidence < ADJ_WEAK_ALL_AROUND) {
+    return { ids: [], reason: 'rejected_weak_all_around' };
+  }
+
+  if (isSupportedTopTwoPick(selected, ranked, evidence)) {
+    return withSecondary(selected, chosenIds, ranked, evidence, 'accepted_close_to_top');
+  }
+
+  if (top.confidence >= ADJ_STRONG_TOP_CONFIDENCE && margin >= ADJ_TOP_OVERRIDE_MARGIN) {
+    if (isSupported(openPartsOf(selected)) && openPartsOf(top.categoryId).w === 0) {
+      return withSecondary(selected, chosenIds, ranked, evidence, 'accepted_text_evidence');
+    }
+    if (distinctStrongPurposes(ranked, evidence) >= 2) {
+      return { ids: [], reason: 'rejected_low_rank' };
+    }
+    const confirmed =
+      isSupported(partsOf(top.categoryId)) ||
+      (!!second &&
+        second.confidence >= ADJ_STRONG_TOP_CONFIDENCE &&
+        samePurposeIds(top.categoryId, second.categoryId, evidence)) ||
+      top.confidence >= ADJ_VERY_STRONG_TOP;
+    return confirmed
+      ? withSecondary(top.categoryId, chosenIds, ranked, evidence, 'overridden_strong_embedding')
+      : { ids: [], reason: 'rejected_low_rank' };
+  }
+
+  if (margin <= ADJ_CLOSE_TO_TOP_WINDOW) {
+    if (!knownDifferentPurpose(selected, top.categoryId, evidence) || textSupport(selected)) {
+      return withSecondary(selected, chosenIds, ranked, evidence, 'accepted_close_to_top');
+    }
+    if (textSupport(top.categoryId)) {
+      return withSecondary(top.categoryId, chosenIds, ranked, evidence, 'overridden_by_text');
+    }
+    return { ids: [], reason: 'rejected_low_rank' };
+  }
+
+  return { ids: [], reason: 'rejected_low_rank' };
+}
+
+/** Purpose-group signature for a category id, or null when the category or signature is unknown. */
+function signatureOf(id: string, evidence: AdjudicationEvidence | undefined): number | null {
+  const cat = evidence?.categoryById.get(id);
+  return cat ? purposeSignature(cat.label, cat.description) : null;
+}
+
+/** Whether two category ids share the same known purpose signature. */
+function samePurposeIds(
+  idA: string,
+  idB: string,
+  evidence: AdjudicationEvidence | undefined,
+): boolean {
+  const sigA = signatureOf(idA, evidence);
+  return sigA !== null && sigA === signatureOf(idB, evidence);
+}
+
+/** Whether both category ids have known signatures that differ, marking distinct purposes. */
+function knownDifferentPurpose(
+  idA: string,
+  idB: string,
+  evidence: AdjudicationEvidence | undefined,
+): boolean {
+  const sigA = signatureOf(idA, evidence);
+  const sigB = signatureOf(idB, evidence);
+  return sigA !== null && sigB !== null && sigA !== sigB;
+}
+
+/**
+ * Conservative deterministic assignment used ONLY when the LLM output for a cluster is unusable after
+ * retry: assign the embedding top when it is STRONG, text-supported, and not contested by a different
+ * strong purpose. Returns the category id, or null to leave the email uncategorized (never a guess).
+ */
+export function deterministicFallback(
+  ranked: CategoryMatch[],
+  evidence?: AdjudicationEvidence,
+): string | null {
+  const top = ranked[0];
+  if (!top || top.confidence < ADJ_STRONG_TOP_CONFIDENCE) return null;
+  const words = evidence ? tokenizeWords(evidence.text) : new Set<string>();
+  const normalized = evidence ? normalizeText(evidence.text) : '';
+  const short = isShortText(normalized);
+  if (
+    !isSupported(
+      evidenceParts(words, normalized, evidence?.categoryById.get(top.categoryId), short),
+    )
+  ) {
+    return null;
+  }
+  if (isFallbackBlockedByCompetingPurpose(ranked, evidence)) return null;
+  return top.categoryId;
+}
+
+/**
+ * Whether the deterministic fallback should be blocked because a near-equal strong runner-up of a
+ * different purpose contests the top match without the top having a clear text-support margin.
+ */
+function isFallbackBlockedByCompetingPurpose(
+  ranked: CategoryMatch[],
+  evidence: AdjudicationEvidence | undefined,
+): boolean {
+  const top = ranked[0];
+  const second = ranked[1];
+  if (!top || !second || second.confidence < ADJ_STRONG_TOP_CONFIDENCE) return false;
+  if (samePurposeIds(top.categoryId, second.categoryId, evidence)) return false;
+  if (!evidence) return true;
+  const words = tokenizeWords(evidence.text);
+  const normalized = normalizeText(evidence.text);
+  const short = isShortText(normalized);
+  const topSupport = supportMagnitude(
+    evidenceParts(words, normalized, evidence.categoryById.get(top.categoryId), short),
+  );
+  const secondSupport = supportMagnitude(
+    evidenceParts(words, normalized, evidence.categoryById.get(second.categoryId), short),
+  );
+  return topSupport < secondSupport + ADJ_TEXT_UNIQUE_MARGIN;
+}
+
+/**
+ * Whether the selected category sits at rank one or two, has text support, is strong on embedding,
+ * and is not clearly out-supported by the top match, making it safe to accept.
+ */
+function isSupportedTopTwoPick(
+  selected: string,
+  ranked: CategoryMatch[],
+  evidence: AdjudicationEvidence | undefined,
+): boolean {
+  if (!evidence) return false;
+  const rank = ranked.findIndex((m) => m.categoryId === selected);
+  if (rank !== 0 && rank !== 1) return false;
+  const top = ranked[0]!;
+  const sel = ranked[rank]!;
+  const words = tokenizeWords(evidence.text);
+  const normalized = normalizeText(evidence.text);
+  const short = isShortText(normalized);
+  const selParts = evidenceParts(words, normalized, evidence.categoryById.get(selected), short);
+  if (!isSupported(selParts) || distinctStrongPurposes(ranked, evidence) >= 3) return false;
+  const strong =
+    sel.confidence >= ADJ_STRONG_TOP_CONFIDENCE ||
+    top.confidence - sel.confidence <= ADJ_CLOSE_TO_TOP_WINDOW;
+  if (!strong) return false;
+  const topParts = evidenceParts(
+    words,
+    normalized,
+    evidence.categoryById.get(top.categoryId),
+    short,
+  );
+  return supportMagnitude(topParts) <= supportMagnitude(selParts) + ADJ_TEXT_UNIQUE_MARGIN;
+}
+
+/**
+ * Pick the single category whose text evidence is strong and uncontested by a different purpose, or
+ * null when none stands out. Prefers the LLM's pick when it ties for the top purpose.
+ */
+function uniqueTextWinner(
+  chosenIds: string[],
+  ranked: CategoryMatch[],
+  evidence?: AdjudicationEvidence,
+): string | null {
+  if (!evidence) return null;
+  const words = tokenizeWords(evidence.text);
+  const normalized = normalizeText(evidence.text);
+  const confById = new Map(ranked.map((m) => [m.categoryId, m.confidence]));
+  const ids = new Set<string>([...ranked.map((m) => m.categoryId), ...chosenIds]);
+  const scored = [...ids]
+    .map((id) => {
+      const cat = evidence.categoryById.get(id);
+      const parts = evidenceParts(words, normalized, cat, false);
+      return {
+        id,
+        parts,
+        strength: supportMagnitude(parts),
+        sig: cat ? purposeSignature(cat.label, cat.description) : null,
+        conf: confById.get(id) ?? -1,
+      };
+    })
+    .filter((c) => isStrongText(c.parts))
+    .sort((a, b) => b.strength - a.strength);
+  const best = scored[0];
+  if (!best) return null;
+  const conflict = scored.some(
+    (c) =>
+      c.sig !== null &&
+      best.sig !== null &&
+      c.sig !== best.sig &&
+      best.strength - c.strength <= ADJ_TEXT_UNIQUE_MARGIN - 1,
+  );
+  if (conflict) return null;
+  const sameTop = scored.filter((c) => c.sig === best.sig);
+  const llmPick = sameTop.find((c) => c.id === chosenIds[0]);
+  return (llmPick ?? sameTop.sort((a, b) => b.conf - a.conf)[0]!).id;
+}
+
+/**
+ * Build the final adjudication from a primary id, optionally adding one second label from the LLM's
+ * remaining picks when it has a different purpose and clears strong text or grounded embedding support.
+ */
+function withSecondary(
+  primary: string,
+  chosenIds: string[],
+  ranked: CategoryMatch[],
+  evidence: AdjudicationEvidence | undefined,
+  reason: Adjudication['reason'],
+): Adjudication {
+  const confById = new Map(ranked.map((m) => [m.categoryId, m.confidence]));
+  const words = evidence ? tokenizeWords(evidence.text) : new Set<string>();
+  const normalized = evidence ? normalizeText(evidence.text) : '';
+  const short = isShortText(normalized);
+  const primaryCat = evidence?.categoryById.get(primary);
+  const primarySig = evidence
+    ? purposeSignature(primaryCat?.label ?? '', primaryCat?.description)
+    : null;
+  const ids = [primary];
+  for (const id of chosenIds) {
+    if (ids.length >= MAX_LABELS_PER_EMAIL) break;
+    if (ids.includes(id)) continue;
+    const cat = evidence?.categoryById.get(id);
+    if (primarySig !== null && cat && purposeSignature(cat.label, cat.description) === primarySig) {
+      continue;
+    }
+    const conf = confById.get(id);
+    const strongEmbed = conf !== undefined && conf >= ADJ_SECONDARY_STRONG_CONF;
+    if (!evidence) {
+      if (strongEmbed) ids.push(id);
+      continue;
+    }
+    const parts = evidenceParts(words, normalized, cat, short);
+    const groundedEmbed = strongEmbed && groupEvidenceCount(words, cat) >= 1;
+    if (isStrongText(parts) || groundedEmbed) ids.push(id);
+  }
+  return { ids, reason };
+}
+
+const SHORTLIST_MAX = 12;
+const SHORTLIST_WINDOW = 0.08;
+
+const GATE_MIN_CONFIDENCE = 0.8;
+const GATE_SECONDARY_MAX = 0.5;
+
+/**
+ * Categories to offer the LLM for one email, ranked best-first. Sends all when there are few,
+ * otherwise the top MAX. Severe centroid collapse also falls back to all categories.
+ */
