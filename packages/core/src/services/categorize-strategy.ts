@@ -895,3 +895,39 @@ const GATE_SECONDARY_MAX = 0.5;
  * Categories to offer the LLM for one email, ranked best-first. Sends all when there are few,
  * otherwise the top MAX. Severe centroid collapse also falls back to all categories.
  */
+export function shortlistFor(ranked: CategoryMatch[], totalCategories: number): CategoryMatch[] {
+  if (ranked.length === 0) return [];
+  if (totalCategories <= SHORTLIST_MAX) return ranked;
+  const best = ranked[0]!.confidence;
+  const within = ranked.filter((c) => best - c.confidence <= SHORTLIST_WINDOW).length;
+  if (within > SHORTLIST_MAX) return ranked;
+  return ranked.slice(0, SHORTLIST_MAX);
+}
+
+/**
+ * Return the category to auto-assign when the embedding is confident enough to judge alone,
+ * otherwise null to send to the LLM. Requires high absolute confidence and a clearly inapplicable
+ * runner-up.
+ */
+export function gateDecision(ranked: CategoryMatch[]): CategoryMatch | null {
+  const top = ranked[0];
+  if (!top || top.confidence < GATE_MIN_CONFIDENCE) return null;
+  const second = ranked[1];
+  if (second && second.confidence > GATE_SECONDARY_MAX) return null;
+  return top;
+}
+
+const FAST_GATE_MIN_CONFIDENCE = 0.78;
+const FAST_GATE_MIN_MARGIN = 0.1;
+
+/**
+ * Category the fast pass may auto-assign, or null to defer to the LLM. Requires the top match to
+ * clear an absolute confidence floor and beat the second by a clear margin.
+ */
+export function gateFastAssignment(ranked: CategoryMatch[]): CategoryMatch | null {
+  const top = ranked[0];
+  if (!top || top.confidence < FAST_GATE_MIN_CONFIDENCE) return null;
+  const second = ranked[1];
+  if (second && top.confidence - second.confidence < FAST_GATE_MIN_MARGIN) return null;
+  return top;
+}
