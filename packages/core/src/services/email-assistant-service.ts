@@ -363,3 +363,207 @@ function buildContextPrompt(ctx: AssistantContext, chars: number): string {
 }
 
 /** Generates AI summaries and reply drafts for individual emails, with caching and de-duplication. */
+export class EmailAssistantService {
+  private readonly summaryInFlight = new Map<string, Promise<EmailAssistantSummaryDto>>();
+
+  /** Wires the LLM client, repositories, result cache, and logger used to summarize and draft replies. */
+  constructor(
+    private llm: LlmClient,
+    private accounts: AccountRepository,
+    private emails: EmailRepository,
+    private attachments: AttachmentRepository,
+    private cache: EmailAssistantRepository,
+    private logger: Logger,
+  ) {}
+
+  /**
+   * Loads and preprocesses the email body and attachment chunks into an AssistantContext, also
+   * computing the content hash used for caching. Throws when the email is not found.
+   */
+  private loadContext(
+    accountId: string,
+    messageId: string,
+    attachmentChars: number,
+  ): AssistantContext {
+    const email = this.emails.findById(messageId, accountId);
+    if (!email) throw new EmailAssistantNotFoundError();
+
+    const body = email.body
+      ? preprocessForEmbedding(email.body, {
+          format: email.bodyFormat,
+          maxChars: BODY_CHARS,
+          keepQuotes: false,
+        })
+      : '';
+    const attachments = this.attachments.listForMessage(accountId, messageId);
+    const attachmentChunks = this.attachments.loadChunksForMessage(
+      accountId,
+      messageId,
+      attachmentChars,
+    );
+    const withoutHash = {
+      email,
+      body,
+      attachments,
+      attachmentChunks,
+      attachmentDtos: buildAttachmentDtos(attachments, attachmentChunks, email.hasAttachments),
+    };
+    return { ...withoutHash, contentHash: hashContext(withoutHash) };
+  }
+
+  /**
+   * Returns a summary for an email, serving a valid cached result or an in-flight request when
+   * possible. Set `force` to bypass the cache and de-duplication and regenerate.
+   */
+  async summarize(
+    accountId: string,
+    messageId: string,
+    params: EmailAssistantParams,
+    force = false,
+  ): Promise<EmailAssistantSummaryDto> {
+    const ctx = this.loadContext(accountId, messageId, ATTACHMENT_CHARS);
+    const inFlightKey = JSON.stringify([
+      accountId,
+      messageId,
+      ctx.contentHash,
+      params.modelId,
+      params.provider,
+    ]);
+
+    if (!force) {
+      const cached = this.cache.findValidSummary(
+        accountId,
+        messageId,
+        ctx.contentHash,
+        params.modelId,
+      );
+      if (cached) return cached;
+
+      const running = this.summaryInFlight.get(inFlightKey);
+      if (running) return running;
+    }
+
+    const task = this.generateSummary(accountId, messageId, params, ctx);
+    if (!force) this.summaryInFlight.set(inFlightKey, task);
+    try {
+      return await task;
+    } finally {
+      if (!force && this.summaryInFlight.get(inFlightKey) === task) {
+        this.summaryInFlight.delete(inFlightKey);
+      }
+    }
+  }
+
+  /**
+   * Calls the model to produce a summary, parses and normalizes the result, caches it when usable,
+   * and falls back to a placeholder summary when the model returns nothing usable.
+   */
+  private async generateSummary(
+    accountId: string,
+    messageId: string,
+    params: EmailAssistantParams,
+    ctx: AssistantContext,
+  ): Promise<EmailAssistantSummaryDto> {
+    const system = params.provider === 'local' ? `/no_think\n${SUMMARY_SYSTEM}` : SUMMARY_SYSTEM;
+    const raw = await this.llm.chat({
+      model: params.modelId,
+      provider: 'chat',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: buildContextPrompt(ctx, BODY_CHARS) },
+      ],
+      responseFormat: 'json_object',
+      temperature: 0.1,
+      maxTokens: SUMMARY_TOKENS,
+      timeoutMs: TIMEOUT_MS,
+      think: params.provider === 'local' ? false : undefined,
+    });
+
+    const parsed = parseSummaryPayload(raw);
+    const keyPoints = safeArray(parsed.keyPoints);
+    const summaryText = parsed.summary
+      ? normalizeWhitespace(parsed.summary)
+      : (keyPoints[0] ??
+        'A summary could not be generated for this email. Open it to read it, or press Refresh to try again.');
+    if (!parsed.summary) {
+      this.logger.warn(
+        { accountId, messageId, modelId: params.modelId, raw: raw.slice(0, 500) },
+        'email summary model returned no usable summary; serving a fallback',
+      );
+    }
+    const summary: EmailAssistantSummaryDto = {
+      accountId,
+      messageId,
+      subject: ctx.email.subject,
+      fromAddr: ctx.email.fromAddr,
+      date: ctx.email.date,
+      hasAttachments: ctx.email.hasAttachments,
+      modelId: params.modelId,
+      provider: params.provider,
+      generatedAt: Date.now(),
+      cached: false,
+      summary: summaryText,
+      keyPoints,
+      actionRequired: parsed.actionRequired,
+      needsReply: parsed.needsReply,
+      deadline: parsed.deadline ? normalizeWhitespace(parsed.deadline) : null,
+      suggestedAction: parsed.suggestedAction ? normalizeWhitespace(parsed.suggestedAction) : null,
+      attachmentSummary: parsed.attachmentSummary
+        ? normalizeWhitespace(parsed.attachmentSummary)
+        : ctx.email.hasAttachments && ctx.attachmentChunks.length === 0
+          ? 'Attachment present, but no extracted text is available yet.'
+          : null,
+      attachments: ctx.attachmentDtos,
+    };
+    if (parsed.summary) this.cache.saveSummary(ctx.contentHash, summary);
+    this.logger.info({ accountId, messageId, modelId: params.modelId }, 'email summary generated');
+    return summary;
+  }
+
+  /**
+   * Drafts a reply addressed back to the original sender, optionally guided by a user instruction.
+   */
+  async draftReply(
+    accountId: string,
+    messageId: string,
+    userPrompt: string | undefined,
+    params: EmailAssistantParams,
+  ): Promise<EmailAssistantDraftResponse> {
+    const ctx = this.loadContext(accountId, messageId, DRAFT_ATTACHMENT_CHARS);
+    const account = this.accounts.findById(accountId);
+    const instruction = userPrompt?.trim()
+      ? `User instruction for this draft:\n${userPrompt.trim().slice(0, 1000)}`
+      : 'User instruction for this draft:\nWrite a concise, polite reply back to the sender. Acknowledge the email and respond appropriately. Do not summarize or repeat the email back to them.';
+    const identity = [
+      `You are writing AS (the reader sending the reply): ${userSignature(account)}${
+        account?.address ? ` <${account.address}>` : ''
+      }`,
+      `You are replying TO (the original sender of the email above): ${ctx.email.fromAddr ?? '(unknown sender)'}`,
+    ].join('\n');
+    const system = params.provider === 'local' ? `/no_think\n${DRAFT_SYSTEM}` : DRAFT_SYSTEM;
+    const raw = await this.llm.chat({
+      model: params.modelId,
+      provider: 'chat',
+      messages: [
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content: `${buildContextPrompt(ctx, DRAFT_BODY_CHARS)}\n\n${identity}\n\n${instruction}`,
+        },
+      ],
+      temperature: 0.2,
+      maxTokens: DRAFT_TOKENS,
+      timeoutMs: TIMEOUT_MS,
+      think: params.provider === 'local' ? false : undefined,
+    });
+
+    return {
+      accountId,
+      messageId,
+      modelId: params.modelId,
+      provider: params.provider,
+      generatedAt: Date.now(),
+      draft: normalizeDraftFormat(raw, ctx, account),
+    };
+  }
+}
