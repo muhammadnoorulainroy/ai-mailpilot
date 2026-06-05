@@ -1,3 +1,6 @@
+/**
+ * Fastify route handlers for account CRUD operations (list, get, create, delete).
+ */
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
@@ -10,6 +13,9 @@ const CreateAccountBody = z.object({
   kind: z.enum(['personal', 'work', 'institutional']),
 });
 
+/**
+ * Maps an internal account record to the public DTO shape returned by the API.
+ */
 function toDto(account: Account): AccountDto {
   return {
     id: account.id,
@@ -20,6 +26,9 @@ function toDto(account: Account): AccountDto {
   };
 }
 
+/**
+ * Registers the account CRUD routes (list, get, create, delete) on the Fastify instance.
+ */
 export async function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
   app.get('/accounts', async () => {
     const accounts = ctx.repos.accounts.list();
