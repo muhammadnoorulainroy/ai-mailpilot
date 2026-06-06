@@ -1,3 +1,6 @@
+/**
+ * Fastify routes for triggering an account embedding run and polling its progress.
+ */
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
@@ -7,6 +10,9 @@ const EmbedRunBody = z.object({
   modelId: z.string().optional(),
 });
 
+/**
+ * Registers HTTP routes for starting an account embedding run and polling its progress.
+ */
 export async function registerEmbedRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
   app.post('/embed/run', async (req, reply) => {
     const parsed = EmbedRunBody.safeParse(req.body);
@@ -24,11 +30,13 @@ export async function registerEmbedRoutes(app: FastifyInstance, ctx: AppContext)
     const modelId = parsed.data.modelId ?? ctx.config.llm.embeddingModel;
     const result = ctx.services.embedding.start(parsed.data.accountId, modelId);
 
-    return {
-      status: result.started ? ('started' as const) : ('already_running' as const),
-      pending: result.pending,
-      modelId,
-    };
+    const status = result.started
+      ? ('started' as const)
+      : result.pending === 0
+        ? ('up_to_date' as const)
+        : ('already_running' as const);
+
+    return { status, pending: result.pending, modelId };
   });
 
   app.get('/embed/progress', async () => {
