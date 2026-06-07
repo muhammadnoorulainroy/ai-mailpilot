@@ -300,4 +300,184 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
     return { categoryId: req.params.id, emails };
   });
 
+  app.post('/categorize/run', async (req, reply) => {
+    const parsed = CategorizeRunBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    const result = ctx.services.category.start(parsed.data.accountId, embeddingModelId, {
+      force: parsed.data.force ?? false,
+    });
+
+    const status = result.started
+      ? ('started' as const)
+      : result.pending === 0
+        ? ('up_to_date' as const)
+        : ('already_running' as const);
+
+    return { status, pending: result.pending };
+  });
+
+  app.get('/categorize/progress', async () => {
+    return ctx.services.category.getProgress();
+  });
+
+  const LlmCategorizeBody = z.object({
+    accountId: z.string().min(1),
+    generationModelId: z.string().optional(),
+    force: z.boolean().optional(),
+    retryUncategorized: z.boolean().optional(),
+    messageIds: z.array(z.string().min(1)).max(5000).optional(),
+  });
+
+  app.post('/categorize/llm/run', async (req, reply) => {
+    const parsed = LlmCategorizeBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+
+    const useCloud = ctx.config.llm.categorizeUseChatProvider && !!ctx.config.llm.chatBaseUrl;
+    const provider = useCloud ? ('chat' as const) : ('main' as const);
+    const modelId = useCloud
+      ? ctx.config.llm.chatModel || ctx.config.llm.generationModel
+      : (parsed.data.generationModelId ?? ctx.config.llm.generationModel);
+    const result = ctx.services.llmCategorize.start(
+      parsed.data.accountId,
+      modelId,
+      ctx.config.llm.embeddingModel,
+      {
+        force: parsed.data.force ?? false,
+        retryUncategorized: parsed.data.retryUncategorized ?? false,
+        messageIds: parsed.data.messageIds,
+        provider,
+      },
+    );
+
+    const status = result.started
+      ? ('started' as const)
+      : result.pending === 0
+        ? ('up_to_date' as const)
+        : ('already_running' as const);
+
+    return { status, pending: result.pending };
+  });
+
+  app.get('/categorize/llm/progress', async (req) => {
+    const accountId = (req.query as { accountId?: string } | undefined)?.accountId;
+    return ctx.services.llmCategorize.getProgress(accountId);
+  });
+
+  app.post('/categorize/llm/stop', async () => {
+    return { stopped: ctx.services.llmCategorize.stop() };
+  });
+
+  app.get<{ Params: { messageId: string }; Querystring: { accountId: string } }>(
+    '/emails/:messageId/categories',
+    async (req, reply) => {
+      const accountId = req.query.accountId;
+      if (!accountId) {
+        reply.code(400).send({ error: 'missing accountId query param' });
+        return;
+      }
+
+      const assignments = ctx.repos.categories.getEmailCategoriesWithLabels(
+        req.params.messageId,
+        accountId,
+      );
+
+      return {
+        messageId: req.params.messageId,
+        accountId,
+        categories: assignments.map((a) => ({
+          categoryId: a.categoryId,
+          label: a.label,
+          confidence: a.confidence,
+          assignedBy: a.assignedBy,
+          method: a.method ?? null,
+        })),
+      };
+    },
+  );
+
+  const SetCategoriesBody = z.object({
+    accountId: z.string().min(1),
+    categoryIds: z.array(z.string().min(1)).max(10),
+  });
+
+  app.put<{ Params: { messageId: string } }>(
+    '/emails/:messageId/categories',
+    async (req, reply) => {
+      const parsed = SetCategoriesBody.safeParse(req.body);
+      if (!parsed.success) {
+        reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+        return;
+      }
+      const { accountId, categoryIds } = parsed.data;
+
+      const account = ctx.repos.accounts.findById(accountId);
+      if (!account) {
+        reply.code(404).send({ error: 'account not found' });
+        return;
+      }
+      if (!ctx.repos.emails.findById(req.params.messageId, accountId)) {
+        reply.code(404).send({ error: 'email not found' });
+        return;
+      }
+      for (const id of categoryIds) {
+        const cat = ctx.repos.categories.findById(id);
+        if (!cat || cat.accountId !== accountId) {
+          reply.code(400).send({ error: `category ${id} not found for this account` });
+          return;
+        }
+      }
+
+      try {
+        ctx.services.correction.setUserCategories(
+          accountId,
+          req.params.messageId,
+          categoryIds,
+          ctx.config.llm.embeddingModel,
+        );
+      } catch (err) {
+        ctx.logger.error({ err, messageId: req.params.messageId }, 'set user categories failed');
+        reply.code(500).send({
+          error: 'failed to apply correction',
+          message: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
+      const assignments = ctx.repos.categories.getEmailCategoriesWithLabels(
+        req.params.messageId,
+        accountId,
+      );
+      return {
+        messageId: req.params.messageId,
+        accountId,
+        categories: assignments.map((a) => ({
+          categoryId: a.categoryId,
+          label: a.label,
+          confidence: a.confidence,
+          assignedBy: a.assignedBy,
+          method: a.method ?? null,
+        })),
+      };
+    },
+  );
 }
