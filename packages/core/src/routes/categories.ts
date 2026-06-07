@@ -1,0 +1,303 @@
+/**
+ * Fastify route handlers for category management, topic discovery, and email
+ * categorization, including embedding and LLM categorize runs and user corrections.
+ */
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import type { AppContext } from '../context.js';
+import type { CategoryRow } from '../repositories/category-repository.js';
+import type { CategoryDto } from '@ai-mailpilot/shared';
+
+const DiscoverBody = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
+  generationModelId: z.string().optional(),
+});
+
+const ListQuery = z.object({
+  accountId: z.string().min(1),
+});
+
+const CategorizeRunBody = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
+  force: z.boolean().optional(),
+});
+
+/**
+ * Maps a category row plus its email count to the client-facing category DTO.
+ */
+function toDto(row: CategoryRow & { emailCount: number }): CategoryDto {
+  return {
+    id: row.id,
+    accountId: row.accountId,
+    label: row.label,
+    description: row.description,
+    source: row.source,
+    emailCount: row.emailCount,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+/**
+ * Registers the category, topic discovery, and categorization HTTP routes on the Fastify instance.
+ */
+export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
+  app.post('/topics/discover', async (req, reply) => {
+    const parsed = DiscoverBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    const generationModelId = parsed.data.generationModelId ?? ctx.config.llm.generationModel;
+
+    try {
+      const result = await ctx.services.topicDiscovery.discover(
+        parsed.data.accountId,
+        embeddingModelId,
+        generationModelId,
+      );
+      return result;
+    } catch (err) {
+      ctx.logger.error({ err }, 'topic discovery failed');
+      reply.code(500).send({
+        error: 'topic discovery failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  app.post('/categories/improve/suggest', async (req, reply) => {
+    const parsed = DiscoverBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    const useCloud = ctx.config.llm.categorizeUseChatProvider && !!ctx.config.llm.chatBaseUrl;
+    const provider = useCloud ? ('chat' as const) : ('main' as const);
+    const modelId = useCloud
+      ? ctx.config.llm.chatModel || ctx.config.llm.generationModel
+      : (parsed.data.generationModelId ?? ctx.config.llm.generationModel);
+    try {
+      return await ctx.services.categoryImprovement.suggest(
+        parsed.data.accountId,
+        embeddingModelId,
+        modelId,
+        provider,
+      );
+    } catch (err) {
+      ctx.logger.error({ err }, 'improve suggest failed');
+      reply.code(500).send({
+        error: 'improve suggest failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  const ApplyImprovementsBody = z.object({
+    accountId: z.string().min(1),
+    existingCategoryExpansions: z
+      .array(
+        z.object({
+          categoryId: z.string().min(1),
+          messageIds: z.array(z.string().min(1)).max(10000),
+        }),
+      )
+      .max(20)
+      .default([]),
+    newCategories: z
+      .array(
+        z.object({
+          label: z.string().min(1).max(80),
+          description: z.string().max(300),
+          messageIds: z.array(z.string().min(1)).max(10000).optional(),
+        }),
+      )
+      .max(20)
+      .default([]),
+    merges: z
+      .array(z.object({ sourceId: z.string().min(1), targetId: z.string().min(1) }))
+      .max(20)
+      .default([]),
+  });
+
+  app.post('/categories/improve/apply', async (req, reply) => {
+    const parsed = ApplyImprovementsBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const embeddingModelId = ctx.config.llm.embeddingModel;
+    try {
+      return await ctx.services.categoryImprovement.apply(parsed.data.accountId, embeddingModelId, {
+        existingCategoryExpansions: parsed.data.existingCategoryExpansions,
+        newCategories: parsed.data.newCategories,
+        merges: parsed.data.merges,
+      });
+    } catch (err) {
+      ctx.logger.error({ err }, 'improve apply failed');
+      reply.code(500).send({
+        error: 'improve apply failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  app.get('/categories', async (req, reply) => {
+    const parsed = ListQuery.safeParse(req.query);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid query', issues: parsed.error.issues });
+      return;
+    }
+
+    const rows = ctx.repos.categories.listForAccount(parsed.data.accountId);
+    return {
+      accountId: parsed.data.accountId,
+      categories: rows.map(toDto),
+    };
+  });
+
+  app.get('/folder-plan', async (req, reply) => {
+    const parsed = ListQuery.safeParse(req.query);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid query', issues: parsed.error.issues });
+      return;
+    }
+
+    const assignments = ctx.repos.categories.getPrimaryCategoryPerEmail(parsed.data.accountId);
+    const labelById = new Map(
+      ctx.repos.categories.listForAccount(parsed.data.accountId).map((c) => [c.id, c.label]),
+    );
+    const countById = new Map<string, number>();
+    for (const a of assignments) {
+      countById.set(a.categoryId, (countById.get(a.categoryId) ?? 0) + 1);
+    }
+    const categories = [...countById.entries()]
+      .map(([id, count]) => ({ id, label: labelById.get(id) ?? 'Unknown', count }))
+      .sort((a, b) => b.count - a.count);
+
+    return { accountId: parsed.data.accountId, categories, assignments };
+  });
+
+  app.delete<{ Params: { id: string } }>('/categories/:id', async (req, reply) => {
+    const deleted = ctx.repos.categories.delete(req.params.id);
+    if (!deleted) {
+      reply.code(404).send({ error: 'category not found' });
+      return;
+    }
+    reply.code(204).send();
+  });
+
+  const PatchBody = z.object({
+    label: z.string().trim().min(1).max(120).optional(),
+    description: z.string().trim().max(500).nullable().optional(),
+  });
+
+  app.patch<{ Params: { id: string } }>('/categories/:id', async (req, reply) => {
+    const parsed = PatchBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    if (parsed.data.label === undefined && parsed.data.description === undefined) {
+      reply.code(400).send({ error: 'nothing to update' });
+      return;
+    }
+
+    const existing = ctx.repos.categories.findById(req.params.id);
+    if (!existing) {
+      reply.code(404).send({ error: 'category not found' });
+      return;
+    }
+
+    if (parsed.data.label && parsed.data.label !== existing.label) {
+      const clash = ctx.repos.categories.findByLabel(existing.accountId, parsed.data.label);
+      if (clash && clash.id !== existing.id) {
+        reply.code(409).send({ error: 'a category with that label already exists' });
+        return;
+      }
+    }
+
+    const updated = ctx.repos.categories.update(req.params.id, {
+      ...(parsed.data.label !== undefined ? { label: parsed.data.label } : {}),
+      ...(parsed.data.description !== undefined ? { description: parsed.data.description } : {}),
+    });
+    if (!updated) {
+      reply.code(404).send({ error: 'category not found' });
+      return;
+    }
+    const emailCount = ctx.repos.categories.countEmails(updated.id);
+    return toDto({ ...updated, emailCount });
+  });
+
+  const MergeBody = z.object({ targetId: z.string().min(1) });
+
+  app.post<{ Params: { id: string } }>('/categories/:id/merge', async (req, reply) => {
+    const parsed = MergeBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    if (req.params.id === parsed.data.targetId) {
+      reply.code(400).send({ error: 'cannot merge a category into itself' });
+      return;
+    }
+
+    const source = ctx.repos.categories.findById(req.params.id);
+    const target = ctx.repos.categories.findById(parsed.data.targetId);
+    if (!source || !target) {
+      reply.code(404).send({ error: 'source or target category not found' });
+      return;
+    }
+    if (source.accountId !== target.accountId) {
+      reply.code(400).send({ error: 'source and target belong to different accounts' });
+      return;
+    }
+
+    const result = ctx.repos.categories.mergeInto(req.params.id, parsed.data.targetId);
+    return result;
+  });
+
+  const EmailsQuery = z.object({
+    limit: z.coerce.number().int().positive().max(500).optional(),
+    offset: z.coerce.number().int().nonnegative().optional(),
+  });
+
+  app.get<{ Params: { id: string } }>('/categories/:id/emails', async (req, reply) => {
+    const parsedQuery = EmailsQuery.safeParse(req.query);
+    if (!parsedQuery.success) {
+      reply.code(400).send({ error: 'invalid query', issues: parsedQuery.error.issues });
+      return;
+    }
+    const category = ctx.repos.categories.findById(req.params.id);
+    if (!category) {
+      reply.code(404).send({ error: 'category not found' });
+      return;
+    }
+    const limit = parsedQuery.data.limit ?? 200;
+    const offset = parsedQuery.data.offset ?? 0;
+    const emails = ctx.repos.categories.listEmailsForCategory(req.params.id, limit, offset);
+    return { categoryId: req.params.id, emails };
+  });
+
+}
