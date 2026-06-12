@@ -1,0 +1,223 @@
+/*
+ * AI MailPilot - Design Tokens
+ *
+ * Minimal and professional: a neutral graphite base with one emerald accent
+ * (green reads as trust and privacy for a local-first mail tool). No purple,
+ * no emoji. Light and dark, driven entirely by the variables below.
+ */
+
+:root {
+  /* Surface */
+  --bg-app: #eaf0ec; /* soft sage canvas so white cards lift off it */
+  --bg-surface: #ffffff; /* cards, inputs */
+  --bg-subtle: #e2eae5; /* section dividers, hover */
+  --bg-sunken: #d7e1db; /* code blocks, deeply inset areas */
+  --bg-overlay: rgba(17, 20, 19, 0.04);
+
+  /* Borders */
+  --border-subtle: #e0e8e3;
+  --border-default: #ccd6d0;
+  --border-strong: #a1aaa5;
+  --border-focus: #111413;
+
+  /* Text */
+  --text-primary: #111413;
+  --text-secondary: #515854;
+  --text-tertiary: #828a86;
+  --text-inverse: #f6f8f7;
+  --text-link: #047857;
+
+  /* Accent - emerald */
+  --accent: #059669;
+  --accent-hover: #047857;
+  --accent-active: #065f46;
+  --accent-subtle: #d8f1e7;
+  --accent-text: #065f46;
+
+  /* Semantic */
+  --urgent: #dc2626;
+  --urgent-subtle: #fde7e4;
+  --urgent-text: #991b1b;
+
+  --success: #16a34a;
+  --success-subtle: #dcf3e3;
+  --success-text: #166534;
+
+  --warning: #d97706;
+  --warning-subtle: #fbe9d0;
+  --warning-text: #92400e;
+
+  --info: #515854;
+  --info-subtle: #eaeeec;
+
+  /* Shadow */
+  --shadow-sm: 0 1px 2px rgba(17, 20, 19, 0.04);
+  --shadow-md: 0 1px 3px rgba(17, 20, 19, 0.06), 0 1px 2px rgba(17, 20, 19, 0.04);
+  --shadow-lg: 0 8px 24px rgba(17, 20, 19, 0.08), 0 2px 6px rgba(17, 20, 19, 0.04);
+  --ring-focus: 0 0 0 3px rgba(5, 150, 105, 0.18);
+
+  /* Spacing */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
+  --space-10: 72px;
+
+  /* Typography */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Consolas, monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 32px;
+
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.65;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Motion */
+  --easing: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --duration-slow: 280ms;
+  --transition-fast: var(--duration-fast) var(--easing);
+  --transition-base: var(--duration-base) var(--easing);
+
+  /* Layout */
+  --page-max-width: 720px;
+  --header-height: 56px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-app: #121413;
+    --bg-surface: #1a1d1c;
+    --bg-subtle: #232726;
+    --bg-sunken: #2c3130;
+    --bg-overlay: rgba(255, 255, 255, 0.05);
+
+    --border-subtle: #262b29;
+    --border-default: #353b38;
+    --border-strong: #515a56;
+    --border-focus: #eef1ef;
+
+    --text-primary: #eef1ef;
+    --text-secondary: #9aa19d;
+    --text-tertiary: #6d746f;
+    --text-inverse: #121413;
+    --text-link: #34d399;
+
+    --accent: #10b981;
+    --accent-hover: #34d399;
+    --accent-active: #6ee7b7;
+    --accent-subtle: #16352a;
+    --accent-text: #6ee7b7;
+
+    --urgent: #f87171;
+    --urgent-subtle: #3a1d1d;
+    --urgent-text: #fca5a5;
+
+    --success: #4ade80;
+    --success-subtle: #14321f;
+    --success-text: #86efac;
+
+    --warning: #fbbf24;
+    --warning-subtle: #3a2c10;
+    --warning-text: #fcd34d;
+
+    --info: #9aa19d;
+    --info-subtle: #232726;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.3);
+    --ring-focus: 0 0 0 3px rgba(16, 185, 129, 0.3);
+  }
+}
+
+/* Reset */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--text-primary);
+  background: var(--bg-app);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+a {
+  color: var(--text-link);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+  border-bottom-color: transparent;
+  transition: border-color var(--transition-fast);
+}
+
+a:hover {
+  border-bottom-color: currentColor;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+  border-color: var(--border-focus);
+}
+
+::selection {
+  background: var(--accent-subtle);
+  color: var(--accent-text);
+}
