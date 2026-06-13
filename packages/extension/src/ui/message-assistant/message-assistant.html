@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI MailPilot Assistant</title>
+    <link rel="stylesheet" href="../shared/design-tokens.css" />
+    <link rel="stylesheet" href="../shared/primitives.css" />
+    <link rel="stylesheet" href="message-assistant.css" />
+  </head>
+  <body>
+    <main class="assistant">
+      <header class="assistant-header">
+        <div>
+          <h1>AI MailPilot</h1>
+          <p id="email-title" class="muted">Loading email...</p>
+        </div>
+        <span id="provider-badge" class="provider local">Local</span>
+      </header>
+
+      <section id="status" class="status-box">Checking selected email...</section>
+
+      <section id="cloud-gate" class="note" hidden>
+        <p id="cloud-gate-text"></p>
+        <button id="cloud-gate-run" class="btn btn-primary btn-sm" type="button">
+          Generate summary
+        </button>
+      </section>
+
+      <section id="summary-panel" class="stack" hidden>
+        <div class="section-row">
+          <h2 class="section-title">Summary</h2>
+          <button id="refresh-summary" class="btn btn-ghost btn-xs" type="button">Refresh</button>
+        </div>
+        <p id="summary-text" class="summary-text"></p>
+
+        <div id="key-points-wrap" class="stack" hidden>
+          <h2 class="section-title">Key Points</h2>
+          <ul id="key-points" class="key-points"></ul>
+        </div>
+
+        <div class="facts">
+          <div>
+            <span class="fact-label">Action</span>
+            <span id="action-state" class="fact-value">No</span>
+          </div>
+          <div>
+            <span class="fact-label">Reply</span>
+            <span id="reply-state" class="fact-value">No</span>
+          </div>
+          <div>
+            <span class="fact-label">Deadline</span>
+            <span id="deadline-state" class="fact-value">None</span>
+          </div>
+        </div>
+
+        <div id="suggested-action-wrap" class="note" hidden>
+          <span class="fact-label">Suggested Action</span>
+          <p id="suggested-action"></p>
+        </div>
+
+        <div id="attachment-wrap" class="note" hidden>
+          <span class="fact-label">Attachments</span>
+          <p id="attachment-summary"></p>
+          <div id="attachment-list" class="attachment-list"></div>
+        </div>
+      </section>
+
+      <section id="draft-panel" class="draft-panel" hidden>
+        <h2 class="section-title">Draft Reply</h2>
+        <textarea
+          id="draft-prompt"
+          class="draft-prompt"
+          rows="3"
+          placeholder="Optional: tone, language, or what to say"
+        ></textarea>
+        <p id="draft-cloud-note" class="muted" hidden></p>
+        <button id="generate-draft" class="btn btn-primary btn-sm" type="button">
+          Generate draft
+        </button>
+        <div id="draft-output-wrap" class="draft-output-wrap" hidden>
+          <textarea id="draft-output" class="draft-output" rows="8"></textarea>
+          <div class="draft-actions">
+            <button id="open-reply" class="btn btn-primary btn-sm" type="button">Open reply</button>
+            <button id="copy-draft" class="btn btn-secondary btn-sm" type="button">Copy</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="message-assistant.js"></script>
+  </body>
+</html>
