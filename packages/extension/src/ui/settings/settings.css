@@ -1,0 +1,206 @@
+/*
+ * Settings page styles. Most styling comes from primitives.css; this file
+ * holds page-specific tweaks only.
+ */
+
+.page-footer {
+  margin-top: var(--space-9);
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--border-subtle);
+  text-align: center;
+}
+
+.account-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 12px var(--space-4);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.account-row:last-child {
+  border-bottom: none;
+}
+
+.account-info {
+  min-width: 0;
+}
+
+.account-name {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: 2px;
+}
+
+.account-address {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-kind {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  text-transform: capitalize;
+}
+
+.account-kind::before {
+  content: '·';
+  margin-right: var(--space-2);
+  color: var(--text-tertiary);
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px var(--space-4);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.folder-row:last-child {
+  border-bottom: none;
+}
+
+.folder-name {
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+
+.empty-row {
+  padding: var(--space-5) var(--space-4);
+  text-align: center;
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  background: var(--bg-surface);
+}
+
+/* Sync options */
+
+.sync-options {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.check-inline input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* Checkbox options in the LLM settings (cloud categorize/priority, rerank). dashboard.css styles
+   .recat-toggle for its own page, but settings.html does not load that file, so without these rules
+   the labels and their hints render inline and run together. Each option is its own row, and the
+   hint explaining it sits on its own line below. */
+.recat-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.recat-toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.recat-toggle + .hint {
+  display: block;
+  margin-top: var(--space-1);
+}
+
+/* Sync progress banner */
+
+.sync-banner {
+  background: var(--bg-surface);
+  border: 1px solid var(--accent-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4) var(--space-5);
+  margin-bottom: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.sync-banner-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.sync-banner-label {
+  font-size: var(--text-md);
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+}
+
+.sync-banner-count {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-track {
+  height: 6px;
+  background: var(--bg-sunken);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: var(--radius-full);
+  transition: width var(--transition-base);
+}
+
+/* Indeterminate sweep when the total folder count is unknown. */
+.progress-fill.indeterminate {
+  width: 35%;
+  animation: sync-sweep 1.1s var(--easing) infinite;
+}
+
+@keyframes sync-sweep {
+  0% {
+    margin-left: -35%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
