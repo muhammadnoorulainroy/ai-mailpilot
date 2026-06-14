@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI MailPilot - Settings</title>
+    <link rel="stylesheet" href="../shared/design-tokens.css" />
+    <link rel="stylesheet" href="../shared/primitives.css" />
+    <link rel="stylesheet" href="settings.css" />
+  </head>
+  <body>
+    <div class="page">
+      <div class="page-inner">
+        <header class="page-header">
+          <div class="brand">
+            <span class="brand-mark">M</span>
+            <span class="brand-name">AI MailPilot</span>
+            <span class="version" id="version">v0.1.0</span>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-ghost btn-sm" id="btn-open-dashboard" type="button">
+              Open dashboard
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-sync" type="button">
+              Sync inbox now
+            </button>
+          </div>
+        </header>
+
+        <div class="sync-options">
+          <label class="check-inline">
+            <input type="checkbox" id="toggle-force-sync" />
+            <span>Force re-fetch all</span>
+          </label>
+          <span class="hint"
+            >Re-fetches every email body, even already-synced ones. Use to repair partial
+            syncs.</span
+          >
+          <label class="check-inline" style="margin-top: var(--space-3)">
+            <input type="checkbox" id="toggle-auto-index" />
+            <span>Auto-index and categorize new mail</span>
+          </label>
+          <span class="hint"
+            >A few seconds after new mail arrives, index it (so it is searchable) and run the local
+            AI to categorize it. Everything stays on your machine; the local model reads the new
+            emails' content to file them.</span
+          >
+        </div>
+
+        <div class="sync-banner" id="sync-banner" hidden>
+          <div class="sync-banner-head">
+            <span class="sync-banner-label" id="sync-banner-label">Syncing...</span>
+            <span class="sync-banner-count mono" id="sync-banner-count"></span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill" id="sync-banner-fill"></div>
+          </div>
+        </div>
+
+        <section class="stack-xl">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Core Server</h2>
+                <p class="card-description">
+                  The local process that does all email intelligence. Nothing leaves your machine
+                  unless you explicitly configure a remote runtime.
+                </p>
+              </div>
+              <span class="badge badge-neutral" id="health-badge">
+                <span class="dot dot-neutral" id="health-dot"></span>
+                <span id="health-label">Checking</span>
+              </span>
+            </div>
+
+            <div class="stack">
+              <div class="row-between">
+                <div>
+                  <div class="label">Endpoint</div>
+                  <div class="hint mono" id="endpoint-url">http://localhost:3420</div>
+                </div>
+                <button class="btn btn-ghost btn-sm" id="btn-test" type="button">
+                  Test connection
+                </button>
+              </div>
+
+              <div class="row-between" id="llm-row" hidden>
+                <div>
+                  <div class="label">LLM runtime</div>
+                  <div class="hint">
+                    <span id="llm-url" class="mono"></span>
+                    <span class="muted"> · </span>
+                    <span id="llm-models" class="muted">no models</span>
+                  </div>
+                </div>
+                <span class="badge badge-neutral" id="llm-badge">
+                  <span class="dot" id="llm-dot"></span>
+                  <span id="llm-label">unknown</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Pairing</h2>
+                <p class="card-description">
+                  Enter the pairing code shown in the Core Server console to connect. The token is
+                  stored only in the extension and is never sent anywhere else.
+                </p>
+              </div>
+              <span class="badge badge-neutral" id="auth-badge">
+                <span class="dot dot-neutral" id="auth-dot"></span>
+                <span id="auth-label">No token</span>
+              </span>
+            </div>
+
+            <div class="stack">
+              <div class="field">
+                <label class="label" for="pair-code-input">Pairing code</label>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    class="input input-monospace"
+                    id="pair-code-input"
+                    inputmode="numeric"
+                    maxlength="6"
+                    placeholder="6-digit code from the Core console"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <button class="btn btn-primary btn-sm" id="btn-pair" type="button">Pair</button>
+                </div>
+                <span class="hint" id="pair-status">
+                  Shown in the Core Server console at startup as "Pairing code: NNNNNN".
+                </span>
+              </div>
+
+              <details class="field">
+                <summary class="hint">Advanced: paste the token manually</summary>
+                <div class="field-row" style="margin-top: var(--space-2)">
+                  <input
+                    type="password"
+                    class="input input-monospace"
+                    id="token-input"
+                    placeholder="paste authToken from config.json"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <button class="btn btn-secondary btn-sm" id="btn-save-token" type="button">
+                    Save
+                  </button>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Mail accounts</h2>
+                <p class="card-description">
+                  Choose which accounts AI MailPilot may read. Work and school accounts are indexed
+                  by default; personal accounts stay off until you turn them on. Toggle any account
+                  off to stop it being read.
+                </p>
+              </div>
+            </div>
+
+            <div id="accounts-list" class="list">
+              <div class="list-item">
+                <div class="muted">Loading accounts from Thunderbird...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Language models</h2>
+                <p class="card-description">
+                  The embedding model converts emails into vectors. The generation model handles
+                  classification and chat. Both run through your configured LLM runtime.
+                </p>
+              </div>
+            </div>
+
+            <div class="stack-lg">
+              <div class="field">
+                <label class="label" for="embedding-select">Embedding model</label>
+                <select class="select input-monospace" id="embedding-select" disabled>
+                  <option value="">Loading models...</option>
+                </select>
+                <span class="hint">
+                  Must produce 1024-dimensional vectors. <strong>bge-m3</strong> is required.
+                </span>
+              </div>
+
+              <div class="field">
+                <label class="label" for="generation-select">Generation model</label>
+                <select class="select input-monospace" id="generation-select" disabled>
+                  <option value="">Loading models...</option>
+                </select>
+                <span class="hint">
+                  Categorization, topics, and priority. A small/fast model (e.g. qwen3:4b) is fine.
+                </span>
+              </div>
+
+              <div class="field">
+                <label class="label" for="chat-provider">Chat provider</label>
+                <select class="select" id="chat-provider">
+                  <option value="local">Local (Ollama)</option>
+                  <option value="openai">OpenAI (ChatGPT)</option>
+                  <option value="custom">Custom (OpenAI-compatible)</option>
+                </select>
+                <span class="hint">
+                  Where chat answers and the opened-email assistant run. Embeddings always stay
+                  local. A cloud provider sends retrieved snippets, opened-email content, extracted
+                  attachment text, and your prompt to that provider.
+                </span>
+              </div>
+
+              <div class="field" id="chat-local-field">
+                <label class="label" for="chat-select">Local chat model</label>
+                <select class="select input-monospace" id="chat-select" disabled>
+                  <option value="">Loading models...</option>
+                </select>
+                <span class="hint">
+                  A larger, reasoning-capable model (e.g. qwen3:8b) gives better answers. This same
+                  model is used for opened-email summaries and draft replies.
+                </span>
+              </div>
+
+              <div id="chat-cloud-fields" hidden>
+                <div class="field">
+                  <label class="label" for="chat-base-url">API base URL</label>
+                  <input
+                    type="text"
+                    class="input input-monospace"
+                    id="chat-base-url"
+                    placeholder="https://api.openai.com/v1"
+                    spellcheck="false"
+                    autocomplete="off"
+                  />
+                </div>
+                <div class="field">
+                  <label class="label" for="chat-api-key">API key</label>
+                  <input
+                    type="password"
+                    class="input"
+                    id="chat-api-key"
+                    placeholder="sk-..."
+                    spellcheck="false"
+                    autocomplete="off"
+                  />
+                  <span class="hint" id="chat-key-status"></span>
+                </div>
+                <div class="field">
+                  <label class="label" for="chat-model-text">Model</label>
+                  <input
+                    type="text"
+                    class="input input-monospace"
+                    id="chat-model-text"
+                    placeholder="gpt-4o-mini"
+                    spellcheck="false"
+                    autocomplete="off"
+                  />
+                  <span class="hint">
+                    gpt-4o-mini is cheap with a 128k context; gpt-4.1-mini is a quality step up.
+                    This same cloud model is also used for opened-email summaries and draft replies.
+                  </span>
+                </div>
+                <label class="recat-toggle">
+                  <input type="checkbox" id="chat-categorize" />
+                  Also use this cloud model for AI categorization
+                </label>
+                <span class="hint">
+                  Runs "Refine (accurate AI)" and "Improve categories" on the cloud model instead of
+                  the local one. Sends email subjects and snippets to the provider. Embeddings,
+                  Topic Discovery, and the fast Organize pass always stay on your machine; only
+                  Refine and Improve use the cloud, and only while this is on.
+                </span>
+                <label class="recat-toggle">
+                  <input type="checkbox" id="chat-priority" />
+                  Also use this cloud model for Priority
+                </label>
+                <span class="hint">
+                  Speeds up "Run priority pass" by using the configured cloud chat model with larger
+                  batches. Sends email subjects and snippets to the provider. Leave this off to keep
+                  priority triage local.
+                </span>
+              </div>
+
+              <div class="field-row">
+                <div class="field">
+                  <label class="label" for="chat-topk">Emails per answer</label>
+                  <input
+                    type="number"
+                    class="input input-monospace"
+                    id="chat-topk"
+                    min="1"
+                    max="50"
+                    step="1"
+                    placeholder="8"
+                  />
+                </div>
+                <div class="field">
+                  <label class="label" for="chat-snippet">Chars per email</label>
+                  <input
+                    type="number"
+                    class="input input-monospace"
+                    id="chat-snippet"
+                    min="200"
+                    max="8000"
+                    step="100"
+                    placeholder="700"
+                  />
+                </div>
+              </div>
+              <span class="hint">
+                How much context chat retrieval feeds the model. Raise these only after increasing
+                the model's context window (OLLAMA_CONTEXT_LENGTH), or long prompts get truncated.
+                Leave blank for the defaults (8 emails, 700 chars).
+              </span>
+
+              <label class="recat-toggle">
+                <input type="checkbox" id="chat-rerank" />
+                Rerank retrieved results with the AI before answering
+              </label>
+              <span class="hint">
+                Reorders the retrieved emails/attachments by relevance for better answers, at the
+                cost of one extra (fast) model call per question. Uses the generation model.
+              </span>
+
+              <div class="row">
+                <button class="btn btn-primary btn-sm" id="btn-save-models" type="button">
+                  Save LLM settings
+                </button>
+                <span class="hint" id="models-status"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Thunderbird integration</h2>
+                <p class="card-description">
+                  Apply each AI MailPilot category as a Thunderbird tag on its emails. Tags are
+                  non-destructive: messages stay in your Inbox, but colored labels make the
+                  categorization visible in the message list.
+                </p>
+              </div>
+            </div>
+
+            <div class="row-between">
+              <div>
+                <div class="label">Apply categories as tags</div>
+                <span class="hint">Runs automatically after every "Organize inbox".</span>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="toggle-apply-tags" />
+                <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Folder exclusions</h2>
+                <p class="card-description">
+                  AI MailPilot skips any folder whose path contains one of these strings. Defaults
+                  exclude Trash, Junk, Drafts, Spam, and Outbox.
+                </p>
+              </div>
+            </div>
+
+            <div class="stack">
+              <div id="folders-list" class="list"></div>
+              <div class="field-row">
+                <input
+                  type="text"
+                  class="input"
+                  id="folder-input"
+                  placeholder="Add a folder name to exclude"
+                />
+                <button class="btn btn-secondary btn-sm" id="btn-add-folder" type="button">
+                  Add
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <footer class="page-footer">
+          <span class="hint">
+            AI MailPilot is open source and runs entirely on your machine by default.
+          </span>
+        </footer>
+      </div>
+    </div>
+
+    <script type="module" src="./settings.js"></script>
+  </body>
+</html>
