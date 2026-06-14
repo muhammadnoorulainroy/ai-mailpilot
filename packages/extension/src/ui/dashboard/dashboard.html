@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI MailPilot - Dashboard</title>
+    <link rel="stylesheet" href="../shared/design-tokens.css" />
+    <link rel="stylesheet" href="../shared/primitives.css" />
+    <link rel="stylesheet" href="dashboard.css" />
+  </head>
+  <body>
+    <div class="page">
+      <div class="page-inner">
+        <header class="page-header">
+          <div class="brand">
+            <span class="brand-mark">M</span>
+            <span class="brand-name">AI MailPilot</span>
+            <span class="version" id="version">v0.1.0</span>
+          </div>
+          <div class="header-actions">
+            <select id="account-select" class="select select-compact" hidden></select>
+            <button class="btn btn-ghost btn-sm" id="btn-refresh" type="button" title="Refresh">
+              Refresh
+            </button>
+            <button
+              class="btn btn-ghost btn-sm"
+              id="btn-settings"
+              type="button"
+              title="Open settings"
+            >
+              Settings
+            </button>
+          </div>
+        </header>
+
+        <section class="card notice-card" id="empty-state" hidden>
+          <h2 class="card-title" id="empty-title">No accounts paired yet</h2>
+          <p class="card-description" id="empty-description">
+            Open settings, paste your auth token, then enable the accounts you want to index.
+          </p>
+          <div class="row">
+            <button class="btn btn-primary btn-sm" id="btn-empty-settings" type="button">
+              Open settings
+            </button>
+          </div>
+        </section>
+
+        <section class="dash" id="content" hidden>
+          <div class="stats-row">
+            <div class="stat">
+              <div class="stat-label">Indexed emails</div>
+              <div class="stat-value" id="stat-total">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Uncategorized</div>
+              <div class="stat-value" id="stat-unclassified">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Categories</div>
+              <div class="stat-value" id="stat-categories">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Last refreshed</div>
+              <div class="stat-value mono" id="stat-time">--</div>
+            </div>
+          </div>
+
+          <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+            <button class="tab tab-active" role="tab" data-tab="categories" type="button">
+              Categories
+            </button>
+            <button class="tab" role="tab" data-tab="folders" type="button">Folders</button>
+            <button class="tab" role="tab" data-tab="priority" type="button">Priority</button>
+            <button class="tab" role="tab" data-tab="recent" type="button">Recent</button>
+            <button class="tab" role="tab" data-tab="chat" type="button">Chat</button>
+          </nav>
+
+          <section class="tab-panel tab-panel-active" id="panel-categories" role="tabpanel">
+            <div class="panel-toolbar">
+              <p class="panel-intro">
+                Smart categories discovered from your inbox. "Organize (fast)" instantly files only
+                the emails it can match with high confidence and leaves the rest for "Refine
+                (accurate AI)", which reads each email's content to categorize the ambiguous ones.
+                Run Refine for full, accurate coverage. An email can belong to several categories.
+              </p>
+              <div class="panel-actions">
+                <button
+                  class="btn btn-primary btn-sm"
+                  id="btn-organize"
+                  type="button"
+                  title="Fast pass: a safe seed. It assigns only high-confidence matches by embedding similarity and leaves ambiguous mail uncategorized. Run Refine afterwards for full, accurate coverage."
+                >
+                  Organize (fast)
+                </button>
+                <button
+                  class="btn btn-secondary btn-sm"
+                  id="btn-refine-ai"
+                  type="button"
+                  title="Accurate pass: the AI reads email content and decides categories from an embedding shortlist. Slower (one model call per group of similar emails)."
+                >
+                  Refine (accurate AI)
+                </button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  id="btn-retry-uncategorized"
+                  type="button"
+                  title="Re-run the AI only on emails it previously left uncategorized (e.g. after adding categories)"
+                >
+                  Retry uncategorized
+                </button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  id="btn-rediscover"
+                  type="button"
+                  title="Throw away existing categories and discover fresh topics from a new sample"
+                >
+                  Re-discover
+                </button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  id="btn-improve"
+                  type="button"
+                  title="Suggest new categories or merges from emails that fit none of your current categories. You approve before anything changes."
+                >
+                  Improve categories
+                </button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  id="btn-stop-ai"
+                  type="button"
+                  hidden
+                  title="Stop the running AI categorization after the current batch"
+                >
+                  Stop
+                </button>
+                <label
+                  class="recat-toggle"
+                  title="Re-file every email from scratch instead of only new mail. Your manual corrections are always kept."
+                >
+                  <input type="checkbox" id="chk-recategorize-all" />
+                  Recategorize everything
+                </label>
+              </div>
+            </div>
+
+            <div id="categories-summary" class="categories-summary muted" hidden></div>
+
+            <div id="categories-list" class="category-grid">
+              <div class="empty-row">
+                No categories yet. Click "Organize inbox" to discover topics and assign emails.
+              </div>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="panel-folders" role="tabpanel" hidden>
+            <div class="panel-toolbar">
+              <p class="panel-intro">
+                File each email into a Thunderbird folder by its primary category, so you can browse
+                them in the folder pane. Tags keep every label; folders use the top one.
+              </p>
+            </div>
+
+            <div class="folder-layout">
+              <div class="folder-side">
+                <div class="field">
+                  <label class="label" for="folder-parent-input">Parent folder</label>
+                  <input
+                    type="text"
+                    class="input"
+                    id="folder-parent-input"
+                    value="AI MailPilot"
+                    spellcheck="false"
+                  />
+                </div>
+
+                <div class="folder-progress" id="folder-progress" hidden>
+                  <div class="progress-track">
+                    <div class="progress-fill" id="folder-progress-fill"></div>
+                  </div>
+                  <span class="hint" id="folder-progress-label"></span>
+                </div>
+
+                <div class="folder-actions">
+                  <button
+                    class="btn btn-primary btn-sm btn-block"
+                    id="btn-organize-folders"
+                    type="button"
+                  >
+                    Organize into folders
+                  </button>
+                  <button
+                    class="btn btn-ghost btn-sm btn-block"
+                    id="btn-restore-folders"
+                    type="button"
+                  >
+                    Move all back to Inbox
+                  </button>
+                </div>
+                <span class="hint" id="folders-status"></span>
+              </div>
+
+              <div class="folder-tree" id="folder-tree">
+                <div class="empty-row">
+                  Organize your inbox into categories first, then preview here.
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="panel-priority" role="tabpanel" hidden>
+            <div class="focus-header">
+              <div>
+                <h2 class="focus-title">Today's Focus</h2>
+                <p class="focus-sub" id="focus-sub">What needs your attention today.</p>
+              </div>
+              <div class="focus-actions">
+                <div class="segmented" id="priority-range" role="group" aria-label="Range">
+                  <button class="seg seg-active" data-range="today" type="button">Today</button>
+                  <button class="seg" data-range="week" type="button">Last 7 days</button>
+                  <button class="seg" data-range="all" type="button">All</button>
+                </div>
+                <button class="btn btn-secondary btn-sm" id="btn-run-triage" type="button">
+                  Run priority pass
+                </button>
+              </div>
+            </div>
+
+            <div class="metric-grid">
+              <div class="metric metric-action">
+                <div class="metric-label">Needs Action</div>
+                <div class="metric-value" id="metric-needs-action">0</div>
+              </div>
+              <div class="metric metric-urgent">
+                <div class="metric-label">Urgent</div>
+                <div class="metric-value" id="metric-urgent">0</div>
+              </div>
+              <div class="metric metric-important">
+                <div class="metric-label">Important FYI</div>
+                <div class="metric-value" id="metric-important">0</div>
+              </div>
+              <div class="metric metric-low">
+                <div class="metric-label">Low / Spam</div>
+                <div class="metric-value" id="metric-low">0</div>
+              </div>
+            </div>
+
+            <p class="focus-note" id="priority-unclassified" hidden></p>
+
+            <div class="focus-section" id="section-needs-action">
+              <div class="section-title">Needs action</div>
+              <div class="list" id="needs-action-list"></div>
+            </div>
+            <div class="focus-section" id="section-carryover" hidden>
+              <div class="section-title">
+                Carryover <span class="section-hint">unresolved from earlier</span>
+              </div>
+              <div class="list" id="carryover-list"></div>
+            </div>
+            <div class="focus-section" id="section-important">
+              <div class="section-title">Important updates</div>
+              <div class="list" id="important-list"></div>
+            </div>
+            <div class="focus-section" id="section-summaries">
+              <div class="section-title">Summaries &amp; digests</div>
+              <div class="list" id="summaries-list"></div>
+            </div>
+            <details class="focus-section" id="section-low">
+              <summary class="section-title section-summary">
+                Low priority &amp; spam <span class="section-hint" id="low-count"></span>
+              </summary>
+              <div class="list" id="low-list"></div>
+            </details>
+          </section>
+
+          <section class="tab-panel" id="panel-recent" role="tabpanel" hidden>
+            <div class="panel-toolbar">
+              <p class="panel-intro">The latest indexed messages.</p>
+            </div>
+            <div id="recent-list" class="list list-bordered">
+              <div class="empty-row">No emails indexed yet.</div>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="panel-chat" role="tabpanel" hidden>
+            <div class="chat-layout">
+              <aside class="chat-sidebar">
+                <button class="btn btn-secondary btn-sm btn-block" id="chat-new" type="button">
+                  + New chat
+                </button>
+                <div id="chat-conversations" class="chat-convo-list">
+                  <div class="chat-convo-empty">No conversations yet.</div>
+                </div>
+              </aside>
+              <div class="chat-main">
+                <div class="chat-privacy-bar">
+                  <span
+                    id="chat-privacy"
+                    class="chat-privacy local"
+                    title="Chat runs on your machine."
+                    >Local</span
+                  >
+                </div>
+                <div id="chat-messages" class="chat-messages">
+                  <div class="chat-empty">
+                    Ask about your inbox, draft replies, or get summaries. It pulls the relevant
+                    emails for context and cites the ones it used.
+                    <br /><br />
+                    Try: "What did my advisor say about the deadline?", "Draft a reply to Maxime
+                    asking for a meeting tomorrow", or "Summarize my recent emails from the bank."
+                  </div>
+                </div>
+                <form id="chat-form" class="chat-input-row">
+                  <textarea
+                    id="chat-input"
+                    class="chat-input"
+                    rows="1"
+                    placeholder="Ask about your inbox..."
+                    autocomplete="off"
+                  ></textarea>
+                  <button type="submit" class="btn btn-primary btn-sm" id="chat-send">Send</button>
+                  <button
+                    type="button"
+                    class="btn btn-secondary btn-sm"
+                    id="chat-stop"
+                    title="Stop generating"
+                    hidden
+                  >
+                    <span aria-hidden="true">&#9632;</span> Stop
+                  </button>
+                </form>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <footer class="page-footer">
+          <span class="hint" id="status-line">Loading...</span>
+        </footer>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="category-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cat-title">
+        <header class="modal-header">
+          <div class="modal-title-row">
+            <div class="title-field">
+              <span class="title-label" id="cat-title">Category name</span>
+              <input
+                type="text"
+                class="input input-title"
+                id="cat-label-input"
+                placeholder="Category name"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+            <button class="btn btn-ghost btn-sm" id="cat-close" type="button" aria-label="Close">
+              Close
+            </button>
+          </div>
+          <div class="title-field">
+            <span class="title-label">Description</span>
+            <textarea
+              class="textarea"
+              id="cat-description-input"
+              rows="2"
+              placeholder="Describe this category (optional)"
+            ></textarea>
+          </div>
+          <div class="row" id="cat-meta-row">
+            <span class="hint" id="cat-count">0 emails</span>
+            <span class="hint muted" id="cat-source"></span>
+            <span class="spacer"></span>
+            <span class="hint" id="cat-save-status"></span>
+            <button class="btn btn-primary btn-sm" id="cat-save" type="button">Save</button>
+          </div>
+        </header>
+
+        <section class="modal-body">
+          <div class="section-title">Actions</div>
+          <div class="row stack-sm">
+            <select class="select" id="cat-merge-select" style="max-width: 280px">
+              <option value="">Merge into...</option>
+            </select>
+            <button class="btn btn-secondary btn-sm" id="cat-merge" type="button" disabled>
+              Merge
+            </button>
+            <span class="spacer"></span>
+            <button class="btn btn-danger btn-sm" id="cat-delete" type="button">
+              Delete category
+            </button>
+          </div>
+
+          <div class="section-title" style="margin-top: var(--space-5)">Emails</div>
+          <div id="cat-email-list" class="list">
+            <div class="empty-row">Loading...</div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="confirm-modal" hidden>
+      <div class="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+        <header class="modal-header">
+          <h2 class="card-title" id="confirm-title">Confirm</h2>
+          <p class="card-description" id="confirm-message"></p>
+        </header>
+        <section class="modal-body">
+          <div class="row-between">
+            <button class="btn btn-ghost btn-sm" id="confirm-cancel" type="button">Cancel</button>
+            <button class="btn btn-primary btn-sm" id="confirm-ok" type="button">Confirm</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="improve-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="improve-title">
+        <header class="modal-header">
+          <h2 class="card-title" id="improve-title">Improve categories</h2>
+          <p class="card-description" id="improve-summary"></p>
+        </header>
+        <section class="modal-body" id="improve-body"></section>
+        <footer class="modal-header">
+          <div class="row-between">
+            <button class="btn btn-ghost btn-sm" id="improve-cancel" type="button">Cancel</button>
+            <button class="btn btn-primary btn-sm" id="improve-apply" type="button">
+              Apply selected
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <script type="module" src="./dashboard.js"></script>
+  </body>
+</html>
