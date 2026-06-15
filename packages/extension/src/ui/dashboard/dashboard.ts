@@ -516,3 +516,263 @@ let categorizeCloudProvider: string | null = null;
 let priorityCloudProvider: string | null = null;
 
 /** Derives a human-readable cloud provider label from a base URL, or null when no URL is set. */
+function providerLabelFor(url: string | null | undefined): string | null {
+  if (!url) return null;
+  if (url.includes('openai.com')) return 'OpenAI';
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return 'a cloud provider';
+  }
+}
+
+/** Builds the chat placeholder text, noting whether questions stay local or go to a cloud provider. */
+function chatEmptyText(): string {
+  const base =
+    'Ask anything about your inbox. It searches your emails and answers from what it ' +
+    'finds, citing the messages it used. ';
+  return chatCloudProvider
+    ? base +
+        `Cloud chat is on: your question and the retrieved emails are sent to ${chatCloudProvider}.`
+    : base + 'Everything stays on your machine.';
+}
+
+/** Reads the current LLM config to cache which chat, categorize, and priority calls use a cloud provider, then updates the privacy badge. */
+async function refreshChatProvider(): Promise<void> {
+  if (!coreClient.hasToken()) return;
+  try {
+    const cfg = await coreClient.getConfig();
+    chatCloudProvider = providerLabelFor(cfg.llm.chatBaseUrl);
+    categorizeCloudProvider = cfg.llm.categorizeUseChatProvider
+      ? providerLabelFor(cfg.llm.chatBaseUrl)
+      : null;
+    priorityCloudProvider = cfg.llm.priorityUseChatProvider
+      ? providerLabelFor(cfg.llm.chatBaseUrl)
+      : null;
+  } catch {
+    chatCloudProvider = null;
+    categorizeCloudProvider = null;
+    priorityCloudProvider = null;
+  }
+  renderChatPrivacy();
+}
+
+/** Returns the cloud provider label if the priority pass is actually configured to use one with a key set, otherwise null. */
+async function resolvePriorityCloudProvider(): Promise<string | null> {
+  if (!coreClient.hasToken()) return null;
+  try {
+    const cfg = await coreClient.getConfig();
+    const active =
+      cfg.llm.priorityUseChatProvider === true &&
+      !!cfg.llm.chatBaseUrl &&
+      cfg.llm.chatApiKeySet === true;
+    return active ? providerLabelFor(cfg.llm.chatBaseUrl) : null;
+  } catch {
+    return 'a cloud provider';
+  }
+}
+
+/** Updates the chat privacy badge to reflect whether chat runs locally or against a cloud provider. */
+function renderChatPrivacy(): void {
+  const badge = document.getElementById('chat-privacy');
+  if (!badge) return;
+  if (chatCloudProvider) {
+    badge.textContent = `Cloud: ${chatCloudProvider}`;
+    badge.className = 'chat-privacy cloud';
+    badge.title = `Your question and the retrieved emails are sent to ${chatCloudProvider}. Embeddings stay local.`;
+  } else {
+    badge.textContent = 'Local';
+    badge.className = 'chat-privacy local';
+    badge.title = 'Chat runs on your machine; nothing is sent to a cloud provider.';
+  }
+}
+
+/** Builds the localStorage key that remembers the last open conversation for an account. */
+function convoStorageKey(accountId: string): string {
+  return `mailpilot_convo_${accountId}`;
+}
+
+/** Wires the chat form, input, stop, and new-chat controls, including submit on Enter and textarea auto-grow. */
+function setupChat(): void {
+  const form = $<HTMLFormElement>('chat-form');
+  const input = $<HTMLTextAreaElement>('chat-input');
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    void sendChat();
+  });
+  $<HTMLButtonElement>('chat-stop').addEventListener('click', () => chatAbort?.abort());
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void sendChat();
+    }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
+  });
+  $<HTMLButtonElement>('chat-new').addEventListener('click', () => newChat());
+}
+
+/** Clears the chat transcript and shows the empty placeholder message. */
+function showChatEmpty(): void {
+  const container = $('chat-messages');
+  container.innerHTML = '';
+  const empty = document.createElement('div');
+  empty.className = 'chat-empty';
+  empty.textContent = chatEmptyText();
+  container.appendChild(empty);
+}
+
+/** Starts a fresh conversation, clearing the remembered id, transcript, and input. */
+function newChat(): void {
+  currentConversationId = null;
+  if (state.currentAccountId) localStorage.removeItem(convoStorageKey(state.currentAccountId));
+  showChatEmpty();
+  $<HTMLTextAreaElement>('chat-input').value = '';
+  void refreshConversationList();
+}
+
+/** Renders a saved conversation's turns, rendering markdown and source lists for assistant replies. */
+function renderConversationTurns(turns: ConversationDto['turns']): void {
+  const container = $('chat-messages');
+  container.innerHTML = '';
+  if (turns.length === 0) {
+    showChatEmpty();
+    return;
+  }
+  for (const turn of turns) {
+    const el = appendChatMessage(turn.role, turn.content);
+    if (turn.role === 'assistant') renderAnswerMarkdown(el);
+    if (turn.role === 'assistant' && turn.sources?.length) appendSources(turn.sources);
+  }
+}
+
+/** Renders the saved conversation sidebar, each item selectable and deletable, highlighting the current one. */
+function renderConversationList(items: ConversationSummaryDto[]): void {
+  const list = $('chat-conversations');
+  list.innerHTML = '';
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'chat-convo-empty';
+    empty.textContent = 'No conversations yet.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const c of items) {
+    const item = document.createElement('div');
+    item.className = `chat-convo-item${c.id === currentConversationId ? ' active' : ''}`;
+    item.addEventListener('click', () => void selectConversation(c.id));
+
+    const body = document.createElement('div');
+    body.className = 'chat-convo-body';
+    const title = document.createElement('div');
+    title.className = 'chat-convo-title';
+    title.textContent = c.preview || 'New conversation';
+    title.title = c.preview;
+    const time = document.createElement('div');
+    time.className = 'chat-convo-time';
+    time.textContent = formatTime(c.updatedAt);
+    body.append(title, time);
+
+    const del = document.createElement('button');
+    del.className = 'chat-convo-del';
+    del.type = 'button';
+    del.textContent = '×';
+    del.title = 'Delete conversation';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void deleteConversation(c.id, item);
+    });
+
+    item.append(body, del);
+    list.appendChild(item);
+  }
+}
+
+/** Fetches and renders the conversation list for the current account, falling back to empty on error. */
+async function refreshConversationList(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) {
+    renderConversationList([]);
+    return;
+  }
+  try {
+    const res = await coreClient.listConversations(accountId);
+    renderConversationList(res.conversations);
+  } catch {
+    renderConversationList([]);
+  }
+}
+
+/** Opens a saved conversation, loading its turns and remembering it for the account. No-op while chat is busy. */
+async function selectConversation(id: string): Promise<void> {
+  if (chatBusy || id === currentConversationId) return;
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  try {
+    const convo = await coreClient.getConversation(id, accountId);
+    currentConversationId = convo.id;
+    if (state.currentAccountId) {
+      localStorage.setItem(convoStorageKey(state.currentAccountId), convo.id);
+    }
+    renderConversationTurns(convo.turns);
+    void refreshConversationList();
+  } catch {
+    void refreshConversationList();
+  }
+}
+
+/** Deletes a conversation after confirmation, removing its row and clearing the view if it was open. */
+async function deleteConversation(id: string, row?: HTMLElement): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  const ok = await confirmDialog(
+    'Delete conversation',
+    'This permanently removes this chat and its history. This cannot be undone.',
+    'Delete',
+  );
+  if (!ok) return;
+
+  try {
+    await coreClient.deleteConversation(id, accountId);
+  } catch (err) {
+    setStatus(`Could not delete conversation: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
+  row?.remove();
+  if (id === currentConversationId) {
+    currentConversationId = null;
+    if (state.currentAccountId) localStorage.removeItem(convoStorageKey(state.currentAccountId));
+    showChatEmpty();
+  }
+  void refreshConversationList();
+}
+
+/** Restores the last open conversation for an account if one was saved, then refreshes the conversation list. */
+async function loadChatForAccount(accountId: string | null): Promise<void> {
+  currentConversationId = null;
+  showChatEmpty();
+  if (accountId) {
+    const id = localStorage.getItem(convoStorageKey(accountId));
+    if (id) {
+      try {
+        const convo = await coreClient.getConversation(id, accountId);
+        if (convo.turns.length > 0) {
+          renderConversationTurns(convo.turns);
+          currentConversationId = convo.id;
+        }
+      } catch {
+        localStorage.removeItem(convoStorageKey(accountId));
+      }
+    }
+  }
+  await refreshConversationList();
+}
+
+/**
+ * Creates a pending assistant message and returns controls to stream into it.
+ * The returned handles append thinking text, switch to the final answer, and
+ * promote streamed thinking into the answer body.
+ */
