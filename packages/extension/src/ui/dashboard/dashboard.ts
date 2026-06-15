@@ -776,3 +776,207 @@ async function loadChatForAccount(accountId: string | null): Promise<void> {
  * The returned handles append thinking text, switch to the final answer, and
  * promote streamed thinking into the answer body.
  */
+function createAssistantTurn(): {
+  answer: HTMLElement;
+  think: (text: string) => void;
+  answerStart: () => void;
+  promote: () => void;
+} {
+  const empty = document.querySelector('.chat-empty');
+  if (empty) empty.remove();
+  const container = $('chat-messages');
+
+  const answer = document.createElement('div');
+  answer.className = 'chat-msg chat-msg-assistant chat-msg-pending';
+  answer.textContent = 'Thinking…';
+  container.appendChild(answer);
+  scrollChat();
+
+  let details: HTMLDetailsElement | null = null;
+  let body: HTMLElement | null = null;
+  let startedAt = 0;
+
+  /** Lazily creates the collapsible thinking panel on first use and returns its body element. */
+  function ensure(): HTMLElement {
+    if (body) return body;
+    startedAt = Date.now();
+    details = document.createElement('details');
+    details.className = 'chat-thinking';
+    details.open = true;
+    const summary = document.createElement('summary');
+    summary.textContent = 'Thinking…';
+    body = document.createElement('div');
+    body.className = 'chat-thinking-body';
+    details.append(summary, body);
+    container.insertBefore(details, answer);
+    answer.textContent = '';
+    answer.classList.remove('chat-msg-pending');
+    return body;
+  }
+
+  return {
+    answer,
+    think(text: string) {
+      const b = ensure();
+      b.textContent = `${b.textContent ?? ''}${text}`;
+      b.scrollTop = b.scrollHeight;
+      scrollChat();
+    },
+    answerStart() {
+      if (details) {
+        details.open = false;
+        const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+        const summary = details.querySelector('summary');
+        if (summary) summary.textContent = `Thought for ${secs}s`;
+      }
+    },
+    promote() {
+      if (body) {
+        answer.textContent = body.textContent ?? '';
+        details?.remove();
+        details = null;
+        body = null;
+      }
+    },
+  };
+}
+
+/** Sends the typed question, streams the assistant reply with thinking and sources, and handles abort and error states. */
+async function sendChat(): Promise<void> {
+  if (chatBusy) return;
+  const input = $<HTMLTextAreaElement>('chat-input');
+  const question = input.value.trim();
+  if (!question) return;
+
+  const accountId = state.currentAccountId;
+  if (!accountId) {
+    appendChatMessage('assistant', 'Select an account first.');
+    return;
+  }
+
+  chatBusy = true;
+  chatAbort = new AbortController();
+  $<HTMLButtonElement>('chat-send').disabled = true;
+  $<HTMLButtonElement>('chat-send').hidden = true;
+  $<HTMLButtonElement>('chat-stop').hidden = false;
+  appendChatMessage('user', question);
+  input.value = '';
+  input.style.height = 'auto';
+
+  const turn = createAssistantTurn();
+  let answerStarted = false;
+  let errored = false;
+  let pendingSources: ChatSourceDto[] = [];
+  /** True while the account this turn was started for is still the active account. */
+  const stillCurrent = (): boolean => state.currentAccountId === accountId;
+
+  /** Switches the turn from thinking to answer mode the first time answer content arrives. */
+  const beginAnswer = (): void => {
+    if (!answerStarted) {
+      turn.answerStart();
+      turn.answer.textContent = '';
+      turn.answer.classList.remove('chat-msg-pending');
+      answerStarted = true;
+    }
+  };
+  /** Marks the turn as failed, appending an interruption note or replacing the answer with an error. */
+  const fail = (message: string): void => {
+    errored = true;
+    if (answerStarted && (turn.answer.textContent ?? '') !== '') {
+      turn.answer.textContent = `${turn.answer.textContent}\n\n[Interrupted: ${message}]`;
+    } else {
+      beginAnswer();
+      turn.answer.textContent = `Sorry, that failed: ${message}`;
+    }
+  };
+
+  try {
+    await coreClient.chatStream(
+      { accountId, question, conversationId: currentConversationId ?? undefined },
+      {
+        onMeta: (conversationId, sources) => {
+          if (!stillCurrent()) return;
+          currentConversationId = conversationId;
+          localStorage.setItem(convoStorageKey(accountId), conversationId);
+          pendingSources = sources;
+        },
+        onThink: (text) => {
+          if (stillCurrent()) turn.think(text);
+        },
+        onDelta: (text) => {
+          if (!stillCurrent()) return;
+          beginAnswer();
+          turn.answer.textContent = `${turn.answer.textContent ?? ''}${text}`;
+          scrollChat();
+        },
+        onPromote: () => {
+          if (!stillCurrent()) return;
+          turn.answerStart();
+          turn.promote();
+          answerStarted = true;
+        },
+        onError: (message) => {
+          if (stillCurrent()) fail(message);
+        },
+      },
+      chatAbort.signal,
+    );
+    if (!stillCurrent()) return;
+    if (!errored && (turn.answer.textContent ?? '').trim() === '') {
+      turn.answer.classList.remove('chat-msg-pending');
+      turn.answer.textContent = '(no answer)';
+    } else if (!answerStarted && !errored) {
+      turn.answer.classList.remove('chat-msg-pending');
+    }
+    if (answerStarted && !errored) renderAnswerMarkdown(turn.answer);
+    if (answerStarted && !errored && pendingSources.length > 0) appendSources(pendingSources);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      if (stillCurrent() && answerStarted) {
+        turn.answer.classList.remove('chat-msg-pending');
+        renderAnswerMarkdown(turn.answer);
+      } else if (stillCurrent()) {
+        turn.answer.classList.remove('chat-msg-pending');
+        turn.answer.textContent = '(stopped)';
+      }
+    } else if (stillCurrent()) {
+      fail(err instanceof Error ? err.message : String(err));
+    }
+  } finally {
+    chatBusy = false;
+    chatAbort = null;
+    $<HTMLButtonElement>('chat-stop').hidden = true;
+    $<HTMLButtonElement>('chat-send').hidden = false;
+    $<HTMLButtonElement>('chat-send').disabled = false;
+    input.focus();
+    if (stillCurrent()) void refreshConversationList();
+  }
+}
+
+/** Scrolls the chat transcript to the bottom. */
+function scrollChat(): void {
+  const c = $('chat-messages');
+  c.scrollTop = c.scrollHeight;
+}
+
+/** Replaces an element's plain text with rendered markdown when it has non-empty content. */
+function renderAnswerMarkdown(el: HTMLElement): void {
+  const raw = el.textContent ?? '';
+  if (raw.trim()) el.innerHTML = renderMarkdown(raw);
+}
+
+/** Appends a chat message bubble for the given role and returns it. The pending flag styles it as in-progress. */
+function appendChatMessage(role: 'user' | 'assistant', text: string, pending = false): HTMLElement {
+  const empty = document.querySelector('.chat-empty');
+  if (empty) empty.remove();
+
+  const container = $('chat-messages');
+  const msg = document.createElement('div');
+  msg.className = `chat-msg chat-msg-${role}${pending ? ' chat-msg-pending' : ''}`;
+  msg.textContent = text;
+  container.appendChild(msg);
+  container.scrollTop = container.scrollHeight;
+  return msg;
+}
+
+/** Appends a collapsible sources panel, deduplicating by message and attachment, listing each cited email. */
