@@ -412,3 +412,107 @@ function resolutionPastTense(resolution: TriageResolution): string {
 }
 
 /** Renders the category cards with assignment counts and a relative bar, each opening an edit modal. */
+function renderCategories(): void {
+  const d = state.dashboard;
+  if (!d) return;
+
+  const summary = $('categories-summary');
+  const container = $('categories-list');
+  container.innerHTML = '';
+
+  if (d.categories.length === 0) {
+    summary.hidden = true;
+    const empty = document.createElement('div');
+    empty.className = 'empty-row';
+    empty.textContent =
+      'No categories yet. Click "Organize inbox" to discover topics and assign emails.';
+    container.appendChild(empty);
+    return;
+  }
+
+  const assigned = d.emails.total - d.emails.uncategorized;
+  const totalLabels = d.categories.reduce((sum, c) => sum + c.emailCount, 0);
+  summary.hidden = false;
+  summary.textContent =
+    totalLabels > assigned
+      ? `${assigned} of ${d.emails.total} emails assigned to ${d.categoryCount} categories (${totalLabels} labels total; some emails belong to more than one).`
+      : `${assigned} of ${d.emails.total} emails assigned to ${d.categoryCount} categories.`;
+
+  const maxCount = Math.max(...d.categories.map((c) => c.emailCount), 1);
+
+  for (const cat of d.categories) {
+    const card = document.createElement('div');
+    card.className = 'category-card';
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    card.title = 'Open to rename, merge, delete, or re-file emails';
+    card.addEventListener('click', () => openCategoryModal(cat));
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openCategoryModal(cat);
+      }
+    });
+
+    const top = document.createElement('div');
+    top.className = 'category-card-top';
+
+    const label = document.createElement('div');
+    label.className = 'category-label';
+    label.textContent = cat.label;
+
+    const count = document.createElement('span');
+    count.className = 'category-count';
+    count.textContent = String(cat.emailCount);
+    top.append(label, count);
+    card.appendChild(top);
+
+    const desc = document.createElement('div');
+    desc.className = 'category-description';
+    desc.textContent = cat.description ?? '';
+    card.appendChild(desc);
+
+    const bar = document.createElement('div');
+    bar.className = 'category-bar';
+    const fill = document.createElement('div');
+    fill.className = 'category-bar-fill';
+    fill.style.width = `${Math.max(3, (cat.emailCount / maxCount) * 100)}%`;
+    bar.appendChild(fill);
+    card.appendChild(bar);
+
+    container.appendChild(card);
+  }
+}
+
+/** Wires tab buttons to toggle the active tab and panel, lazily loading the priority view when selected. */
+function setupTabs(): void {
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.tab'));
+  const panels = Array.from(document.querySelectorAll<HTMLElement>('.tab-panel'));
+  for (const tab of tabs) {
+    tab.addEventListener('click', () => {
+      const name = tab.dataset.tab;
+      if (!name) return;
+      for (const t of tabs) {
+        const active = t === tab;
+        t.classList.toggle('tab-active', active);
+        t.setAttribute('aria-selected', active ? 'true' : 'false');
+      }
+      for (const panel of panels) {
+        const active = panel.id === `panel-${name}`;
+        panel.hidden = !active;
+        panel.classList.toggle('tab-panel-active', active);
+      }
+      if (name === 'priority') void loadPriority();
+    });
+  }
+}
+
+let currentConversationId: string | null = null;
+let chatBusy = false;
+let chatAbort: AbortController | null = null;
+
+let chatCloudProvider: string | null = null;
+let categorizeCloudProvider: string | null = null;
+let priorityCloudProvider: string | null = null;
+
+/** Derives a human-readable cloud provider label from a base URL, or null when no URL is set. */
