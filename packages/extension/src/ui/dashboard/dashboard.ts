@@ -229,3 +229,186 @@ const BUCKET_LABEL: Record<PriorityEmailDto['bucket'], string> = {
 };
 
 /** Loads the priority focus list for the current account and selected range, then renders it. */
+async function loadPriority(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  try {
+    const data = await coreClient.priority({
+      accountId,
+      range: state.priorityRange,
+      dayStartMs: localDayStartMs(),
+    });
+    if (accountId !== state.currentAccountId) return;
+    state.priority = data;
+    renderPriority();
+  } catch (err) {
+    if (accountId !== state.currentAccountId) return;
+    setStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Renders the priority view metrics, the unclassified hint, and each priority bucket list. */
+function renderPriority(): void {
+  const p = state.priority;
+  if (!p) return;
+
+  $('focus-sub').textContent = RANGE_SUBTITLE[p.range];
+  $('metric-needs-action').textContent = p.counts.needsAction.toLocaleString();
+  $('metric-urgent').textContent = p.counts.urgent.toLocaleString();
+  $('metric-important').textContent = p.counts.important.toLocaleString();
+  $('metric-low').textContent = p.counts.lowPriority.toLocaleString();
+
+  const unclassified = $('priority-unclassified');
+  if (p.counts.unclassified > 0) {
+    unclassified.hidden = false;
+    const scope = p.range === 'all' ? '' : ' in this range';
+    const n = p.counts.unclassified.toLocaleString();
+    unclassified.textContent = `${n} email${p.counts.unclassified === 1 ? '' : 's'}${scope} not classified yet. Run the priority pass to triage them.`;
+  } else {
+    unclassified.hidden = true;
+  }
+
+  const needsEmpty =
+    p.range === 'today' ? 'No urgent email today.' : 'Nothing needs action in this range.';
+  renderPriorityList('needs-action-list', p.needsAction, needsEmpty);
+  renderPriorityList('important-list', p.important, 'No important updates.');
+  renderPriorityList('summaries-list', p.summaries, 'No summaries or digests.');
+  renderPriorityList('low-list', p.lowPriority, 'Nothing low priority.');
+
+  const carrySection = $('section-carryover');
+  if (p.carryover.length > 0) {
+    carrySection.hidden = false;
+    renderPriorityList('carryover-list', p.carryover, 'No carryover.');
+  } else {
+    carrySection.hidden = true;
+  }
+
+  $('low-count').textContent = p.counts.lowPriority > 0 ? `(${p.counts.lowPriority})` : '';
+}
+
+/** Renders a list of priority emails into a container, showing emptyText when there are none. */
+function renderPriorityList(
+  containerId: string,
+  emails: PriorityEmailDto[],
+  emptyText: string,
+): void {
+  const container = $(containerId);
+  container.innerHTML = '';
+  if (emails.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-row';
+    empty.textContent = emptyText;
+    container.appendChild(empty);
+    return;
+  }
+  for (const email of emails) container.appendChild(priorityRow(email));
+}
+
+/** Builds a single priority email row with its subject, bucket tag, summary, and resolve actions. */
+function priorityRow(email: PriorityEmailDto): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'email-row priority-row';
+
+  const meta = document.createElement('div');
+  meta.className = 'email-meta';
+
+  const head = document.createElement('div');
+  head.className = 'priority-head';
+  const subject = document.createElement('span');
+  subject.className = 'email-subject';
+  subject.textContent = email.subject ?? '(no subject)';
+  head.appendChild(subject);
+  const tag = document.createElement('span');
+  tag.className = `priority-tag tag-${email.bucket}`;
+  tag.textContent = BUCKET_LABEL[email.bucket];
+  head.appendChild(tag);
+  if (email.deadlineAt) {
+    const dl = document.createElement('span');
+    dl.className = 'priority-deadline';
+    dl.textContent = `due ${formatTime(email.deadlineAt)}`;
+    head.appendChild(dl);
+  }
+  meta.appendChild(head);
+
+  const from = document.createElement('div');
+  from.className = 'email-from';
+  from.textContent = email.fromAddr ?? '(unknown sender)';
+  meta.appendChild(from);
+
+  const summary = email.shortSummary ?? email.reasoning;
+  if (summary) {
+    const s = document.createElement('div');
+    s.className = 'email-reasoning';
+    s.textContent = summary;
+    meta.appendChild(s);
+  }
+  if (email.suggestedAction) {
+    const a = document.createElement('div');
+    a.className = 'priority-action';
+    a.textContent = email.suggestedAction;
+    meta.appendChild(a);
+  }
+
+  const side = document.createElement('div');
+  side.className = 'priority-side';
+  const date = document.createElement('div');
+  date.className = 'email-date';
+  date.textContent = email.date ? formatTime(email.date) : '';
+  side.appendChild(date);
+
+  const actions = document.createElement('div');
+  actions.className = 'priority-resolve';
+  actions.appendChild(resolveButton('Done', 'done', email.messageId));
+  actions.appendChild(resolveButton('Snooze', 'snooze', email.messageId));
+  actions.appendChild(resolveButton('Dismiss', 'dismiss', email.messageId));
+  side.appendChild(actions);
+
+  row.appendChild(meta);
+  row.appendChild(side);
+  return row;
+}
+
+/** Builds a button that resolves a triaged email to the given resolution when clicked. */
+function resolveButton(
+  label: string,
+  resolution: TriageResolution,
+  messageId: string,
+): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.className = 'btn btn-ghost btn-xs';
+  btn.type = 'button';
+  btn.textContent = label;
+  btn.addEventListener('click', () => void resolvePriority(messageId, resolution));
+  return btn;
+}
+
+/** Applies a triage resolution to an email, reloads the priority view, and offers an undo. Snooze hides it until tomorrow. */
+async function resolvePriority(messageId: string, resolution: TriageResolution): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  try {
+    const snoozedUntil =
+      resolution === 'snooze' ? localDayStartMs() + 24 * 60 * 60 * 1000 : undefined;
+    await coreClient.resolveTriage({ accountId, messageId, resolution, snoozedUntil });
+    await loadPriority();
+    showResolutionUndo(accountId, messageId, resolution);
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Maps a triage resolution to its past-tense status label for the undo prompt. */
+function resolutionPastTense(resolution: TriageResolution): string {
+  switch (resolution) {
+    case 'done':
+      return 'Marked done';
+    case 'snooze':
+      return 'Snoozed until tomorrow';
+    case 'dismiss':
+      return 'Dismissed';
+    case 'reset':
+      return 'Restored';
+  }
+}
+
+/** Renders the category cards with assignment counts and a relative bar, each opening an edit modal. */
