@@ -1450,3 +1450,103 @@ async function resolveTbAccountId(): Promise<string | null> {
 }
 
 /** Sets the status text in the folders panel. */
+function setFoldersStatus(msg: string): void {
+  $('folders-status').textContent = msg;
+}
+
+/** Updates the folder operation progress bar and label from a progress event. */
+function showFolderProgress(p: OrganizeProgress): void {
+  $('folder-progress').hidden = false;
+  const pct = p.total > 0 ? Math.round((p.moved / p.total) * 100) : p.phase === 'done' ? 100 : 0;
+  $('folder-progress-fill').style.width = `${pct}%`;
+  $('folder-progress-label').textContent =
+    p.phase === 'folders'
+      ? 'Creating folders...'
+      : p.phase === 'done'
+        ? 'Done'
+        : `Moving ${p.moved}/${p.total}...`;
+}
+
+/** Enables or disables the organize and restore folder buttons during an operation. */
+function setFolderButtonsDisabled(disabled: boolean): void {
+  $<HTMLButtonElement>('btn-organize-folders').disabled = disabled;
+  $<HTMLButtonElement>('btn-restore-folders').disabled = disabled;
+}
+
+/** Returns the trimmed parent folder name from the input, defaulting to "AI MailPilot". */
+function folderParentName(): string {
+  return $<HTMLInputElement>('folder-parent-input').value.trim() || 'AI MailPilot';
+}
+
+/** Moves emails into Thunderbird folders by primary category after confirmation, reporting progress and results. */
+async function organizeFolders(): Promise<void> {
+  const account = state.currentAccountId;
+  const plan = state.folderPlan;
+  if (!account || !plan) return;
+  if (plan.assignments.length === 0) {
+    setFoldersStatus('Nothing to organize yet. Categorize your inbox first.');
+    return;
+  }
+  const tbAccountId = await resolveTbAccountId();
+  if (!tbAccountId) {
+    setFoldersStatus('Matching Thunderbird account not found.');
+    return;
+  }
+  const parentName = folderParentName();
+
+  const ok = await confirmDialog(
+    'Organize into folders',
+    `Move ${plan.assignments.length} email(s) into ${plan.categories.length} folder(s) under "${parentName}"? Each email moves to its primary category. You can move everything back to the Inbox anytime.`,
+    'Organize',
+  );
+  if (!ok) return;
+
+  setFolderButtonsDisabled(true);
+  setFoldersStatus('');
+  try {
+    const result = await organizeIntoFolders(account, tbAccountId, parentName, showFolderProgress);
+    const missed = result.missing > 0 ? `, ${result.missing} not found in Thunderbird` : '';
+    setFoldersStatus(
+      `Moved ${result.moved} email(s) into ${result.foldersUsed} folder(s)${missed}.`,
+    );
+  } catch (err) {
+    setFoldersStatus(err instanceof Error ? err.message : String(err));
+  } finally {
+    setFolderButtonsDisabled(false);
+    window.setTimeout(() => ($('folder-progress').hidden = true), 1500);
+  }
+}
+
+/** Moves all emails out of the AI MailPilot folders back into the Inbox after confirmation, then refreshes. */
+async function restoreFolders(): Promise<void> {
+  const tbAccountId = await resolveTbAccountId();
+  if (!tbAccountId) {
+    setFoldersStatus('Matching Thunderbird account not found.');
+    return;
+  }
+  const parentName = folderParentName();
+
+  const ok = await confirmDialog(
+    'Move everything back to Inbox',
+    `Move all emails from the "${parentName}" folders back into the Inbox?`,
+    'Move back',
+  );
+  if (!ok) return;
+
+  setFolderButtonsDisabled(true);
+  setFoldersStatus('');
+  try {
+    const result = await restoreFromFolders(tbAccountId, parentName, showFolderProgress);
+    setFoldersStatus(`Moved ${result.movedBack} email(s) back to the Inbox.`);
+    await refreshDashboard();
+  } catch (err) {
+    setFoldersStatus(err instanceof Error ? err.message : String(err));
+  } finally {
+    setFolderButtonsDisabled(false);
+    window.setTimeout(() => ($('folder-progress').hidden = true), 1500);
+  }
+}
+
+let improveSuggestions: ImproveSuggestionsResponse | null = null;
+
+/** Asks Core for category improvement suggestions and opens the review modal, or reports when there are none. */
