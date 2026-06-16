@@ -980,3 +980,96 @@ function appendChatMessage(role: 'user' | 'assistant', text: string, pending = f
 }
 
 /** Appends a collapsible sources panel, deduplicating by message and attachment, listing each cited email. */
+function appendSources(sources: ChatSourceDto[]): void {
+  const container = $('chat-messages');
+  const details = document.createElement('details');
+  details.className = 'chat-sources';
+
+  const seen = new Set<string>();
+  const unique = sources.filter((s) => {
+    const key = `${s.messageId}|${s.attachmentName ?? ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const summary = document.createElement('summary');
+  summary.textContent = `Sources (${unique.length})`;
+  details.appendChild(summary);
+
+  unique.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'chat-source';
+
+    const num = document.createElement('span');
+    num.className = 'chat-source-num';
+    num.textContent = `[${i + 1}]`;
+
+    const subject = document.createElement('span');
+    subject.textContent = s.subject ?? '(no subject)';
+
+    const meta = document.createElement('span');
+    meta.className = 'chat-source-from';
+    meta.textContent = ` ${s.fromAddr ?? 'unknown'}${s.date ? ` \u00b7 ${formatTime(s.date)}` : ''}`;
+
+    row.append(num, subject, meta);
+
+    if (s.attachmentName) {
+      const att = document.createElement('span');
+      att.className = 'chat-source-attachment';
+      att.textContent = `\u{1F4CE} ${s.attachmentName}`;
+      row.appendChild(att);
+    }
+
+    details.appendChild(row);
+  });
+
+  container.appendChild(details);
+  container.scrollTop = container.scrollHeight;
+}
+
+/** Renders the recent emails list, or an empty hint when nothing is indexed. */
+function renderRecent(): void {
+  const d = state.dashboard;
+  if (!d) return;
+  const container = $('recent-list');
+  container.innerHTML = '';
+  if (d.recent.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-row';
+    empty.textContent = 'No emails indexed yet.';
+    container.appendChild(empty);
+    return;
+  }
+  for (const e of d.recent) {
+    container.appendChild(simpleEmailRow(e.subject, e.fromAddr, e.date));
+  }
+}
+
+/** Builds a basic email row showing subject, sender, and date, with fallbacks for missing fields. */
+function simpleEmailRow(
+  subject: string | null,
+  fromAddr: string | null,
+  date: number | null,
+): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'email-row';
+  const meta = document.createElement('div');
+  meta.className = 'email-meta';
+  const subj = document.createElement('div');
+  subj.className = 'email-subject';
+  subj.textContent = subject ?? '(no subject)';
+  meta.appendChild(subj);
+  const from = document.createElement('div');
+  from.className = 'email-from';
+  from.textContent = fromAddr ?? '(unknown sender)';
+  meta.appendChild(from);
+  const dateEl = document.createElement('div');
+  dateEl.className = 'email-date';
+  dateEl.textContent = date ? formatTime(date) : '';
+  row.appendChild(meta);
+  row.appendChild(dateEl);
+  return row;
+}
+
+/** Runs the priority triage pass, confirming first when a cloud provider is used, and polls progress to completion. */
