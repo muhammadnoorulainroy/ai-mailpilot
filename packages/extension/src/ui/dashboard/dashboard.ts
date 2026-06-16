@@ -1073,3 +1073,380 @@ function simpleEmailRow(
 }
 
 /** Runs the priority triage pass, confirming first when a cloud provider is used, and polls progress to completion. */
+async function runTriage(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  priorityCloudProvider = await resolvePriorityCloudProvider();
+  if (priorityCloudProvider) {
+    const ok = await confirmDialog(
+      'Run Priority with cloud AI?',
+      `This priority pass will send email subjects and snippets to ${priorityCloudProvider}. Embeddings stay local. Continue?`,
+      'Run priority pass',
+    );
+    if (!ok) return;
+  }
+  const btn = $<HTMLButtonElement>('btn-run-triage');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+
+  let finalLabel = original;
+
+  try {
+    const result = await coreClient.runTriage({ accountId });
+    if (result.status === 'up_to_date') {
+      setStatus('Priority already up to date.');
+      finalLabel = 'Already up to date';
+    } else if (result.status === 'already_running') {
+      setStatus('Another run is already in progress. Try again when it finishes.');
+      finalLabel = 'Busy';
+    } else {
+      setStatus(
+        priorityCloudProvider
+          ? `Priority pass running on ${result.pending} emails with ${priorityCloudProvider}...`
+          : `Priority pass running on ${result.pending} emails locally...`,
+      );
+      const outcome = await pollProgress('triage', accountId);
+      finalLabel = reportOutcome(outcome, 'Priority pass complete.');
+    }
+    await Promise.all([refreshDashboard(), loadPriority()]);
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+    finalLabel = 'Failed';
+  } finally {
+    btn.textContent = finalLabel;
+    window.setTimeout(() => {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 2000);
+  }
+}
+
+/** Enables or disables all category action buttons while a run is in progress. */
+function setCategoryActionsDisabled(disabled: boolean): void {
+  $<HTMLButtonElement>('btn-organize').disabled = disabled;
+  $<HTMLButtonElement>('btn-rediscover').disabled = disabled;
+  $<HTMLButtonElement>('btn-refine-ai').disabled = disabled;
+  $<HTMLButtonElement>('btn-retry-uncategorized').disabled = disabled;
+  $<HTMLButtonElement>('btn-improve').disabled = disabled;
+}
+
+/** Returns whether the user opted to recategorize every email rather than only new ones. */
+function wantsForce(): boolean {
+  return $<HTMLInputElement>('chk-recategorize-all').checked;
+}
+
+/**
+ * Runs the fast categorization pass, optionally rediscovering topics first.
+ * Confirms a full recategorize, polls progress, then refreshes and applies tags.
+ */
+async function organizeInbox(rediscover: boolean): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  const force = wantsForce();
+  if (force) {
+    const ok = await confirmDialog(
+      'Recategorize everything',
+      'This re-files every email with the fast pass, replacing the current auto-categorization. Your manual corrections are kept. Continue?',
+      'Recategorize',
+    );
+    if (!ok) return;
+  }
+
+  const btn = $<HTMLButtonElement>(rediscover ? 'btn-rediscover' : 'btn-organize');
+  const original = btn.textContent;
+  setCategoryActionsDisabled(true);
+  btn.textContent = rediscover ? 'Re-discovering...' : 'Organizing...';
+
+  let finalLabel = original;
+
+  try {
+    const hasCategories = (state.dashboard?.categories.length ?? 0) > 0;
+    if (rediscover || !hasCategories) {
+      setStatus('Discovering topics from your inbox...');
+      const discovery = await coreClient.discoverTopics({ accountId });
+      if (discovery.status === 'insufficient_categories') {
+        setStatus(
+          hasCategories
+            ? 'Could not find enough clear categories, so your existing categories were kept. Use "Improve categories" to grow them from uncategorized mail, or try a stronger model in Settings.'
+            : 'Could not build clear categories from your inbox yet. Try Re-discover again, switch to a stronger model in Settings, or add categories manually.',
+        );
+        finalLabel = hasCategories ? 'Kept existing' : 'No categories';
+        return;
+      }
+      setStatus(
+        `Discovered ${discovery.topicsCreated} topics from ${discovery.emailsSampled} sampled emails. Assigning...`,
+      );
+    } else {
+      setStatus(force ? 'Recategorizing all emails...' : 'Categorizing new emails...');
+    }
+
+    const result = await coreClient.runCategorize({ accountId, force });
+    if (result.status === 'up_to_date') {
+      setStatus('Inbox already organized.');
+      finalLabel = 'Already up to date';
+    } else if (result.status === 'already_running') {
+      setStatus('Another run is already in progress. Try again when it finishes.');
+      finalLabel = 'Busy';
+    } else {
+      setStatus(`Categorizing ${result.pending} emails...`);
+      const outcome = await pollProgress('categorize', accountId);
+      finalLabel = reportOutcome(outcome, 'Inbox organized.');
+    }
+    await refreshDashboard();
+    await applyTagsIfEnabled();
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+    finalLabel = 'Failed';
+  } finally {
+    btn.textContent = finalLabel;
+    window.setTimeout(() => {
+      btn.textContent = original;
+      setCategoryActionsDisabled(false);
+    }, 2000);
+  }
+}
+
+/**
+ * Runs the slower LLM categorization pass after a confirmation describing scope, cloud use, and local cost.
+ * With opts.retry it only re-reads previously uncategorized mail.
+ */
+async function refineWithAi(opts: { retry?: boolean } = {}): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  if ((state.dashboard?.categories.length ?? 0) === 0) {
+    setStatus('No categories yet. Click "Organize inbox" or "Re-discover" first.');
+    return;
+  }
+
+  const retry = opts.retry ?? false;
+  const force = retry ? false : wantsForce();
+  const total = state.dashboard?.emails.total ?? 0;
+  const scope = force
+    ? `It re-files all ${total.toLocaleString()} emails (your manual corrections are kept).`
+    : `It only upgrades mail the fast pass categorized plus anything uncategorized - existing AI results and your corrections are left alone.`;
+  const cloudNote = categorizeCloudProvider
+    ? ` Cloud categorization is on: email subjects and snippets are sent to ${categorizeCloudProvider}.`
+    : '';
+  const LARGE_LOCAL_RUN = 5000;
+  const localSlowNote =
+    !categorizeCloudProvider && total > LARGE_LOCAL_RUN
+      ? ` Heads up: on an inbox this size the local model can take a long time, often hours. Turning on cloud categorization in Settings is much faster. You can stop the run at any time and the progress is saved.`
+      : '';
+  const ok = await confirmDialog(
+    retry ? 'Retry uncategorized' : 'Refine with AI',
+    (retry
+      ? 'The AI re-reads the emails it previously left uncategorized and files any that now fit a category. Useful after you add or rename categories. Runs in the background. Start now?'
+      : `The AI reads your email content and files each one into the categories that actually fit. It groups near-identical emails so it makes far fewer model calls. ${scope} Runs in the background; you can keep working and refresh later. Start now?`) +
+      cloudNote +
+      localSlowNote,
+    'Start',
+  );
+  if (!ok) return;
+
+  const btn = $<HTMLButtonElement>('btn-refine-ai');
+  const stopBtn = $<HTMLButtonElement>('btn-stop-ai');
+  const original = btn.textContent;
+  setCategoryActionsDisabled(true);
+  btn.textContent = 'Refining...';
+
+  let finalLabel = original;
+  try {
+    const result = await coreClient.runLlmCategorize({
+      accountId,
+      force,
+      retryUncategorized: retry,
+    });
+    if (result.status === 'up_to_date') {
+      setStatus('Nothing to categorize.');
+      finalLabel = 'Up to date';
+    } else if (result.status === 'already_running') {
+      setStatus('A categorization run is already in progress.');
+      finalLabel = 'Busy';
+    } else {
+      setStatus(`AI is reading ${result.pending.toLocaleString()} emails...`);
+      stopBtn.hidden = false;
+      const outcome = await pollProgress('llmCategorize', accountId);
+      finalLabel = reportOutcome(outcome, 'AI categorization complete.');
+    }
+    await refreshDashboard();
+    await applyTagsIfEnabled();
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+    finalLabel = 'Failed';
+  } finally {
+    stopBtn.hidden = true;
+    btn.textContent = finalLabel;
+    window.setTimeout(() => {
+      btn.textContent = original;
+      setCategoryActionsDisabled(false);
+    }, 2000);
+  }
+}
+
+/** Requests that the running LLM categorization stop after the current batch. */
+async function stopAiRun(): Promise<void> {
+  const stopBtn = $<HTMLButtonElement>('btn-stop-ai');
+  stopBtn.disabled = true;
+  try {
+    await coreClient.stopLlmCategorize();
+    setStatus('Stopping after the current batch...');
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  } finally {
+    window.setTimeout(() => {
+      stopBtn.disabled = false;
+    }, 1500);
+  }
+}
+
+/** True when a run status string represents a finished or stopped state. */
+const isTerminal = (s: string): boolean =>
+  s === 'completed' ||
+  s === 'completed_with_failures' ||
+  s === 'error' ||
+  s === 'idle' ||
+  s === 'stopped' ||
+  s === 'interrupted';
+
+const MAX_POLLS = 1200;
+
+interface RunOutcome {
+  status: string;
+  failed: number;
+  error?: string;
+}
+
+/** Sets a status message for a finished run and returns the short button label for its outcome. */
+function reportOutcome(outcome: RunOutcome | null, successMsg: string): string {
+  if (!outcome) return 'In background';
+  if (outcome.status === 'error') {
+    setStatus(
+      outcome.error ??
+        'The run ended with an error; some emails may be unprocessed. Check the Core log.',
+    );
+    return 'Failed';
+  }
+  if (outcome.status === 'stopped') {
+    setStatus('Stopped. Partial results were saved.');
+    return 'Stopped';
+  }
+  if (outcome.status === 'interrupted') {
+    setStatus(
+      'The previous run was interrupted before finishing. Click Refine to continue where it left off.',
+    );
+    return 'Interrupted';
+  }
+  if (outcome.status === 'completed_with_failures') {
+    setStatus(
+      `${successMsg} ${outcome.failed} email(s) could not be processed and will be retried.`,
+    );
+    return 'Done, some failed';
+  }
+  setStatus(successMsg);
+  return 'Done';
+}
+
+/** On load, surfaces a status hint if a previous Refine run was interrupted so the user can resume it. */
+async function surfaceInterruptedRun(): Promise<void> {
+  if (!state.currentAccountId) return;
+  try {
+    const p = await coreClient.llmCategorizeProgress(state.currentAccountId);
+    if (p.status !== 'interrupted') return;
+    if (p.accountId !== null && p.accountId !== state.currentAccountId) return;
+    setStatus(
+      `A previous Refine run was interrupted at ${p.processed.toLocaleString()}/${p.total.toLocaleString()} emails. ` +
+        'Click Refine to continue where it left off.',
+    );
+  } catch {}
+}
+
+/**
+ * Polls a background run of the given kind until it reaches a terminal state,
+ * updating the status line each tick. Returns the outcome, or null if it is
+ * still running after the poll cap.
+ */
+async function pollProgress(
+  kind: 'triage' | 'categorize' | 'llmCategorize',
+  accountId: string,
+): Promise<RunOutcome | null> {
+  const maxPolls = kind === 'llmCategorize' ? MAX_POLLS * 20 : MAX_POLLS;
+  for (let i = 0; i < maxPolls; i++) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    if (kind === 'triage') {
+      const p = await coreClient.triageProgress();
+      if (p.accountId !== null && p.accountId !== accountId) continue;
+      setStatus(`Triage ${p.processed}/${p.total} (${p.failed} failed)`);
+      if (isTerminal(p.status)) return { status: p.status, failed: p.failed };
+    } else if (kind === 'categorize') {
+      const p = await coreClient.categorizeProgress();
+      if (p.accountId !== null && p.accountId !== accountId) continue;
+      setStatus(`Categorize ${p.processed}/${p.total} (${p.assigned} assigned)`);
+      if (isTerminal(p.status))
+        return { status: p.status, failed: (p as { failed?: number }).failed ?? 0 };
+    } else {
+      const p = await coreClient.llmCategorizeProgress(accountId);
+      if (p.accountId !== null && p.accountId !== accountId) continue;
+      if (p.phase === 'preparing' || p.phase === 'clustering') {
+        setStatus('Preparing groups from your inbox... this can take a moment on a large inbox.');
+      } else {
+        const groups =
+          p.clusters > 0
+            ? ` - ${p.clustersProcessed.toLocaleString()}/${p.clusters.toLocaleString()} groups, ${p.llmCalls.toLocaleString()} AI calls`
+            : '';
+        setStatus(
+          `AI categorizing${groups}: ${p.processed.toLocaleString()}/${p.total.toLocaleString()} emails ` +
+            `(${p.assigned.toLocaleString()} labels, ${p.failed} failed)`,
+        );
+      }
+      if (isTerminal(p.status)) return { status: p.status, failed: p.failed, error: p.error };
+    }
+  }
+  setStatus('Still running in the background; refresh to see the latest.');
+  return null;
+}
+
+/** When tag sync is enabled, applies category tags to the matching Thunderbird account and reports the result. */
+async function applyTagsIfEnabled(): Promise<void> {
+  const prefs = await loadSyncPrefs();
+  if (!prefs.applyTags) return;
+  if (!state.currentAccountId) return;
+
+  const coreAccount = state.accounts.find((a) => a.id === state.currentAccountId);
+  if (!coreAccount) return;
+
+  const snapshot = await MailboxSnapshot.load();
+  const tbAccount = snapshot
+    .listAccounts()
+    .find((a) => a.address.toLowerCase() === coreAccount.address.toLowerCase());
+  if (!tbAccount) {
+    setStatus('Tag apply skipped: matching Thunderbird account not found.');
+    return;
+  }
+
+  setStatus('Applying tags in Thunderbird...');
+  try {
+    const result = await applyTagsForAccount(state.currentAccountId, tbAccount.tbId);
+    const created = result.tagsCreated > 0 ? `, ${result.tagsCreated} new tag(s)` : '';
+    const missed = result.missingMessages > 0 ? `, ${result.missingMessages} not found` : '';
+    const cleared = result.staleTagsCleared > 0 ? `, ${result.staleTagsCleared} stale cleared` : '';
+    setStatus(
+      `Tagged ${result.taggedMessages} message(s) in Thunderbird${created}${cleared}${missed}.`,
+    );
+  } catch (err) {
+    setStatus(`Tag apply failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Finds the Thunderbird account id whose address matches the current Core account, or null. */
+async function resolveTbAccountId(): Promise<string | null> {
+  const coreAccount = state.accounts.find((a) => a.id === state.currentAccountId);
+  if (!coreAccount) return null;
+  const snapshot = await MailboxSnapshot.load();
+  const tb = snapshot
+    .listAccounts()
+    .find((a) => a.address.toLowerCase() === coreAccount.address.toLowerCase());
+  return tb?.tbId ?? null;
+}
+
+/** Sets the status text in the folders panel. */
