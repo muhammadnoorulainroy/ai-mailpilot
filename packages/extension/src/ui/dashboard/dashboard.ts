@@ -1550,3 +1550,167 @@ async function restoreFolders(): Promise<void> {
 let improveSuggestions: ImproveSuggestionsResponse | null = null;
 
 /** Asks Core for category improvement suggestions and opens the review modal, or reports when there are none. */
+async function improveCategories(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  setCategoryActionsDisabled(true);
+  setStatus('Looking for categories to add or merge...');
+  try {
+    const s = await coreClient.improveSuggest({ accountId });
+    improveSuggestions = s;
+    if (s.warning) {
+      setStatus(s.warning);
+      return;
+    }
+    if (
+      s.existingCategoryExpansions.length === 0 &&
+      s.newCategories.length === 0 &&
+      s.merges.length === 0
+    ) {
+      setStatus(
+        s.diagnostics?.recommendation ??
+          (s.uncategorizedCount > 0
+            ? `No clear improvements found for ${s.uncategorizedCount.toLocaleString()} uncategorized emails.`
+            : 'Your inbox is well categorized; nothing to improve.'),
+      );
+      return;
+    }
+    renderImproveModal(s);
+    $('improve-modal').hidden = false;
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  } finally {
+    setCategoryActionsDisabled(false);
+  }
+}
+
+/** Renders the improve modal sections for new categories, existing-category expansions, and merges. */
+function renderImproveModal(s: ImproveSuggestionsResponse): void {
+  $('improve-summary').textContent =
+    `${s.uncategorizedCount.toLocaleString()} emails fit no current category. ` +
+    'Pick the changes to apply; nothing happens until you click Apply.';
+  const body = $('improve-body');
+  body.innerHTML = '';
+
+  if (s.newCategories.length > 0) {
+    const rows = s.newCategories.map((c, i) => {
+      const count =
+        c.estimatedCount >= 100
+          ? ' (~100+ similar)'
+          : c.estimatedCount > 0
+            ? ` (~${c.estimatedCount} similar)`
+            : '';
+      const example = c.sampleSubjects.length > 0 ? ` Example: "${c.sampleSubjects[0]}"` : '';
+      return improveRow(`new-${i}`, `${c.label}${count}`, `${c.description}${example}`);
+    });
+    body.appendChild(improveSection('New categories', rows));
+  }
+  if (s.existingCategoryExpansions.length > 0) {
+    const rows = s.existingCategoryExpansions.map((e, i) => {
+      const count =
+        e.estimatedCount >= 100
+          ? ' (~100+ similar)'
+          : e.estimatedCount > 0
+            ? ` (~${e.estimatedCount} similar)`
+            : '';
+      const example = e.sampleSubjects.length > 0 ? ` Example: "${e.sampleSubjects[0]}"` : '';
+      return improveRow(`expand-${i}`, `${e.categoryLabel}${count}`, `${e.reason}${example}`);
+    });
+    body.prepend(improveSection('File into existing categories', rows));
+  }
+  if (s.merges.length > 0) {
+    const rows = s.merges.map((m, i) =>
+      improveRow(`merge-${i}`, `${m.sourceLabel} -> ${m.targetLabel}`, m.reason),
+    );
+    body.appendChild(improveSection('Merge overlapping categories', rows));
+  }
+}
+
+/** Wraps a titled group of improvement rows into a section element. */
+function improveSection(title: string, rows: HTMLElement[]): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'improve-section';
+  const head = document.createElement('div');
+  head.className = 'section-title';
+  head.textContent = title;
+  wrap.appendChild(head);
+  for (const r of rows) wrap.appendChild(r);
+  return wrap;
+}
+
+/** Builds a checked checkbox row for one improvement suggestion, keyed so apply can find selected ones. */
+function improveRow(key: string, title: string, detail: string): HTMLElement {
+  const label = document.createElement('label');
+  label.className = 'improve-row';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = true;
+  cb.dataset.key = key;
+  const text = document.createElement('div');
+  const t = document.createElement('div');
+  t.className = 'improve-row-title';
+  t.textContent = title;
+  const d = document.createElement('div');
+  d.className = 'improve-row-detail';
+  d.textContent = detail;
+  text.append(t, d);
+  label.append(cb, text);
+  return label;
+}
+
+/** Closes the improve modal and clears the cached suggestions. */
+function closeImproveModal(): void {
+  $('improve-modal').hidden = true;
+  improveSuggestions = null;
+}
+
+/** Applies the checked improvement suggestions (new categories, expansions, merges) and refreshes the dashboard. */
+async function applyImprovements(): Promise<void> {
+  const accountId = state.currentAccountId;
+  const s = improveSuggestions;
+  if (!accountId || !s) {
+    closeImproveModal();
+    return;
+  }
+  const checked = new Set(
+    Array.from($('improve-body').querySelectorAll<HTMLInputElement>('input[type=checkbox]'))
+      .filter((c) => c.checked)
+      .map((c) => c.dataset.key ?? ''),
+  );
+  const newCategories = s.newCategories
+    .filter((_, i) => checked.has(`new-${i}`))
+    .map((c) => ({ label: c.label, description: c.description, messageIds: c.messageIds }));
+  const existingCategoryExpansions = s.existingCategoryExpansions
+    .filter((_, i) => checked.has(`expand-${i}`))
+    .map((e) => ({ categoryId: e.categoryId, messageIds: e.messageIds }));
+  const merges = s.merges
+    .filter((_, i) => checked.has(`merge-${i}`))
+    .map((m) => ({ sourceId: m.sourceId, targetId: m.targetId }));
+
+  closeImproveModal();
+  if (existingCategoryExpansions.length === 0 && newCategories.length === 0 && merges.length === 0)
+    return;
+
+  setCategoryActionsDisabled(true);
+  setStatus('Applying category changes...');
+  try {
+    const r = await coreClient.improveApply({
+      accountId,
+      existingCategoryExpansions,
+      newCategories,
+      merges,
+    });
+    setStatus(
+      `Filed ${r.expanded.toLocaleString()} email(s), added ${r.created} categor${
+        r.created === 1 ? 'y' : 'ies'
+      }, merged ${r.merged}. Run Refine to continue improving coverage.`,
+    );
+    await refreshDashboard();
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+  } finally {
+    setCategoryActionsDisabled(false);
+  }
+}
+
+/** Shows the modal confirmation dialog and resolves true on confirm, false on cancel, backdrop click, or Escape. */
