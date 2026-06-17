@@ -2049,3 +2049,165 @@ function setSaveStatus(msg: string, tone: 'muted' | 'success' | 'error' = 'muted
 }
 
 /** Attaches all top-level event handlers for toolbar buttons, account selection, range tabs, and modals. */
+function attachHandlers(): void {
+  setupTabs();
+  setupChat();
+
+  $<HTMLButtonElement>('btn-refresh').addEventListener('click', () => {
+    void refreshDashboard();
+  });
+
+  $<HTMLButtonElement>('btn-settings').addEventListener('click', () => {
+    void browser.runtime.openOptionsPage();
+  });
+
+  $<HTMLButtonElement>('btn-empty-settings').addEventListener('click', () => {
+    void browser.runtime.openOptionsPage();
+  });
+
+  $<HTMLSelectElement>('account-select').addEventListener('change', (e) => {
+    const sel = e.target as HTMLSelectElement;
+    state.currentAccountId = sel.value;
+    state.priority = null;
+    void loadChatForAccount(sel.value);
+    void refreshDashboard();
+    if (!$('panel-priority').hidden) void loadPriority();
+  });
+
+  for (const seg of Array.from(
+    document.querySelectorAll<HTMLButtonElement>('#priority-range .seg'),
+  )) {
+    seg.addEventListener('click', () => {
+      const range = seg.dataset.range as PriorityRange | undefined;
+      if (!range || range === state.priorityRange) return;
+      state.priorityRange = range;
+      for (const s of Array.from(
+        document.querySelectorAll<HTMLButtonElement>('#priority-range .seg'),
+      )) {
+        s.classList.toggle('seg-active', s === seg);
+      }
+      void loadPriority();
+    });
+  }
+
+  $<HTMLButtonElement>('btn-run-triage').addEventListener('click', () => {
+    void runTriage();
+  });
+  $<HTMLButtonElement>('btn-organize').addEventListener('click', () => {
+    void organizeInbox(false);
+  });
+  $<HTMLButtonElement>('btn-refine-ai').addEventListener('click', () => {
+    void refineWithAi();
+  });
+  $<HTMLButtonElement>('btn-retry-uncategorized').addEventListener('click', () => {
+    void refineWithAi({ retry: true });
+  });
+  $<HTMLButtonElement>('btn-stop-ai').addEventListener('click', () => {
+    void stopAiRun();
+  });
+  $<HTMLButtonElement>('btn-rediscover').addEventListener('click', () => {
+    void organizeInbox(true);
+  });
+  $<HTMLButtonElement>('btn-improve').addEventListener('click', () => {
+    void improveCategories();
+  });
+  $<HTMLButtonElement>('improve-cancel').addEventListener('click', closeImproveModal);
+  $<HTMLButtonElement>('improve-apply').addEventListener('click', () => {
+    void applyImprovements();
+  });
+  $('improve-modal').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeImproveModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('improve-modal').hidden) closeImproveModal();
+  });
+
+  $<HTMLButtonElement>('btn-organize-folders').addEventListener('click', () => {
+    void organizeFolders();
+  });
+  $<HTMLButtonElement>('btn-restore-folders').addEventListener('click', () => {
+    void restoreFolders();
+  });
+  $<HTMLInputElement>('folder-parent-input').addEventListener('input', renderFolderTree);
+
+  $<HTMLButtonElement>('cat-close').addEventListener('click', closeCategoryModal);
+  $('category-modal').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeCategoryModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('category-modal').hidden) closeCategoryModal();
+  });
+
+  $<HTMLButtonElement>('cat-save').addEventListener('click', () => {
+    void saveCategoryEdits();
+  });
+  $<HTMLSelectElement>('cat-merge-select').addEventListener('change', (e) => {
+    const target = (e.target as HTMLSelectElement).value;
+    $<HTMLButtonElement>('cat-merge').disabled = !target;
+  });
+  $<HTMLButtonElement>('cat-merge').addEventListener('click', () => {
+    void mergeCurrentCategory();
+  });
+  $<HTMLButtonElement>('cat-delete').addEventListener('click', () => {
+    void deleteCurrentCategory();
+  });
+}
+
+let statusUndoTimer: number | null = null;
+
+/** Sets the status line text and cancels any pending undo timer. */
+function setStatus(msg: string): void {
+  if (statusUndoTimer !== null) {
+    window.clearTimeout(statusUndoTimer);
+    statusUndoTimer = null;
+  }
+  $('status-line').textContent = msg;
+}
+
+/** Shows a status message with an Undo button that resets the triage resolution, auto-clearing after ten seconds. */
+function showResolutionUndo(
+  accountId: string,
+  messageId: string,
+  resolution: TriageResolution,
+): void {
+  if (statusUndoTimer !== null) window.clearTimeout(statusUndoTimer);
+  const el = $('status-line');
+  el.textContent = `${resolutionPastTense(resolution)}. `;
+
+  const undo = document.createElement('button');
+  undo.type = 'button';
+  undo.className = 'status-undo';
+  undo.textContent = 'Undo';
+  undo.addEventListener('click', async () => {
+    undo.disabled = true;
+    try {
+      await coreClient.resolveTriage({ accountId, messageId, resolution: 'reset' });
+      if (accountId === state.currentAccountId) await loadPriority();
+      setStatus('Restored to the focus view.');
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    }
+  });
+  el.appendChild(undo);
+
+  statusUndoTimer = window.setTimeout(() => {
+    statusUndoTimer = null;
+    if (el.contains(undo)) el.textContent = '';
+  }, 10_000);
+}
+
+/** Formats an epoch-millis timestamp as a short local date and time, or "--" when missing. */
+function formatTime(ms: number): string {
+  if (!ms) return '--';
+  const d = new Date(ms);
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+init().catch((err) => {
+  console.error('[MailPilot dashboard] init failed:', err);
+});
