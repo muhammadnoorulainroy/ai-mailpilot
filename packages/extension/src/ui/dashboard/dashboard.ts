@@ -1714,3 +1714,338 @@ async function applyImprovements(): Promise<void> {
 }
 
 /** Shows the modal confirmation dialog and resolves true on confirm, false on cancel, backdrop click, or Escape. */
+function confirmDialog(title: string, message: string, okLabel = 'Confirm'): Promise<boolean> {
+  return new Promise((resolve) => {
+    const backdrop = $('confirm-modal');
+    const okBtn = $<HTMLButtonElement>('confirm-ok');
+    const cancelBtn = $<HTMLButtonElement>('confirm-cancel');
+
+    $('confirm-title').textContent = title;
+    $('confirm-message').textContent = message;
+    okBtn.textContent = okLabel;
+    backdrop.hidden = false;
+
+    /** Hides the dialog, detaches its listeners, and resolves the promise with the result. */
+    const finish = (result: boolean): void => {
+      backdrop.hidden = true;
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      backdrop.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    };
+    /** Confirms the dialog. */
+    const onOk = (): void => finish(true);
+    /** Cancels the dialog. */
+    const onCancel = (): void => finish(false);
+    /** Cancels when the click lands on the backdrop rather than the dialog body. */
+    const onBackdrop = (e: Event): void => {
+      if (e.target === backdrop) finish(false);
+    };
+    /** Cancels the dialog on the Escape key. */
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') finish(false);
+    };
+
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    backdrop.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey);
+  });
+}
+
+interface ModalCategory {
+  id: string;
+  label: string;
+  description: string | null;
+  emailCount: number;
+}
+
+let modalCategory: ModalCategory | null = null;
+
+/** Opens the category edit modal for a category, populating its fields, merge targets, and email list. */
+function openCategoryModal(cat: DashboardCategorySummaryDto): void {
+  modalCategory = {
+    id: cat.id,
+    label: cat.label,
+    description: cat.description,
+    emailCount: cat.emailCount,
+  };
+
+  $<HTMLInputElement>('cat-label-input').value = cat.label;
+  $<HTMLTextAreaElement>('cat-description-input').value = cat.description ?? '';
+  $('cat-count').textContent = cat.emailCount === 1 ? '1 email' : `${cat.emailCount} emails`;
+  $('cat-source').textContent = '';
+  setSaveStatus('');
+
+  const sel = $<HTMLSelectElement>('cat-merge-select');
+  sel.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Merge into...';
+  sel.appendChild(placeholder);
+  for (const other of state.dashboard?.categories ?? []) {
+    if (other.id === cat.id) continue;
+    const opt = document.createElement('option');
+    opt.value = other.id;
+    opt.textContent = other.label;
+    sel.appendChild(opt);
+  }
+  $<HTMLButtonElement>('cat-merge').disabled = true;
+
+  $('category-modal').hidden = false;
+  void loadCategoryEmails(cat.id);
+}
+
+/** Closes the category edit modal and clears its active category. */
+function closeCategoryModal(): void {
+  $('category-modal').hidden = true;
+  modalCategory = null;
+}
+
+/** Loads and renders the emails in a category into the modal, ignoring results if the modal moved on. */
+async function loadCategoryEmails(categoryId: string): Promise<void> {
+  const list = $('cat-email-list');
+  list.innerHTML = '<div class="empty-row">Loading...</div>';
+  try {
+    const result = await coreClient.listEmailsInCategory(categoryId, 200);
+    if (modalCategory?.id !== categoryId) return;
+    renderCategoryEmails(list, result.emails);
+  } catch (err) {
+    if (modalCategory?.id !== categoryId) return;
+    list.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'empty-row';
+    row.textContent = err instanceof Error ? err.message : String(err);
+    list.appendChild(row);
+  }
+}
+
+/** Renders the category modal's email rows, each with an inline category membership editor. */
+function renderCategoryEmails(container: HTMLElement, emails: CategoryEmailDto[]): void {
+  container.innerHTML = '';
+
+  if (emails.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-row';
+    empty.textContent = 'No emails in this category.';
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const email of emails) {
+    const row = document.createElement('div');
+    row.className = 'email-row';
+
+    const meta = document.createElement('div');
+    meta.className = 'email-meta';
+
+    const subject = document.createElement('div');
+    subject.className = 'email-subject';
+    subject.textContent = email.subject ?? '(no subject)';
+    meta.appendChild(subject);
+
+    const from = document.createElement('div');
+    from.className = 'email-from';
+    from.textContent = email.fromAddr ?? '(unknown sender)';
+    meta.appendChild(from);
+
+    meta.appendChild(buildCategoryEditor(email));
+
+    const date = document.createElement('div');
+    date.className = 'email-date';
+    date.textContent = email.date ? formatTime(email.date) : '';
+
+    row.appendChild(meta);
+    row.appendChild(date);
+    container.appendChild(row);
+  }
+}
+
+type ChipProvenance = {
+  assignedBy: 'user' | 'auto';
+  method?: 'embed' | 'llm' | 'gate' | null;
+  confidence: number;
+};
+
+/** Builds a small provenance badge showing how a category was assigned (you, fast embed, gate, or AI), or null. */
+function chipProvenance(cat: ChipProvenance): HTMLElement | null {
+  let text: string;
+  let kind: string;
+  if (cat.assignedBy === 'user') {
+    text = 'You';
+    kind = 'cp-user';
+  } else if (cat.method === 'embed') {
+    text = `Fast ${Math.round(cat.confidence * 100)}%`;
+    kind = 'cp-fast';
+  } else if (cat.method === 'gate') {
+    text = 'Fast';
+    kind = 'cp-fast';
+  } else if (cat.method === 'llm') {
+    text = 'AI';
+    kind = 'cp-ai';
+  } else {
+    return null;
+  }
+  const el = document.createElement('span');
+  el.className = `cat-chip-prov ${kind}`;
+  el.textContent = text;
+  return el;
+}
+
+/** Builds the per-email category editor with removable chips and an add-category dropdown. */
+function buildCategoryEditor(email: CategoryEmailDto): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'cat-editor';
+
+  for (const cat of email.categories) {
+    const chip = document.createElement('span');
+    chip.className = 'cat-chip';
+
+    const label = document.createElement('span');
+    label.textContent = cat.label;
+    chip.appendChild(label);
+
+    const prov = chipProvenance(cat);
+    if (prov) chip.appendChild(prov);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'cat-chip-x';
+    remove.textContent = '×';
+    remove.title = `Remove from ${cat.label}`;
+    remove.addEventListener('click', () => {
+      const next = email.categories.filter((c) => c.id !== cat.id).map((c) => c.id);
+      void applyMembership(email.messageId, next);
+    });
+    chip.appendChild(remove);
+    wrap.appendChild(chip);
+  }
+
+  const present = new Set(email.categories.map((c) => c.id));
+  const add = document.createElement('select');
+  add.className = 'select select-compact cat-add';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = '+ Add';
+  add.appendChild(placeholder);
+  for (const cat of state.dashboard?.categories ?? []) {
+    if (present.has(cat.id)) continue;
+    const opt = document.createElement('option');
+    opt.value = cat.id;
+    opt.textContent = cat.label;
+    add.appendChild(opt);
+  }
+  add.addEventListener('change', () => {
+    if (!add.value) return;
+    void applyMembership(email.messageId, [...email.categories.map((c) => c.id), add.value]);
+  });
+  wrap.appendChild(add);
+
+  return wrap;
+}
+
+/** Saves the new category membership for an email, then reloads the modal list and dashboard. */
+async function applyMembership(messageId: string, categoryIds: string[]): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId || !modalCategory) return;
+  const fromCategoryId = modalCategory.id;
+  setSaveStatus('Saving...');
+  try {
+    await coreClient.setEmailCategories(messageId, accountId, categoryIds);
+    setSaveStatus('Saved. The categories will learn from this.', 'success');
+    if (modalCategory?.id === fromCategoryId) await loadCategoryEmails(fromCategoryId);
+    await refreshDashboard();
+  } catch (err) {
+    setSaveStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Saves edited category label and description when changed, validating that the label is not empty. */
+async function saveCategoryEdits(): Promise<void> {
+  if (!modalCategory) return;
+  const label = $<HTMLInputElement>('cat-label-input').value.trim();
+  const description = $<HTMLTextAreaElement>('cat-description-input').value.trim();
+
+  if (!label) {
+    setSaveStatus('Label cannot be empty.', 'error');
+    return;
+  }
+
+  const labelChanged = label !== modalCategory.label;
+  const descChanged = description !== (modalCategory.description ?? '');
+  if (!labelChanged && !descChanged) {
+    setSaveStatus('No changes.', 'muted');
+    return;
+  }
+
+  setSaveStatus('Saving...');
+  try {
+    await coreClient.updateCategory(modalCategory.id, {
+      ...(labelChanged ? { label } : {}),
+      ...(descChanged ? { description: description || null } : {}),
+    });
+    modalCategory.label = label;
+    modalCategory.description = description || null;
+    setSaveStatus('Saved.', 'success');
+    await refreshDashboard();
+  } catch (err) {
+    setSaveStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Merges the modal's category into a selected target after confirmation, reassigning emails and closing the modal. */
+async function mergeCurrentCategory(): Promise<void> {
+  if (!modalCategory) return;
+  const targetId = $<HTMLSelectElement>('cat-merge-select').value;
+  if (!targetId) return;
+
+  const targetLabel = state.dashboard?.categories.find((c) => c.id === targetId)?.label ?? 'target';
+
+  const confirmed = window.confirm(
+    `Merge "${modalCategory.label}" into "${targetLabel}"? This will reassign every email and delete the source category.`,
+  );
+  if (!confirmed) return;
+
+  setSaveStatus('Merging...');
+  try {
+    const result = await coreClient.mergeCategory(modalCategory.id, { targetId });
+    setSaveStatus(`Merged ${result.reassigned} email(s).`, 'success');
+    await refreshDashboard();
+    closeCategoryModal();
+  } catch (err) {
+    setSaveStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Deletes the modal's category after confirmation, leaving its emails unassigned, then closes the modal. */
+async function deleteCurrentCategory(): Promise<void> {
+  if (!modalCategory) return;
+  const confirmed = window.confirm(
+    `Delete category "${modalCategory.label}"? Its emails will become unassigned (you can re-organize to redistribute them).`,
+  );
+  if (!confirmed) return;
+
+  setSaveStatus('Deleting...');
+  try {
+    await coreClient.deleteCategory(modalCategory.id);
+    await refreshDashboard();
+    closeCategoryModal();
+  } catch (err) {
+    setSaveStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Sets the category modal save-status message and colors it by tone. */
+function setSaveStatus(msg: string, tone: 'muted' | 'success' | 'error' = 'muted'): void {
+  const el = $('cat-save-status');
+  el.textContent = msg;
+  el.style.color =
+    tone === 'error'
+      ? 'var(--urgent-text)'
+      : tone === 'success'
+        ? 'var(--success-text)'
+        : 'var(--text-tertiary)';
+}
+
+/** Attaches all top-level event handlers for toolbar buttons, account selection, range tabs, and modals. */
