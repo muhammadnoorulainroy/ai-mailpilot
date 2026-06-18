@@ -207,3 +207,140 @@ function renderFolders(): void {
 }
 
 /** Fetches Core config when paired and populates every model and chat provider field. */
+async function loadConfigIfAuthed(): Promise<void> {
+  if (!coreClient.hasToken()) {
+    populateModelSelects(null, null, null);
+    return;
+  }
+  try {
+    const cfg = await coreClient.getConfig();
+    $('endpoint-url').textContent = cfg.llm.baseUrl;
+    const chatBaseUrl = cfg.llm.chatBaseUrl ?? '';
+    state.savedChatBaseUrl = cfg.llm.chatBaseUrl ?? null;
+    state.savedChatModel = cfg.llm.chatModel ?? null;
+    const provider =
+      chatBaseUrl === '' ? 'local' : chatBaseUrl.includes('openai.com') ? 'openai' : 'custom';
+    populateModelSelects(
+      cfg.llm.embeddingModel,
+      cfg.llm.generationModel,
+      localChatModelForSelect(cfg.llm.chatModel, cfg.llm.generationModel),
+    );
+    $<HTMLInputElement>('chat-topk').value = cfg.llm.chatTopK?.toString() ?? '';
+    $<HTMLInputElement>('chat-snippet').value = cfg.llm.chatSnippetChars?.toString() ?? '';
+    $<HTMLInputElement>('chat-rerank').checked = cfg.llm.chatRerank ?? true;
+
+    $<HTMLSelectElement>('chat-provider').value = provider;
+    $<HTMLInputElement>('chat-base-url').value = chatBaseUrl;
+    const modelField = $<HTMLInputElement>('chat-model-text');
+    modelField.value = provider === 'local' ? '' : (cfg.llm.chatModel ?? '');
+    if (
+      provider === 'openai' &&
+      (!modelField.value.trim() || modelField.value.trim() === cfg.llm.generationModel)
+    ) {
+      modelField.value = 'gpt-4o-mini';
+    }
+    $<HTMLInputElement>('chat-categorize').checked = cfg.llm.categorizeUseChatProvider ?? false;
+    $<HTMLInputElement>('chat-priority').checked = cfg.llm.priorityUseChatProvider ?? false;
+    $('chat-key-status').textContent = cfg.llm.chatApiKeySet
+      ? 'A key is configured. Leave blank to keep it.'
+      : 'No key stored yet.';
+    applyChatProvider(provider);
+
+    $<HTMLInputElement>('toggle-auto-index').checked = cfg.autoIndex;
+  } catch (err) {
+    setStatus('models-status', err instanceof Error ? err.message : String(err), 'error');
+    populateModelSelects(null, null, null);
+  }
+}
+
+/**
+ * Picks which local model to preselect for chat, using the configured chat model when
+ * it is available locally and otherwise falling back to the generation model.
+ */
+function localChatModelForSelect(
+  configuredChat: string | undefined,
+  generationModel: string,
+): string {
+  const generationModels = state.availableModels.filter((m) => !isEmbeddingModel(m));
+  if (
+    configuredChat &&
+    generationModels.some((model) => canonicalModelId(model) === canonicalModelId(configuredChat))
+  ) {
+    return configuredChat;
+  }
+  return generationModel;
+}
+
+/** Shows the local model field or the cloud fields depending on the selected provider. */
+function applyChatProvider(provider: string): void {
+  const isLocal = provider === 'local';
+  $('chat-local-field').hidden = !isLocal;
+  $('chat-cloud-fields').hidden = isLocal;
+}
+
+/** Fills the embedding, generation, and chat selects from the cached available models. */
+function populateModelSelects(
+  currentEmbedding: string | null,
+  currentGeneration: string | null,
+  currentChat: string | null,
+): void {
+  const embed = $<HTMLSelectElement>('embedding-select');
+  const gen = $<HTMLSelectElement>('generation-select');
+  const chat = $<HTMLSelectElement>('chat-select');
+
+  const embeddingModels = state.availableModels.filter(isEmbeddingModel).sort();
+  const generationModels = state.availableModels.filter((m) => !isEmbeddingModel(m)).sort();
+
+  fillSelect(embed, embeddingModels, currentEmbedding, 'No embedding models found');
+  fillSelect(gen, generationModels, currentGeneration, 'No generation models found');
+  fillSelect(chat, generationModels, currentChat, 'No chat models found');
+}
+
+/**
+ * Rebuilds a select from available options, selecting the current value and adding a
+ * "not pulled" option when the configured model is not present locally.
+ */
+function fillSelect(
+  select: HTMLSelectElement,
+  available: string[],
+  current: string | null,
+  emptyLabel: string,
+): void {
+  select.innerHTML = '';
+
+  if (available.length === 0 && !current) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = emptyLabel;
+    opt.disabled = true;
+    opt.selected = true;
+    select.appendChild(opt);
+    select.disabled = true;
+    return;
+  }
+
+  const currentCanonical = current ? canonicalModelId(current) : null;
+  const matchInAvailable = currentCanonical
+    ? (available.find((m) => canonicalModelId(m) === currentCanonical) ?? null)
+    : null;
+
+  if (current && !matchInAvailable) {
+    const opt = document.createElement('option');
+    opt.value = current;
+    opt.textContent = `${current} (not pulled)`;
+    opt.selected = true;
+    select.appendChild(opt);
+  }
+
+  for (const id of available) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = id;
+    if (id === matchInAvailable) opt.selected = true;
+    select.appendChild(opt);
+  }
+
+  select.disabled = false;
+}
+
+/** Binds all button, toggle, and input event listeners for the settings page. */
