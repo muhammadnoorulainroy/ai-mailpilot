@@ -567,3 +567,116 @@ interface SyncProgress {
 }
 
 /** Builds a zeroed progress object for the given phase. */
+function emptyProgress(phase: SyncProgress['phase']): SyncProgress {
+  return {
+    phase,
+    processed: 0,
+    total: 0,
+    pushed: 0,
+    upToDate: 0,
+    embedProcessed: 0,
+    embedTotal: 0,
+  };
+}
+
+/** Updates the sync progress banner label, bar, and count for the current phase. */
+function renderSyncBanner(p: SyncProgress): void {
+  $('sync-banner').hidden = false;
+  const fill = $<HTMLElement>('sync-banner-fill');
+  const label = $('sync-banner-label');
+  const count = $('sync-banner-count');
+
+  /** Renders a filled progress bar and a done over total count. */
+  const determinate = (done: number, total: number): void => {
+    fill.classList.remove('indeterminate');
+    fill.style.width = `${Math.min(100, Math.round((done / total) * 100))}%`;
+    count.textContent = `${done.toLocaleString()} / ${total.toLocaleString()}`;
+  };
+  /** Renders an animated bar with optional text when no total is known. */
+  const indeterminate = (text: string): void => {
+    fill.classList.add('indeterminate');
+    fill.style.width = '';
+    count.textContent = text;
+  };
+
+  if (p.phase === 'embedding') {
+    label.textContent = 'Embedding emails';
+    if (p.embedTotal > 0) determinate(p.embedProcessed, p.embedTotal);
+    else indeterminate('');
+  } else if (p.phase === 'done') {
+    label.textContent = 'Sync complete';
+    fill.classList.remove('indeterminate');
+    fill.style.width = '100%';
+    const parts: string[] = [];
+    if (p.pushed > 0) parts.push(`${p.pushed.toLocaleString()} synced`);
+    if (p.upToDate > 0) parts.push(`${p.upToDate.toLocaleString()} already up to date`);
+    count.textContent = parts.join(', ');
+  } else if (p.phase === 'error') {
+    label.textContent = `Sync failed: ${p.error ?? 'unknown error'}`;
+    fill.classList.remove('indeterminate');
+  } else {
+    label.textContent = 'Syncing emails from Thunderbird';
+    if (p.total > 0) determinate(p.processed, p.total);
+    else indeterminate(p.processed > 0 ? `${p.processed.toLocaleString()} emails` : '');
+  }
+}
+
+type Tone = 'success' | 'warning' | 'urgent' | 'neutral' | 'info' | 'error';
+
+/** Sets the dot, badge, and label classes and text for a status indicator to match the tone. */
+function setBadge(
+  dotId: string,
+  labelId: string,
+  badgeId: string,
+  tone: Tone,
+  label: string,
+): void {
+  const dot = $(dotId);
+  const labelEl = $(labelId);
+  const badge = $(badgeId);
+
+  dot.className = `dot dot-${tone === 'info' || tone === 'error' ? 'neutral' : tone}`;
+
+  if (tone === 'urgent' || tone === 'error') {
+    badge.className = 'badge badge-urgent';
+    dot.className = 'dot dot-urgent';
+  } else if (tone === 'warning') {
+    badge.className = 'badge badge-warning';
+    dot.className = 'dot dot-warning';
+  } else if (tone === 'success') {
+    badge.className = 'badge badge-success';
+    dot.className = 'dot dot-success';
+  } else {
+    badge.className = 'badge badge-neutral';
+    dot.className = 'dot dot-neutral';
+  }
+
+  labelEl.textContent = label;
+}
+
+/** Writes a status message into an element and colors it according to the tone. */
+function setStatus(id: string, message: string, tone: Tone): void {
+  const el = $(id);
+  el.textContent = message;
+  el.className = 'hint';
+  if (tone === 'error' || tone === 'urgent') el.style.color = 'var(--urgent-text)';
+  else if (tone === 'success') el.style.color = 'var(--success-text)';
+  else if (tone === 'warning') el.style.color = 'var(--warning-text)';
+  else el.style.color = 'var(--text-secondary)';
+}
+
+/**
+ * Parses a tuning field, returning null for blank input, 'invalid' when out of the
+ * inclusive min to max integer range, or the parsed number.
+ */
+function parseTuning(raw: string, min: number, max: number): number | null | 'invalid' {
+  const t = raw.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < min || n > max) return 'invalid';
+  return n;
+}
+
+init().catch((err) => {
+  console.error('[MailPilot settings] init failed:', err);
+});
