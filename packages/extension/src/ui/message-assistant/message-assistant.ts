@@ -193,3 +193,118 @@ function renderSummary(summary: EmailAssistantSummaryDto): void {
 }
 
 /** Request a summary for the target email and render it, optionally forcing a regenerate past the cache. */
+async function loadSummary(force = false): Promise<void> {
+  if (!target) return;
+  try {
+    setStatus(force ? 'Refreshing summary...' : 'Generating summary...');
+    const res = await coreClient.emailAssistantSummary({
+      accountId: target.accountId,
+      messageId: target.messageId,
+      force,
+      confirmCloud: cloudProvider ? true : undefined,
+    });
+    $('cloud-gate').hidden = true;
+    renderSummary(res.summary);
+    setStatus(res.summary.cached ? 'Loaded cached summary.' : 'Summary generated.', 'success');
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Generate a reply draft from the optional user prompt, persist it, and show it in the output field. */
+async function generateDraft(): Promise<void> {
+  if (!target) return;
+  const btn = $<HTMLButtonElement>('generate-draft');
+  btn.disabled = true;
+  try {
+    setStatus('Generating draft...');
+    const prompt = $<HTMLTextAreaElement>('draft-prompt').value.trim();
+    const res = await coreClient.emailAssistantDraft({
+      accountId: target.accountId,
+      messageId: target.messageId,
+      prompt: prompt || undefined,
+      confirmCloud: cloudProvider ? true : undefined,
+    });
+    $('draft-output-wrap').hidden = false;
+    $<HTMLTextAreaElement>('draft-output').value = res.draft;
+    await savePopupState({ draftPrompt: prompt, draftOutput: res.draft });
+    setStatus('Draft ready.', 'success');
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** Open Thunderbird's reply composer pre-filled with the current draft text. */
+async function openReply(): Promise<void> {
+  if (!target) return;
+  const draft = $<HTMLTextAreaElement>('draft-output').value.trim();
+  if (!draft) return;
+  try {
+    await browser.compose.beginReply(target.tbMessageId, 'replyToSender', {
+      isPlainText: true,
+      plainTextBody: draft,
+    });
+    setStatus('Reply composer opened.', 'success');
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Copy the current draft text to the clipboard. */
+async function copyDraft(): Promise<void> {
+  const draft = $<HTMLTextAreaElement>('draft-output').value;
+  if (!draft) return;
+  try {
+    await navigator.clipboard.writeText(draft);
+    setStatus('Draft copied.', 'success');
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+/** Bootstrap the popup: resolve the target email, detect the provider, wire up controls, and load or gate the summary. */
+async function init(): Promise<void> {
+  try {
+    await coreClient.loadToken();
+    target = await resolveTarget();
+    $('email-title').textContent = target.subject ?? '(no subject)';
+
+    const cfg = await coreClient.getConfig();
+    const cloudActive = !!cfg.llm.chatBaseUrl && cfg.llm.chatApiKeySet === true;
+    cloudProvider = cloudActive ? providerLabelFor(cfg.llm.chatBaseUrl) : null;
+    stateKey = makeStateKey(target, cloudProvider);
+    const persisted = await loadPopupState();
+    renderProviderBadge();
+
+    $('refresh-summary').addEventListener('click', () => void loadSummary(true));
+    $('generate-draft').addEventListener('click', () => void generateDraft());
+    $('open-reply').addEventListener('click', () => void openReply());
+    $('copy-draft').addEventListener('click', () => void copyDraft());
+    $('cloud-gate-run').addEventListener('click', () => void loadSummary(false));
+    $<HTMLTextAreaElement>('draft-prompt').addEventListener('input', (event) => {
+      const value = (event.target as HTMLTextAreaElement).value;
+      void savePopupState({ draftPrompt: value });
+    });
+    restoreDraftState(persisted);
+
+    if (cloudProvider) {
+      $('cloud-gate-text').textContent =
+        `Cloud AI is on. Generating a summary sends this email's subject, body, and attachment ` +
+        `text to ${cloudProvider}. Nothing is sent until you choose to.`;
+      $('cloud-gate').hidden = false;
+      $('draft-cloud-note').textContent =
+        `Generating a draft also sends this email to ${cloudProvider}.`;
+      $('draft-cloud-note').hidden = false;
+      setStatus('Ready. Email stays on your machine until you generate a summary.');
+    } else {
+      await loadSummary();
+    }
+  } catch (err) {
+    renderProviderBadge();
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
+
+void init();
