@@ -1,57 +1,54 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI MailPilot</title>
-  <link rel="stylesheet" href="sidebar.css">
-</head>
-<body>
-  <div id="app">
-    <header class="header">
-      <h1 class="header__title">AI MailPilot</h1>
-      <span id="connection-status" class="status status--disconnected">Disconnected</span>
-    </header>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI MailPilot</title>
+    <link rel="stylesheet" href="sidebar.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="header">
+        <h1 class="header__title">AI MailPilot</h1>
+        <span id="connection-status" class="status status--disconnected">Disconnected</span>
+      </header>
 
-    <nav class="tabs">
-      <button class="tab tab--active" data-tab="categories">Categories</button>
-      <button class="tab" data-tab="chat">Chat</button>
-    </nav>
+      <nav class="tabs">
+        <button class="tab tab--active" data-tab="categories">Categories</button>
+        <button class="tab" data-tab="chat">Chat</button>
+      </nav>
 
-    <main id="tab-content">
-      <!-- Categories tab (default) -->
-      <section id="categories-tab" class="tab-panel">
-        <div id="categories-list" class="categories">
-          <p class="placeholder">No categories yet. Index a folder to get started.</p>
-        </div>
-        <div class="actions">
-          <button id="btn-index" class="btn btn--primary">Index Folder</button>
-          <button id="btn-cluster" class="btn btn--secondary">Discover Categories</button>
-        </div>
-      </section>
+      <main id="tab-content">
+        <section id="categories-tab" class="tab-panel">
+          <div id="categories-list" class="categories">
+            <p class="placeholder">No categories yet. Index a folder to get started.</p>
+          </div>
+          <div class="actions">
+            <button id="btn-index" class="btn btn--primary">Index Folder</button>
+            <button id="btn-cluster" class="btn btn--secondary">Discover Categories</button>
+          </div>
+        </section>
 
-      <!-- Chat tab (Tier 2) -->
-      <section id="chat-tab" class="tab-panel" style="display: none;">
-        <div id="chat-messages" class="chat-messages">
-          <p class="placeholder">Ask anything about your emails.</p>
-        </div>
-        <div class="chat-input">
-          <input type="text" id="chat-input" placeholder="Ask your inbox..." />
-          <button id="btn-send" class="btn btn--primary">Send</button>
-        </div>
-      </section>
-    </main>
+        <section id="chat-tab" class="tab-panel" style="display: none">
+          <div id="chat-messages" class="chat-messages">
+            <p class="placeholder">Ask anything about your emails.</p>
+          </div>
+          <div class="chat-input">
+            <input type="text" id="chat-input" placeholder="Ask your inbox..." />
+            <button id="btn-send" class="btn btn--primary">Send</button>
+          </div>
+        </section>
+      </main>
 
-    <!-- Progress bar (shown during indexing) -->
-    <div id="progress-bar" class="progress" style="display: none;">
-      <div class="progress__label">Indexing...</div>
-      <div class="progress__bar">
-        <div class="progress__fill" style="width: 0%"></div>
+      <div id="progress-bar" class="progress" style="display: none">
+        <div class="progress__label">Indexing...</div>
+        <div class="progress__bar">
+          <div class="progress__fill" style="width: 0%"></div>
+        </div>
+        <div class="progress__text">0 / 0</div>
       </div>
-      <div class="progress__text">0 / 0</div>
     </div>
-  </div>
 
-  <script type="module" src="../sidebar/sidebar.js"></script>
-</body>
+    <script type="module" src="../sidebar/sidebar.js"></script>
+  </body>
 </html>

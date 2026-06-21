@@ -1,3 +1,7 @@
+/**
+ * Sidebar tab switching. Wires each tab control to toggle the active state and
+ * show only the matching tab panel.
+ */
 document.querySelectorAll('.tab').forEach((tab) => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach((t) => t.classList.remove('tab--active'));

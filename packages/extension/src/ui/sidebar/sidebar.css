@@ -1,6 +1,7 @@
 :root {
-  --color-primary: #3b82f6;
-  --color-primary-hover: #2563eb;
+  /* Emerald accent matching the shared design tokens, no purple. */
+  --color-primary: #059669;
+  --color-primary-hover: #047857;
   --color-bg: #ffffff;
   --color-surface: #f8fafc;
   --color-border: #e2e8f0;
