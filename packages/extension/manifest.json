@@ -16,9 +16,12 @@
   "permissions": [
     "messagesRead",
     "messagesTagsList",
+    "messagesTags",
     "messagesUpdate",
     "messagesMove",
     "accountsRead",
+    "accountsFolders",
+    "compose",
     "storage",
     "menus"
   ],
@@ -29,7 +32,16 @@
   },
 
   "browser_action": {
-    "default_title": "AI MailPilot - Sync inbox",
+    "default_title": "AI MailPilot - Open dashboard",
+    "default_icon": {
+      "16": "assets/icons/mailpilot-16.png",
+      "32": "assets/icons/mailpilot-32.png"
+    }
+  },
+
+  "message_display_action": {
+    "default_title": "AI MailPilot Assistant",
+    "default_popup": "message-assistant/message-assistant.html",
     "default_icon": {
       "16": "assets/icons/mailpilot-16.png",
       "32": "assets/icons/mailpilot-32.png"
@@ -37,7 +49,7 @@
   },
 
   "options_ui": {
-    "page": "sidebar/sidebar.html",
+    "page": "settings/settings.html",
     "open_in_tab": true
   },
 
