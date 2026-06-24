@@ -1,3 +1,7 @@
+/**
+ * tsup build configuration for the core package, bundling the server entry to ESM
+ * with type declarations and inlining the shared workspace package.
+ */
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
