@@ -14,6 +14,7 @@
     "dev:core": "npm run dev -w @ai-mailpilot/core",
     "dev:extension": "npm run dev -w @ai-mailpilot/extension",
     "test": "npm run test --workspaces --if-present",
+    "typecheck": "tsc --noEmit -p packages/shared/tsconfig.json && tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/extension/tsconfig.json",
     "lint": "eslint packages/shared/src packages/core/src packages/extension/src",
     "lint:fix": "eslint packages/shared/src packages/core/src packages/extension/src --fix",
     "format": "prettier --write packages/shared/src packages/core/src packages/extension/src",
