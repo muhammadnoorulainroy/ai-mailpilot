@@ -32,3 +32,13 @@ coverage/
 
 # Thunderbird profile (for testing)
 test-profile/
+
+# Local SQLite databases and decrypted exports (contain real email; never commit)
+*.db
+*.db-shm
+*.db-wal
+!Thumbs.db
+
+# Local scratch and debug scripts
+db-inspect.mjs
+trace_claim.mjs
