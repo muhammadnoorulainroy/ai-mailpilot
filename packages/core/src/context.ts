@@ -11,6 +11,8 @@ import { createLlmClient, type LlmClient } from './llm/client.js';
 import { AccountRepository } from './repositories/account-repository.js';
 import { AttachmentRepository } from './repositories/attachment-repository.js';
 import { CategoryRepository } from './repositories/category-repository.js';
+import { CategoryAliasRepository } from './repositories/category-alias-repository.js';
+import { DiscoveryAuditRepository } from './repositories/discovery-audit-repository.js';
 import { ConversationRepository } from './repositories/conversation-repository.js';
 import { EmailRepository } from './repositories/email-repository.js';
 import { EmailAssistantRepository } from './repositories/email-assistant-repository.js';
@@ -44,6 +46,8 @@ export interface Repositories {
   embeddings: EmbeddingRepository;
   triage: TriageRepository;
   categories: CategoryRepository;
+  categoryAliases: CategoryAliasRepository;
+  discoveryAudit: DiscoveryAuditRepository;
   conversations: ConversationRepository;
   attachments: AttachmentRepository;
   failures: FailureRepository;
@@ -96,6 +100,8 @@ export function buildContext(): AppContext {
     embeddings: new EmbeddingRepository(db),
     triage: new TriageRepository(db),
     categories: new CategoryRepository(db),
+    categoryAliases: new CategoryAliasRepository(db),
+    discoveryAudit: new DiscoveryAuditRepository(db),
     conversations: new ConversationRepository(db),
     attachments: new AttachmentRepository(db),
     failures: new FailureRepository(db),
@@ -122,6 +128,9 @@ export function buildContext(): AppContext {
       repos.embeddings,
       repos.categories,
       logger,
+      repos.accounts,
+      repos.discoveryAudit,
+      () => config.llm,
     ),
     categoryImprovement: new CategoryImprovementService(
       db,
@@ -130,6 +139,9 @@ export function buildContext(): AppContext {
       repos.embeddings,
       repos.categories,
       logger,
+      repos.accounts,
+      repos.discoveryAudit,
+      () => config.llm,
     ),
     category: new CategoryOrchestrator(
       categorizationService,

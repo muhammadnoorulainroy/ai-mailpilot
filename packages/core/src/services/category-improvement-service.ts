@@ -5,6 +5,10 @@
  */
 import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
+import type { AccountRepository } from '../repositories/account-repository.js';
+import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
+import type { LlmConfig } from '../config/schema.js';
+import { assertDiscoveryLocal } from './discovery-guard.js';
 import type {
   ApplyImprovementsResponse,
   ImproveSuggestionsResponse,
@@ -283,6 +287,9 @@ export class CategoryImprovementService {
     private embeddings: EmbeddingRepository,
     private categories: CategoryRepository,
     private logger: Logger,
+    private accounts?: AccountRepository,
+    private audit?: DiscoveryAuditRepository,
+    private getConfig?: () => LlmConfig,
   ) {}
 
   /**
@@ -297,15 +304,54 @@ export class CategoryImprovementService {
     modelId: string,
     provider: 'main' | 'chat' = 'main',
   ): Promise<ImproveSuggestionsResponse> {
+    const cfg = this.getConfig?.();
+    const accountKind = this.accounts?.findById(accountId)?.kind ?? 'unknown';
     const uncategorizedCount = this.categories.countUncategorized(accountId);
+    const empty: ImproveSuggestionsResponse = {
+      uncategorizedCount,
+      sampledCount: 0,
+      existingCategoryExpansions: [],
+      newCategories: [],
+      merges: [],
+    };
+
+    if (this.accounts && !this.accounts.isDiscoveryEligible(accountId)) {
+      this.audit?.log({
+        accountId,
+        flow: 'improve_categories',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'skipped',
+        modelId,
+      });
+      return empty;
+    }
+    if (cfg) {
+      try {
+        assertDiscoveryLocal(cfg, provider);
+      } catch (err) {
+        this.audit?.log({
+          accountId,
+          flow: 'improve_categories',
+          accountKind,
+          provider: provider === 'main' ? 'local' : 'cloud',
+          status: 'blocked',
+          modelId,
+          error: String(err),
+        });
+        throw err;
+      }
+    }
     if (uncategorizedCount < MIN_UNCATEGORIZED) {
-      return {
-        uncategorizedCount,
-        sampledCount: 0,
-        existingCategoryExpansions: [],
-        newCategories: [],
-        merges: [],
-      };
+      this.audit?.log({
+        accountId,
+        flow: 'improve_categories',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'insufficient',
+        modelId,
+      });
+      return empty;
     }
 
     const uncategorized = this.listUncategorizedForImprove(accountId);
@@ -314,6 +360,17 @@ export class CategoryImprovementService {
       vectorsByMsg.set(e.messageId, e.vector);
     }
     const sample = this.clusterFirstSample(uncategorized, vectorsByMsg, SAMPLE_SIZE);
+    this.audit?.log({
+      accountId,
+      flow: 'improve_categories',
+      accountKind,
+      provider: provider === 'main' ? 'local' : 'cloud',
+      status: 'ok',
+      modelId,
+      sampleSize: sample.length,
+      emailsExposed: sample.length,
+      fieldsRead: ['subject', 'from_addr'],
+    });
     const existing = this.categories.listForAccount(accountId);
     const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
 
@@ -872,7 +929,11 @@ export class CategoryImprovementService {
       if (v) inputs.push({ messageId: e.messageId, fromAddr: e.fromAddr, vector: v });
     }
     if (inputs.length === 0) {
-      return mixedSampleBySender(uncategorized, size).map((e) => ({
+      return mixedSampleBySender(
+        uncategorized,
+        size,
+        stableHash(uncategorized.map((e) => e.messageId).join('|')),
+      ).map((e) => ({
         subject: e.subject,
         fromAddr: e.fromAddr,
         clusterSize: 1,
