@@ -123,6 +123,7 @@ export class CategoryRepository {
     listByStatus: Statement<unknown[]>;
     setStatus: Statement<unknown[]>;
     retireCategory: Statement<unknown[]>;
+    listAutoAssignments: Statement<unknown[]>;
     countEmailsForCategory: Statement<unknown[]>;
     clearAuto: Statement<unknown[]>;
     countUncategorized: Statement<unknown[]>;
@@ -196,6 +197,12 @@ export class CategoryRepository {
       ),
       retireCategory: db.prepare(
         "UPDATE categories SET status = 'retired', retired_at = ?, updated_at = ? WHERE id = ?",
+      ),
+      listAutoAssignments: db.prepare(
+        `SELECT ec.message_id, ec.category_id
+           FROM email_categories ec
+           JOIN categories c ON c.id = ec.category_id
+          WHERE ec.account_id = ? AND ec.assigned_by = 'auto' AND c.status = 'active'`,
       ),
       countEmailsForCategory: db.prepare(
         'SELECT COUNT(*) AS c FROM email_categories WHERE category_id = ?',
@@ -434,6 +441,15 @@ export class CategoryRepository {
   /** Retired categories, kept for history and to preserve their assignments. */
   listRetired(accountId: string): CategoryWithCount[] {
     return this.listByStatus(accountId, 'retired');
+  }
+
+  /** Non-user (auto) assignments to active categories. Used to detect low-confidence residual mail. */
+  listAutoAssignments(accountId: string): Array<{ messageId: string; categoryId: string }> {
+    const rows = this.stmts.listAutoAssignments.all(accountId) as Array<{
+      message_id: string;
+      category_id: string;
+    }>;
+    return rows.map((r) => ({ messageId: r.message_id, categoryId: r.category_id }));
   }
 
   /** Look up a category by its frozen canonical key, or null if none exists. */

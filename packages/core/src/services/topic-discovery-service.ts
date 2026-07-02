@@ -620,7 +620,7 @@ const LABEL_STOPWORDS = new Set([
   'or',
 ]);
 
-const VAGUE_TOKENS = new Set([
+export const VAGUE_TOKENS = new Set([
   'support',
   'help',
   'helpdesk',
@@ -705,7 +705,7 @@ const VAGUE_TOKENS = new Set([
 ]);
 
 /** Lowercase word tokens of a label with common stopwords removed. */
-function significantTokens(label: string): string[] {
+export function significantTokens(label: string): string[] {
   const tokens = label.toLowerCase().match(/[a-z0-9]+/g) ?? [];
   return tokens.filter((t) => !LABEL_STOPWORDS.has(t));
 }
