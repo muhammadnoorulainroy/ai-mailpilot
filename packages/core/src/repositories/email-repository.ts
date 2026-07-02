@@ -424,6 +424,28 @@ export class EmailRepository {
     return rows.map((r) => this.summaryFromRow(r));
   }
 
+  /**
+   * Summaries for a specific set of message ids, scoped to the account. Read-only. Chunked to stay
+   * within SQLite's bound-parameter limit. Row order is not guaranteed; a caller that needs a stable
+   * order should reorder by its own id list.
+   */
+  summariesByIds(accountId: string, messageIds: string[]): EmailSummary[] {
+    const CHUNK = 400;
+    const out: EmailSummary[] = [];
+    for (let i = 0; i < messageIds.length; i += CHUNK) {
+      const chunk = messageIds.slice(i, i + CHUNK);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT ${SELECT_SUMMARY_COLS} FROM emails WHERE account_id = ? AND message_id IN (${placeholders})`,
+        )
+        .all(accountId, ...chunk) as EmailSummaryDbRow[];
+      for (const r of rows) out.push(this.summaryFromRow(r));
+    }
+    return out;
+  }
+
   /** Stream just the message ids for an account in date-desc order. */
   listIds(accountId: string): string[] {
     const rows = this.stmts.listIdsForAccount.all(accountId) as Array<{ message_id: string }>;
