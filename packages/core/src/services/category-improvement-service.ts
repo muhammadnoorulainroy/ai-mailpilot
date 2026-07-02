@@ -360,17 +360,19 @@ export class CategoryImprovementService {
       vectorsByMsg.set(e.messageId, e.vector);
     }
     const sample = this.clusterFirstSample(uncategorized, vectorsByMsg, SAMPLE_SIZE);
-    this.audit?.log({
-      accountId,
-      flow: 'improve_categories',
-      accountKind,
-      provider: provider === 'main' ? 'local' : 'cloud',
-      status: 'ok',
-      modelId,
-      sampleSize: sample.length,
-      emailsExposed: sample.length,
-      fieldsRead: ['subject', 'from_addr'],
-    });
+    const auditImprove = (status: 'ok' | 'failed', error?: string): void =>
+      this.audit?.log({
+        accountId,
+        flow: 'improve_categories',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status,
+        modelId,
+        sampleSize: sample.length,
+        emailsExposed: sample.length,
+        fieldsRead: ['subject', 'from_addr'],
+        error,
+      });
     const existing = this.categories.listForAccount(accountId);
     const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
 
@@ -408,6 +410,7 @@ export class CategoryImprovementService {
       raw = await this.requestSuggestions(modelId, userPrompt, provider);
     } catch (err) {
       this.logger.warn({ accountId, err }, 'improve categories: suggestion request failed');
+      auditImprove('failed', String(err));
       return emptyWith(CONNECTIVITY_WARNING);
     }
 
@@ -419,13 +422,17 @@ export class CategoryImprovementService {
         );
       } catch (err) {
         this.logger.warn({ accountId, err }, 'improve categories: stricter retry request failed');
+        auditImprove('failed', String(err));
         return emptyWith(CONNECTIVITY_WARNING);
       }
     }
     if (!parsed) {
       this.logger.warn({ accountId }, 'improve categories: could not parse model suggestions');
+      auditImprove('failed', 'could not parse model suggestions');
       return emptyWith(PARSE_WARNING);
     }
+
+    auditImprove('ok');
 
     const directExpansions = this.resolveExistingCategoryExpansions(
       parsed.existingCategoryExpansions,

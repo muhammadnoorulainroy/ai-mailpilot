@@ -209,6 +209,24 @@ describe('aliases', () => {
     aliases.removeAlias(acc.id, 'Factures');
     expect(aliases.findByAlias(acc.id, 'factures')).toBeNull();
   });
+
+  it('does not resolve an alias to a retired or suggested category', () => {
+    const acc = accounts.create({ address: 'a@b.com', kind: 'work' });
+    const cat = categories.create({ accountId: acc.id, label: 'Invoices', source: 'user' });
+    aliases.addAlias(acc.id, cat.id, 'Factures');
+    expect(aliases.findByAlias(acc.id, 'factures')?.id).toBe(cat.id);
+    categories.retire(cat.id);
+    expect(aliases.findByAlias(acc.id, 'factures')).toBeNull();
+
+    const suggested = categories.create({
+      accountId: acc.id,
+      label: 'Crypto',
+      source: 'auto',
+      status: 'suggested',
+    });
+    aliases.addAlias(acc.id, suggested.id, 'Trading');
+    expect(aliases.findByAlias(acc.id, 'trading')).toBeNull();
+  });
 });
 
 describe('seed taxonomy is dormant', () => {

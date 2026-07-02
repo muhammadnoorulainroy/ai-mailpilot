@@ -45,7 +45,7 @@ export class CategoryAliasRepository {
                 c.first_seen_at, c.retired_at, c.created_at, c.updated_at
            FROM category_aliases a
            JOIN categories c ON c.id = a.category_id
-          WHERE a.account_id = ? AND a.normalized_alias = ?`,
+          WHERE a.account_id = ? AND a.normalized_alias = ? AND c.status = 'active'`,
       ),
       listForCategory: db.prepare(
         'SELECT alias FROM category_aliases WHERE category_id = ? ORDER BY alias ASC',

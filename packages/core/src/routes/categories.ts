@@ -170,7 +170,7 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       return;
     }
 
-    const rows = ctx.repos.categories.listForAccount(parsed.data.accountId);
+    const rows = ctx.repos.categories.listActive(parsed.data.accountId);
     return {
       accountId: parsed.data.accountId,
       categories: rows.map(toDto),

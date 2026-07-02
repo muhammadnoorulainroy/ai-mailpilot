@@ -311,6 +311,27 @@ export class TopicDiscoveryService {
       `Highest-volume senders by domain: ${topDomains}\n\n` +
       `Identify ${TARGET_TOPIC_COUNT} recurring topics. Make sure each high-volume sender above has a fitting topic.`;
 
+    const insufficient = (): DiscoveryResult => {
+      this.audit?.log({
+        accountId,
+        flow: 'topic_discovery',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'insufficient',
+        modelId: generationModelId,
+        poolSize: pool.length,
+        sampleSize: sample.length,
+        emailsExposed: sample.length,
+        fieldsRead: ['subject', 'from_addr'],
+      });
+      return {
+        status: 'insufficient_categories',
+        topicsCreated: 0,
+        emailsSampled: sample.length,
+        centroidsComputed: 0,
+      };
+    };
+
     let topics: DiscoveredTopic[];
     try {
       topics = await this.requestTopics(generationModelId, userPrompt);
@@ -328,12 +349,7 @@ export class TopicDiscoveryService {
           { accountId, err: retryErr },
           'topic discovery: stricter retry produced no usable topics, keeping existing taxonomy',
         );
-        return {
-          status: 'insufficient_categories',
-          topicsCreated: 0,
-          emailsSampled: sample.length,
-          centroidsComputed: 0,
-        };
+        return insufficient();
       }
     }
     const vague = topics.filter((t) => isVagueTopicLabel(t.label)).map((t) => t.label);
@@ -348,13 +364,6 @@ export class TopicDiscoveryService {
         this.logger.warn({ accountId, err }, 'topic discovery: retry failed, keeping first pass');
       }
     }
-
-    const insufficient = (): DiscoveryResult => ({
-      status: 'insufficient_categories',
-      topicsCreated: 0,
-      emailsSampled: sample.length,
-      centroidsComputed: 0,
-    });
 
     const concrete = dedupeNearLabels(topics.filter((t) => !isVagueTopicLabel(t.label)));
     const minCategories = minCategoriesFor(inboxSize);
