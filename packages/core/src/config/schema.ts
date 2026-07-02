@@ -28,6 +28,7 @@ export const LlmConfigSchema = z.object({
   chatApiKey: z.string().nullable().optional(),
   categorizeUseChatProvider: z.boolean().default(false),
   priorityUseChatProvider: z.boolean().default(false),
+  allowCloudDiscovery: z.boolean().default(false),
 });
 
 /** Zod schema for the full application configuration. */
