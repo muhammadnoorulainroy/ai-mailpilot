@@ -37,14 +37,15 @@ export class CategoryAliasRepository {
     this.stmts = {
       insert: db.prepare(
         `INSERT INTO category_aliases (account_id, category_id, alias, normalized_alias, source, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+         SELECT ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM categories WHERE id = ? AND account_id = ?)
          ON CONFLICT (account_id, normalized_alias) DO NOTHING`,
       ),
       findByAlias: db.prepare(
         `SELECT c.id, c.account_id, c.label, c.description, c.source, c.canonical_key, c.status,
                 c.first_seen_at, c.retired_at, c.created_at, c.updated_at
            FROM category_aliases a
-           JOIN categories c ON c.id = a.category_id
+           JOIN categories c ON c.id = a.category_id AND c.account_id = a.account_id
           WHERE a.account_id = ? AND a.normalized_alias = ? AND c.status = 'active'`,
       ),
       listForCategory: db.prepare(
@@ -70,6 +71,8 @@ export class CategoryAliasRepository {
       normalizeForMatch(alias),
       source,
       Date.now(),
+      categoryId,
+      accountId,
     );
   }
 

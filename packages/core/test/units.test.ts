@@ -1631,6 +1631,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [{ id: 'c1', label: 'Job Opportunities', description: 'jobs' }],
       getCentroidEntries: () =>
         [] as Array<{
@@ -1678,6 +1681,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [] as Array<{ id: string; label: string; description: string }>,
       getCentroidEntries: () =>
         [] as Array<{
@@ -1741,6 +1747,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [{ id: 'c1', label: 'Developer Code Reviews', description: 'dev' }],
       getCentroidEntries: () => [
         {
@@ -1794,6 +1803,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [
         { id: 'job', label: 'Job Opportunities', description: 'job alerts', emailCount: 10 },
       ],
@@ -1849,6 +1861,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [
         { id: 'job', label: 'Job Opportunities', description: 'job alerts', emailCount: 10 },
       ],
@@ -1895,6 +1910,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [
         { id: 'job', label: 'Job Opportunities', description: 'job alerts', emailCount: 10 },
       ],
@@ -1929,6 +1947,9 @@ describe('CategoryImprovementService', () => {
     };
     const categories = {
       countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
       listForAccount: () => [{ id: 'c1', label: 'Banking', description: 'd' }],
       getCentroidEntries: () => [
         { categoryId: 'c1', label: 'Banking', vector: vec, emailCount: 10 },
@@ -1977,7 +1998,7 @@ describe('CategoryImprovementService', () => {
       listForAccount: () => [] as Array<{ label: string }>,
       create: vi.fn((i: { label: string }) => ({ id: `new-${i.label}`, accountId: 'a' })),
       saveCentroid: vi.fn(),
-      findById: (id: string) => ({ id, accountId: 'a' }),
+      findById: (id: string) => ({ id, accountId: 'a', status: 'active' }),
       mergeInto: vi.fn(() => ({ reassigned: 1 })),
     };
     const svc = new CategoryImprovementService(

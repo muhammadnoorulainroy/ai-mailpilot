@@ -373,7 +373,7 @@ export class CategoryImprovementService {
         fieldsRead: ['subject', 'from_addr'],
         error,
       });
-    const existing = this.categories.listForAccount(accountId);
+    const existing = this.categories.listActive(accountId);
     const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
 
     const existingText =
@@ -745,13 +745,16 @@ export class CategoryImprovementService {
     const stagedExpansions = (approved.existingCategoryExpansions ?? [])
       .map((e) => {
         const cat = this.categories.findById(e.categoryId);
-        if (!cat || cat.accountId !== accountId) return null;
+        if (!cat || cat.accountId !== accountId || cat.status !== 'active') return null;
         const messageIds = uniqueIds(e.messageIds).filter((id) => vectorsByMsg.has(id));
         if (messageIds.length === 0) return null;
         return { categoryId: cat.id, messageIds };
       })
       .filter((e): e is { categoryId: string; messageIds: string[] } => e !== null);
 
+    // Dedupe new-category labels across ALL statuses so we never create a duplicate of an active,
+    // suggested, or retired category. A collision skips creation rather than assigning into a
+    // hidden category. TODO(phase 2): offer explicit reactivation of a retired label match.
     const seen = new Set(
       this.categories.listForAccount(accountId).map((c) => normalizeLabel(c.label)),
     );
@@ -833,6 +836,7 @@ export class CategoryImprovementService {
         const tgt = this.categories.findById(m.targetId);
         if (!src || !tgt || src.id === tgt.id) continue;
         if (src.accountId !== accountId || tgt.accountId !== accountId) continue;
+        if (src.status !== 'active' || tgt.status !== 'active') continue;
         this.categories.mergeInto(m.sourceId, m.targetId);
         merged += 1;
       }

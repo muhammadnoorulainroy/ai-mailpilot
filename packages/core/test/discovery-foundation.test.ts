@@ -8,7 +8,7 @@ import BetterSqlite3, { type Database } from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { openDatabase } from '../src/db/database.js';
 import { runMigrations } from '../src/db/migrations.js';
-import { migrations } from '../src/db/schema.js';
+import { migrations, EMBEDDING_DIM } from '../src/db/schema.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { CategoryRepository } from '../src/repositories/category-repository.js';
 import { CategoryAliasRepository } from '../src/repositories/category-alias-repository.js';
@@ -35,6 +35,13 @@ function fakeLlm(): LlmClient {
     chat: vi.fn(async () => '{"topics":[]}'),
     chatStream: vi.fn(),
   } as unknown as LlmClient;
+}
+
+/** A minimal non-zero embedding vector for tests. */
+function vec(): Float32Array {
+  const a = new Float32Array(EMBEDDING_DIM);
+  a[0] = 1;
+  return a;
 }
 
 describe('v18 backfill and canonical_key', () => {
@@ -130,9 +137,23 @@ describe('stable identity and no silent edits', () => {
 });
 
 describe('local-only discovery guard', () => {
-  it('discoveryProvider is main when allowCloudDiscovery is false', () => {
-    expect(discoveryProvider(config({ allowCloudDiscovery: false, chatBaseUrl: 'http://x' }))).toBe('main');
-    expect(discoveryProvider(config({ allowCloudDiscovery: true, chatBaseUrl: 'http://x' }))).toBe('chat');
+  it('discoveryProvider is main when allowCloudDiscovery is false, ignoring categorizeUseChatProvider', () => {
+    expect(discoveryProvider(config({ allowCloudDiscovery: false, chatBaseUrl: 'http://x' }))).toBe(
+      'main',
+    );
+    // categorizeUseChatProvider (Refine's flag) must never route discovery/improve to cloud.
+    expect(
+      discoveryProvider(
+        config({
+          allowCloudDiscovery: false,
+          categorizeUseChatProvider: true,
+          chatBaseUrl: 'http://x',
+        }),
+      ),
+    ).toBe('main');
+    expect(discoveryProvider(config({ allowCloudDiscovery: true, chatBaseUrl: 'http://x' }))).toBe(
+      'chat',
+    );
   });
 
   it('assertDiscoveryLocal throws for a cloud provider when not opted in', () => {
@@ -155,6 +176,29 @@ describe('local-only discovery guard', () => {
     expect(llm.chat).not.toHaveBeenCalled();
     const rows = audit.listForAccount(acc.id);
     expect(rows[0]?.status).toBe('skipped');
+    expect(rows[0]?.flow).toBe('topic_discovery');
+    db.close();
+  });
+
+  it('topic discovery audits insufficient when an eligible account has no emails', async () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const audit = new DiscoveryAuditRepository(db);
+    const acc = accounts.create({ address: 'w2@x.com', kind: 'work' });
+    const svc = new TopicDiscoveryService(
+      fakeLlm(),
+      new EmailRepository(db),
+      new EmbeddingRepository(db),
+      new CategoryRepository(db),
+      silentLogger,
+      accounts,
+      audit,
+      () => config(),
+    );
+    const res = await svc.discover(acc.id, 'bge-m3', 'qwen');
+    expect(res.topicsCreated).toBe(0);
+    const rows = audit.listForAccount(acc.id);
+    expect(rows[0]?.status).toBe('insufficient');
     expect(rows[0]?.flow).toBe('topic_discovery');
     db.close();
   });
@@ -227,6 +271,24 @@ describe('aliases', () => {
     aliases.addAlias(acc.id, suggested.id, 'Trading');
     expect(aliases.findByAlias(acc.id, 'trading')).toBeNull();
   });
+
+  it('never resolves or stores an alias across account boundaries', () => {
+    const a = accounts.create({ address: 'a@x.com', kind: 'work' });
+    const b = accounts.create({ address: 'b@x.com', kind: 'work' });
+    const bCat = categories.create({ accountId: b.id, label: 'B Category', source: 'user' });
+
+    // addAlias refuses to store an alias for account A pointing at account B's category.
+    aliases.addAlias(a.id, bCat.id, 'CrossAlias');
+    expect(aliases.findByAlias(a.id, 'crossalias')).toBeNull();
+    expect(aliases.listForCategory(bCat.id)).toHaveLength(0);
+
+    // Even a raw cross-account alias row does not resolve, because the join is account-scoped.
+    db.prepare(
+      `INSERT INTO category_aliases (account_id, category_id, alias, normalized_alias, source, created_at)
+       VALUES (?, ?, 'Raw', 'raw', 'auto', 1)`,
+    ).run(a.id, bCat.id);
+    expect(aliases.findByAlias(a.id, 'raw')).toBeNull();
+  });
 });
 
 describe('seed taxonomy is dormant', () => {
@@ -244,5 +306,41 @@ describe('deterministic sampling', () => {
     expect(seededShuffle(arr, 123)).toEqual(seededShuffle(arr, 123));
     expect(seededShuffle(arr, 123)).not.toEqual(seededShuffle(arr, 999));
     expect([...arr]).toEqual(Array.from({ length: 20 }, (_, i) => i)); // input untouched
+  });
+});
+
+describe('improve categories respects category status', () => {
+  it('apply does not assign an expansion to a retired category', async () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const categories = new CategoryRepository(db);
+    const emails = new EmailRepository(db);
+    const embeddings = new EmbeddingRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const cat = categories.create({ accountId: acc.id, label: 'Old', source: 'auto' });
+    categories.retire(cat.id);
+    emails.upsertBatch([{ messageId: 'e1', accountId: acc.id, folder: 'INBOX' }]);
+    embeddings.saveEmbedding({ messageId: 'e1', accountId: acc.id, modelId: 'bge-m3' }, vec());
+
+    const svc = new CategoryImprovementService(
+      db,
+      fakeLlm(),
+      emails,
+      embeddings,
+      categories,
+      silentLogger,
+    );
+    await svc.apply(acc.id, 'bge-m3', {
+      existingCategoryExpansions: [{ categoryId: cat.id, messageIds: ['e1'] }],
+      newCategories: [],
+      merges: [],
+    });
+    const count = (
+      db.prepare('SELECT COUNT(*) AS c FROM email_categories WHERE category_id = ?').get(cat.id) as {
+        c: number;
+      }
+    ).c;
+    expect(count).toBe(0);
+    db.close();
   });
 });

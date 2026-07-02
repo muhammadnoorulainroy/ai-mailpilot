@@ -268,9 +268,23 @@ export class TopicDiscoveryService {
       return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
     }
 
+    const auditNoData = (poolSize: number): void =>
+      this.audit?.log({
+        accountId,
+        flow: 'topic_discovery',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'insufficient',
+        modelId: generationModelId,
+        poolSize,
+        sampleSize: 0,
+        emailsExposed: 0,
+      });
+
     const senders = this.emails.listSenders(accountId);
     const inboxSize = senders.length;
     if (inboxSize === 0) {
+      auditNoData(0);
       return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
     }
     const freq = domainFrequency(senders);
@@ -280,6 +294,7 @@ export class TopicDiscoveryService {
       freq.slice(0, TOP_DOMAIN_COUNT).map(([d]) => d),
     );
     if (pool.length === 0) {
+      auditNoData(pool.length);
       return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
     }
 
