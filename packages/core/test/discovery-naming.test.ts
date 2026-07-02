@@ -39,6 +39,17 @@ describe('buildNamingMessages', () => {
     const shown = many.filter((s) => user!.content.includes(s));
     expect(shown.length).toBe(NAMING_SAMPLE_PER_CLUSTER);
   });
+
+  it('adds the /no_think control only for the local model', () => {
+    expect(
+      buildNamingMessages([input()], { noThink: true })[0]!.content.startsWith('/no_think'),
+    ).toBe(true);
+    expect(buildNamingMessages([input()], { noThink: false })[0]!.content).not.toContain(
+      '/no_think',
+    );
+    // Default is cloud-safe: no Ollama control line.
+    expect(buildNamingMessages([input()])[0]!.content).not.toContain('/no_think');
+  });
 });
 
 describe('parseNamedCandidates', () => {

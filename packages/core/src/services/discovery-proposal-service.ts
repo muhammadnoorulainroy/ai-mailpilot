@@ -95,14 +95,18 @@ export class DiscoveryProposalService {
     const cfg = this.getConfig();
     const provider = discoveryProvider(cfg);
     assertDiscoveryLocal(cfg, provider);
+    // On the cloud chat provider use the configured cloud model and drop the Ollama-only controls
+    // (`/no_think`, `think`), which would pollute or fail an OpenAI-style request.
+    const local = provider === 'main';
+    const model = local ? generationModelId : cfg.chatModel || generationModelId;
     const raw = await this.llm.chat({
-      model: generationModelId,
+      model,
       provider,
-      messages: buildNamingMessages(namingInputs),
+      messages: buildNamingMessages(namingInputs, { noThink: local }),
       responseFormat: 'json_object',
       temperature: 0.2,
       maxTokens: NAMING_OUTPUT_TOKENS,
-      think: false,
+      think: local ? false : undefined,
     });
 
     const parsed = parseNamedCandidates(raw, chosen.length);
