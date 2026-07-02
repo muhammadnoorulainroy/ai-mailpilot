@@ -121,11 +121,13 @@ describe('reconcileAutoCategories durable taxonomy', () => {
     expect(categories.listForAccount(acct.id).map((c) => c.label)).toContain('Course Grades');
   });
 
-  it('deletes an empty obsolete auto category a run omits', () => {
+  it('keeps an empty obsolete auto category active and reports it as omitted (no silent delete)', () => {
     const acct = accounts.create({ address: 'rec2@x.y', kind: 'work' });
-    categories.create({ accountId: acct.id, label: 'Unused', source: 'auto' });
-    categories.reconcileAutoCategories(acct.id, 'bge-m3', omit);
-    expect(categories.listForAccount(acct.id).map((c) => c.label)).not.toContain('Unused');
+    const unused = categories.create({ accountId: acct.id, label: 'Unused', source: 'auto' });
+    const result = categories.reconcileAutoCategories(acct.id, 'bge-m3', omit);
+    expect(categories.findById(unused.id)?.status).toBe('active');
+    expect(categories.listForAccount(acct.id).map((c) => c.label)).toContain('Unused');
+    expect(result.omitted).toContain(unused.id);
   });
 
   it('preserves an auto category a user filed mail into', () => {
@@ -610,7 +612,7 @@ describe('CategoryRepository provenance skip sets (incremental categorization)',
 });
 
 describe('CategoryRepository.reconcileAutoCategories (stable identities)', () => {
-  it('keeps matching labels (stable id), preserves user-corrected categories, prunes obsolete', () => {
+  it('keeps matching labels (stable id), preserves user-corrected categories, keeps obsolete active', () => {
     const acct = accounts.create({ address: 'rec@x.y', kind: 'work' });
     const centroid = vec(0.2);
     categories.reconcileAutoCategories(acct.id, 'bge-m3', [
@@ -640,7 +642,7 @@ describe('CategoryRepository.reconcileAutoCategories (stable identities)', () =>
     ]);
 
     const after = categories.listForAccount(acct.id);
-    expect(after.map((c) => c.label).sort()).toEqual(['Job Alerts', 'New', 'Old Topic']);
+    expect(after.map((c) => c.label).sort()).toEqual(['Job Alerts', 'New', 'Old Topic', 'Stale']);
     expect(after.find((c) => c.label === 'Job Alerts')!.id).toBe(jobId);
     expect(after.find((c) => c.label === 'Old Topic')!.id).toBe(oldId);
     expect(categories.getUserAssignedMessageIds(acct.id)).toEqual(new Set(['u']));
@@ -679,24 +681,9 @@ describe('ConversationRepository (chat record persistence)', () => {
   });
 });
 
-describe('CategoryRepository.replaceAutoCategories atomic swap (M4)', () => {
-  it('replaces the previous auto category set with the new one', () => {
-    const acct = accounts.create({ address: 'a@b.c', kind: 'work' });
-    const centroid = vec(0.2);
-
-    categories.replaceAutoCategories(acct.id, 'bge-m3', [
-      { label: 'One', description: 'd1', centroid, emailCount: 1 },
-      { label: 'Two', description: 'd2', centroid, emailCount: 2 },
-    ]);
-    expect(categories.listForAccount(acct.id)).toHaveLength(2);
-
-    categories.replaceAutoCategories(acct.id, 'bge-m3', [
-      { label: 'Three', description: 'd3', centroid, emailCount: 3 },
-    ]);
-    const after = categories.listForAccount(acct.id);
-    expect(after).toHaveLength(1);
-    expect(after[0]!.label).toBe('Three');
-    expect(categories.getCentroidEntries(acct.id, 'bge-m3:latest')).toHaveLength(1);
+describe('CategoryRepository.replaceAutoCategories (retired)', () => {
+  it('throws, because it destroyed category identity; reconcileAutoCategories replaces it', () => {
+    expect(() => categories.replaceAutoCategories()).toThrow(/retired/);
   });
 });
 
