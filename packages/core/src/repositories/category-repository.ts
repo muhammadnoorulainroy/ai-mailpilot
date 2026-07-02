@@ -8,9 +8,13 @@ import { EMBEDDING_DIM } from '../db/schema.js';
 import { EmbeddingDimensionError } from './embedding-repository.js';
 import { bufferToVector, vectorToBuffer } from '../util/vector.js';
 import { canonicalizeModelId } from '../util/model-id.js';
+import { normalizeForMatch } from '../util/text.js';
 
 /** Where a category came from. */
 export type CategorySource = 'auto' | 'user' | 'imported';
+
+/** Lifecycle state of a category. Only active categories are shown to the user and assigned to. */
+export type CategoryStatus = 'active' | 'suggested' | 'retired';
 
 /** Who created an email to category assignment. */
 export type AssignedBy = 'user' | 'auto';
@@ -30,6 +34,10 @@ export interface CategoryRow {
   label: string;
   description: string | null;
   source: CategorySource;
+  canonicalKey: string;
+  status: CategoryStatus;
+  firstSeenAt: number;
+  retiredAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -40,6 +48,9 @@ export interface CreateCategoryInput {
   label: string;
   description?: string;
   source: CategorySource;
+  status?: CategoryStatus;
+  /** Frozen identity key. Derived deterministically from the label when omitted. */
+  canonicalKey?: string;
 }
 
 /** Editable fields for an existing category. */
@@ -90,6 +101,10 @@ interface CategoryDbRow {
   label: string;
   description: string | null;
   source: CategorySource;
+  canonical_key: string;
+  status: CategoryStatus;
+  first_seen_at: number;
+  retired_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -102,7 +117,12 @@ export class CategoryRepository {
     deleteCategory: Statement<unknown[]>;
     findById: Statement<unknown[]>;
     findByLabel: Statement<unknown[]>;
+    findByCanonicalKey: Statement<unknown[]>;
+    selectCanonicalKeys: Statement<unknown[]>;
     listForAccount: Statement<unknown[]>;
+    listByStatus: Statement<unknown[]>;
+    setStatus: Statement<unknown[]>;
+    retireCategory: Statement<unknown[]>;
     countEmailsForCategory: Statement<unknown[]>;
     clearAuto: Statement<unknown[]>;
     countUncategorized: Statement<unknown[]>;
@@ -134,27 +154,48 @@ export class CategoryRepository {
   constructor(private db: Database) {
     this.stmts = {
       insertCategory: db.prepare(
-        `INSERT INTO categories (id, account_id, label, description, source, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO categories (id, account_id, label, description, source, canonical_key, status, first_seen_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       updateCategory: db.prepare(
         'UPDATE categories SET label = ?, description = ?, updated_at = ? WHERE id = ?',
       ),
       deleteCategory: db.prepare('DELETE FROM categories WHERE id = ?'),
       findById: db.prepare(
-        'SELECT id, account_id, label, description, source, created_at, updated_at FROM categories WHERE id = ?',
+        'SELECT id, account_id, label, description, source, canonical_key, status, first_seen_at, retired_at, created_at, updated_at FROM categories WHERE id = ?',
       ),
       findByLabel: db.prepare(
-        'SELECT id, account_id, label, description, source, created_at, updated_at FROM categories WHERE account_id = ? AND label = ?',
+        'SELECT id, account_id, label, description, source, canonical_key, status, first_seen_at, retired_at, created_at, updated_at FROM categories WHERE account_id = ? AND label = ?',
       ),
+      findByCanonicalKey: db.prepare(
+        'SELECT id, account_id, label, description, source, canonical_key, status, first_seen_at, retired_at, created_at, updated_at FROM categories WHERE account_id = ? AND canonical_key = ?',
+      ),
+      selectCanonicalKeys: db.prepare('SELECT canonical_key FROM categories WHERE account_id = ?'),
       listForAccount: db.prepare(
-        `SELECT c.id, c.account_id, c.label, c.description, c.source, c.created_at, c.updated_at,
+        `SELECT c.id, c.account_id, c.label, c.description, c.source,
+                c.canonical_key, c.status, c.first_seen_at, c.retired_at, c.created_at, c.updated_at,
                 COALESCE(COUNT(ec.message_id), 0) AS email_count
            FROM categories c
            LEFT JOIN email_categories ec ON ec.category_id = c.id
           WHERE c.account_id = ?
           GROUP BY c.id
           ORDER BY c.label ASC`,
+      ),
+      listByStatus: db.prepare(
+        `SELECT c.id, c.account_id, c.label, c.description, c.source,
+                c.canonical_key, c.status, c.first_seen_at, c.retired_at, c.created_at, c.updated_at,
+                COALESCE(COUNT(ec.message_id), 0) AS email_count
+           FROM categories c
+           LEFT JOIN email_categories ec ON ec.category_id = c.id
+          WHERE c.account_id = ? AND c.status = ?
+          GROUP BY c.id
+          ORDER BY c.label ASC`,
+      ),
+      setStatus: db.prepare(
+        'UPDATE categories SET status = ?, retired_at = ?, updated_at = ? WHERE id = ?',
+      ),
+      retireCategory: db.prepare(
+        "UPDATE categories SET status = 'retired', retired_at = ?, updated_at = ? WHERE id = ?",
       ),
       countEmailsForCategory: db.prepare(
         'SELECT COUNT(*) AS c FROM email_categories WHERE category_id = ?',
@@ -198,7 +239,7 @@ export class CategoryRepository {
            FROM category_embeddings ce
            JOIN category_embedding_index cei ON cei.rowid = ce.rowid
            JOIN categories c ON c.id = cei.category_id
-          WHERE c.account_id = ? AND cei.model_id = ?`,
+          WHERE c.account_id = ? AND cei.model_id = ? AND c.status = 'active'`,
       ),
       getCentroidByCategory: db.prepare(
         `SELECT ce.embedding, cei.email_count
@@ -273,7 +314,7 @@ export class CategoryRepository {
     };
   }
 
-  /** Insert a new category and return the stored row. */
+  /** Insert a new category and return the stored row. Freezes a deterministic canonical key. */
   create(input: CreateCategoryInput): CategoryRow {
     const now = Date.now();
     const row: CategoryRow = {
@@ -282,6 +323,10 @@ export class CategoryRepository {
       label: input.label,
       description: input.description ?? null,
       source: input.source,
+      canonicalKey: input.canonicalKey ?? this.deriveCanonicalKey(input.accountId, input.label),
+      status: input.status ?? 'active',
+      firstSeenAt: now,
+      retiredAt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -291,10 +336,31 @@ export class CategoryRepository {
       row.label,
       row.description,
       row.source,
+      row.canonicalKey,
+      row.status,
+      row.firstSeenAt,
       row.createdAt,
       row.updatedAt,
     );
     return row;
+  }
+
+  /**
+   * A deterministic, per-account-unique canonical key for a label, matching the migration
+   * backfill. Suffixes on collision so two labels never share a key.
+   */
+  private deriveCanonicalKey(accountId: string, label: string): string {
+    const taken = new Set(
+      (this.stmts.selectCanonicalKeys.all(accountId) as Array<{ canonical_key: string }>).map(
+        (r) => r.canonical_key,
+      ),
+    );
+    const base = normalizeForMatch(label).replace(/\s+/g, '_').slice(0, 60) || 'category';
+    if (!taken.has(base)) return base;
+    for (let i = 2; ; i++) {
+      const candidate = `${base}_${i}`;
+      if (!taken.has(candidate)) return candidate;
+    }
   }
 
   /** Apply partial edits to a category, returning the updated row or null if it does not exist. */
@@ -334,12 +400,63 @@ export class CategoryRepository {
     return row ? this.fromRow(row) : null;
   }
 
-  /** All categories for an account with their email counts, ordered by label. */
+  /** All categories for an account with their email counts, ordered by label. Every status. */
   listForAccount(accountId: string): CategoryWithCount[] {
     const rows = this.stmts.listForAccount.all(accountId) as Array<
       CategoryDbRow & { email_count: number }
     >;
     return rows.map((r) => ({ ...this.fromRow(r), emailCount: r.email_count }));
+  }
+
+  /** Every category regardless of status. Named for intent; same result as listForAccount. */
+  listAll(accountId: string): CategoryWithCount[] {
+    return this.listForAccount(accountId);
+  }
+
+  /** Categories with the given status, with email counts, ordered by label. */
+  private listByStatus(accountId: string, status: CategoryStatus): CategoryWithCount[] {
+    const rows = this.stmts.listByStatus.all(accountId, status) as Array<
+      CategoryDbRow & { email_count: number }
+    >;
+    return rows.map((r) => ({ ...this.fromRow(r), emailCount: r.email_count }));
+  }
+
+  /** Active categories only: the ones shown to the user and eligible for assignment. */
+  listActive(accountId: string): CategoryWithCount[] {
+    return this.listByStatus(accountId, 'active');
+  }
+
+  /** Suggested (dormant) categories awaiting user approval. */
+  listSuggested(accountId: string): CategoryWithCount[] {
+    return this.listByStatus(accountId, 'suggested');
+  }
+
+  /** Retired categories, kept for history and to preserve their assignments. */
+  listRetired(accountId: string): CategoryWithCount[] {
+    return this.listByStatus(accountId, 'retired');
+  }
+
+  /** Look up a category by its frozen canonical key, or null if none exists. */
+  findByCanonicalKey(accountId: string, canonicalKey: string): CategoryRow | null {
+    const row = this.stmts.findByCanonicalKey.get(accountId, canonicalKey) as
+      | CategoryDbRow
+      | undefined;
+    return row ? this.fromRow(row) : null;
+  }
+
+  /** Set a category's status. Retiring stamps retired_at; any other status clears it. */
+  setStatus(id: string, status: CategoryStatus): void {
+    const retiredAt = status === 'retired' ? Date.now() : null;
+    this.stmts.setStatus.run(status, retiredAt, Date.now(), id);
+  }
+
+  /**
+   * Retire a category: it keeps its id, assignments, and history but stops being shown or
+   * assigned to. Phase 2 only, driven by a user-approved retirement proposal. Nothing in the
+   * discovery path calls this automatically.
+   */
+  retire(id: string): void {
+    this.stmts.retireCategory.run(Date.now(), Date.now(), id);
   }
 
   /** Delete all auto categories for an account, returning the number removed. */
@@ -348,43 +465,21 @@ export class CategoryRepository {
   }
 
   /**
-   * Atomically replace an account's auto categories and their centroids with a freshly
-   * discovered set, in one transaction. A failure before commit leaves the prior topics
-   * intact. Returns the number of categories written.
+   * Retired. This cleared and recreated all auto categories, destroying their ids and any
+   * assignments, folders, and corrections tied to them. Use reconcileAutoCategories, which
+   * preserves identity.
    */
-  replaceAutoCategories(
-    accountId: string,
-    modelId: string,
-    topics: ReadonlyArray<{
-      label: string;
-      description: string;
-      centroid: Float32Array;
-      emailCount: number;
-    }>,
-  ): number {
-    const tx = this.db.transaction(() => {
-      this.stmts.clearAuto.run(accountId);
-      for (const t of topics) {
-        const row = this.create({
-          accountId,
-          label: t.label,
-          description: t.description,
-          source: 'auto',
-        });
-        this.saveCentroid(row.id, modelId, t.centroid, t.emailCount);
-      }
-      return topics.length;
-    });
-    return tx();
+  replaceAutoCategories(): never {
+    throw new Error('replaceAutoCategories is retired; use reconcileAutoCategories');
   }
 
   /**
    * Reconcile an account's auto categories with a freshly discovered set, preserving
    * identity. A category whose label still matches a discovered topic keeps its id so
    * tags, folders, and corrections tied to it stay valid, and gets its centroid and
-   * description refreshed. New topics are created. Obsolete auto categories are removed
-   * only when no user correction points at them, so manual corrections survive. Returns
-   * the number of live topics after reconciliation.
+   * description refreshed. New topics are created. Obsolete auto categories are NEVER deleted or
+   * retired here; they stay active and are returned in `omitted` as candidates for a Phase 2
+   * user-approved retirement. Returns the live count and the omitted ids.
    */
   reconcileAutoCategories(
     accountId: string,
@@ -395,7 +490,7 @@ export class CategoryRepository {
       centroid: Float32Array;
       emailCount: number;
     }>,
-  ): number {
+  ): { live: number; omitted: string[] } {
     const tx = this.db.transaction(() => {
       const existing = this.stmts.listAutoWithUserFlag.all(accountId) as Array<{
         id: string;
@@ -429,16 +524,17 @@ export class CategoryRepository {
         }
       }
 
+      const omitted: string[] = [];
       for (const e of existing) {
         if (keptIds.has(e.id)) continue;
-        const unused = e.has_user === 0 && e.assigned_count < RECONCILE_KEEP_MIN_ASSIGNMENTS;
-        if (unused) {
-          this.delete(e.id);
-        } else {
-          keptIds.add(e.id);
+        // Phase 1: never delete and never retire. Keep it active and record that this run did
+        // not re-find it, so a Phase 2 user-approved flow can propose retiring it.
+        keptIds.add(e.id);
+        if (e.has_user === 0 && e.assigned_count < RECONCILE_KEEP_MIN_ASSIGNMENTS) {
+          omitted.push(e.id);
         }
       }
-      return keptIds.size;
+      return { live: keptIds.size, omitted };
     });
     return tx();
   }
@@ -906,6 +1002,10 @@ export class CategoryRepository {
       label: row.label,
       description: row.description,
       source: row.source,
+      canonicalKey: row.canonical_key,
+      status: row.status,
+      firstSeenAt: row.first_seen_at,
+      retiredAt: row.retired_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

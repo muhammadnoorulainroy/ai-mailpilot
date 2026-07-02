@@ -80,6 +80,7 @@ export function redactConfig(config: AppConfig): SafeConfig {
       chatBaseUrl: config.llm.chatBaseUrl,
       categorizeUseChatProvider: config.llm.categorizeUseChatProvider,
       priorityUseChatProvider: config.llm.priorityUseChatProvider,
+      allowCloudDiscovery: config.llm.allowCloudDiscovery,
       chatApiKeySet: !!config.llm.chatApiKey,
     },
   };

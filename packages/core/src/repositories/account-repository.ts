@@ -41,6 +41,8 @@ export class AccountRepository {
     list: Statement<unknown[]>;
     delete: Statement<unknown[]>;
     updateMeta: Statement<unknown[]>;
+    selectEligibility: Statement<unknown[]>;
+    setExclude: Statement<unknown[]>;
   };
 
   /** Prepares the SQL statements used for all account operations. */
@@ -60,6 +62,10 @@ export class AccountRepository {
       ),
       delete: db.prepare('DELETE FROM accounts WHERE id = ?'),
       updateMeta: db.prepare('UPDATE accounts SET display_name = ?, kind = ? WHERE id = ?'),
+      selectEligibility: db.prepare(
+        'SELECT kind, exclude_from_discovery FROM accounts WHERE id = ?',
+      ),
+      setExclude: db.prepare('UPDATE accounts SET exclude_from_discovery = ? WHERE id = ?'),
     };
   }
 
@@ -119,6 +125,20 @@ export class AccountRepository {
       return { ...existing, displayName, kind: input.kind };
     }
     return existing;
+  }
+
+  /** Whether discovery may run for this account. Personal and excluded accounts are ineligible. */
+  isDiscoveryEligible(id: string): boolean {
+    const row = this.stmts.selectEligibility.get(id) as
+      | { kind: AccountKind; exclude_from_discovery: number }
+      | undefined;
+    if (!row) return false;
+    return row.kind !== 'personal' && row.exclude_from_discovery === 0;
+  }
+
+  /** Set whether this account is excluded from discovery. */
+  setExcludeFromDiscovery(id: string, excluded: boolean): void {
+    this.stmts.setExclude.run(excluded ? 1 : 0, id);
   }
 
   /** Maps a raw database row to an Account, converting snake_case columns. */

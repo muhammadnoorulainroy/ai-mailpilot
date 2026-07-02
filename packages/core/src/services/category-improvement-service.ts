@@ -5,6 +5,10 @@
  */
 import type { Database } from 'better-sqlite3';
 import type { Logger } from 'pino';
+import type { AccountRepository } from '../repositories/account-repository.js';
+import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
+import type { LlmConfig } from '../config/schema.js';
+import { assertDiscoveryLocal } from './discovery-guard.js';
 import type {
   ApplyImprovementsResponse,
   ImproveSuggestionsResponse,
@@ -283,6 +287,9 @@ export class CategoryImprovementService {
     private embeddings: EmbeddingRepository,
     private categories: CategoryRepository,
     private logger: Logger,
+    private accounts?: AccountRepository,
+    private audit?: DiscoveryAuditRepository,
+    private getConfig?: () => LlmConfig,
   ) {}
 
   /**
@@ -297,15 +304,54 @@ export class CategoryImprovementService {
     modelId: string,
     provider: 'main' | 'chat' = 'main',
   ): Promise<ImproveSuggestionsResponse> {
+    const cfg = this.getConfig?.();
+    const accountKind = this.accounts?.findById(accountId)?.kind ?? 'unknown';
     const uncategorizedCount = this.categories.countUncategorized(accountId);
+    const empty: ImproveSuggestionsResponse = {
+      uncategorizedCount,
+      sampledCount: 0,
+      existingCategoryExpansions: [],
+      newCategories: [],
+      merges: [],
+    };
+
+    if (this.accounts && !this.accounts.isDiscoveryEligible(accountId)) {
+      this.audit?.log({
+        accountId,
+        flow: 'improve_categories',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'skipped',
+        modelId,
+      });
+      return empty;
+    }
+    if (cfg) {
+      try {
+        assertDiscoveryLocal(cfg, provider);
+      } catch (err) {
+        this.audit?.log({
+          accountId,
+          flow: 'improve_categories',
+          accountKind,
+          provider: provider === 'main' ? 'local' : 'cloud',
+          status: 'blocked',
+          modelId,
+          error: String(err),
+        });
+        throw err;
+      }
+    }
     if (uncategorizedCount < MIN_UNCATEGORIZED) {
-      return {
-        uncategorizedCount,
-        sampledCount: 0,
-        existingCategoryExpansions: [],
-        newCategories: [],
-        merges: [],
-      };
+      this.audit?.log({
+        accountId,
+        flow: 'improve_categories',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'insufficient',
+        modelId,
+      });
+      return empty;
     }
 
     const uncategorized = this.listUncategorizedForImprove(accountId);
@@ -314,7 +360,20 @@ export class CategoryImprovementService {
       vectorsByMsg.set(e.messageId, e.vector);
     }
     const sample = this.clusterFirstSample(uncategorized, vectorsByMsg, SAMPLE_SIZE);
-    const existing = this.categories.listForAccount(accountId);
+    const auditImprove = (status: 'ok' | 'failed', error?: string): void =>
+      this.audit?.log({
+        accountId,
+        flow: 'improve_categories',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status,
+        modelId,
+        sampleSize: sample.length,
+        emailsExposed: sample.length,
+        fieldsRead: ['subject', 'from_addr'],
+        error,
+      });
+    const existing = this.categories.listActive(accountId);
     const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
 
     const existingText =
@@ -351,6 +410,7 @@ export class CategoryImprovementService {
       raw = await this.requestSuggestions(modelId, userPrompt, provider);
     } catch (err) {
       this.logger.warn({ accountId, err }, 'improve categories: suggestion request failed');
+      auditImprove('failed', String(err));
       return emptyWith(CONNECTIVITY_WARNING);
     }
 
@@ -362,13 +422,17 @@ export class CategoryImprovementService {
         );
       } catch (err) {
         this.logger.warn({ accountId, err }, 'improve categories: stricter retry request failed');
+        auditImprove('failed', String(err));
         return emptyWith(CONNECTIVITY_WARNING);
       }
     }
     if (!parsed) {
       this.logger.warn({ accountId }, 'improve categories: could not parse model suggestions');
+      auditImprove('failed', 'could not parse model suggestions');
       return emptyWith(PARSE_WARNING);
     }
+
+    auditImprove('ok');
 
     const directExpansions = this.resolveExistingCategoryExpansions(
       parsed.existingCategoryExpansions,
@@ -681,13 +745,16 @@ export class CategoryImprovementService {
     const stagedExpansions = (approved.existingCategoryExpansions ?? [])
       .map((e) => {
         const cat = this.categories.findById(e.categoryId);
-        if (!cat || cat.accountId !== accountId) return null;
+        if (!cat || cat.accountId !== accountId || cat.status !== 'active') return null;
         const messageIds = uniqueIds(e.messageIds).filter((id) => vectorsByMsg.has(id));
         if (messageIds.length === 0) return null;
         return { categoryId: cat.id, messageIds };
       })
       .filter((e): e is { categoryId: string; messageIds: string[] } => e !== null);
 
+    // Dedupe new-category labels across ALL statuses so we never create a duplicate of an active,
+    // suggested, or retired category. A collision skips creation rather than assigning into a
+    // hidden category. TODO(phase 2): offer explicit reactivation of a retired label match.
     const seen = new Set(
       this.categories.listForAccount(accountId).map((c) => normalizeLabel(c.label)),
     );
@@ -769,6 +836,7 @@ export class CategoryImprovementService {
         const tgt = this.categories.findById(m.targetId);
         if (!src || !tgt || src.id === tgt.id) continue;
         if (src.accountId !== accountId || tgt.accountId !== accountId) continue;
+        if (src.status !== 'active' || tgt.status !== 'active') continue;
         this.categories.mergeInto(m.sourceId, m.targetId);
         merged += 1;
       }
@@ -872,7 +940,11 @@ export class CategoryImprovementService {
       if (v) inputs.push({ messageId: e.messageId, fromAddr: e.fromAddr, vector: v });
     }
     if (inputs.length === 0) {
-      return mixedSampleBySender(uncategorized, size).map((e) => ({
+      return mixedSampleBySender(
+        uncategorized,
+        size,
+        stableHash(uncategorized.map((e) => e.messageId).join('|')),
+      ).map((e) => ({
         subject: e.subject,
         fromAddr: e.fromAddr,
         clusterSize: 1,

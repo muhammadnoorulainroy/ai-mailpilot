@@ -11,6 +11,11 @@ import type { EmbeddingRepository } from '../repositories/embedding-repository.j
 import { parseLlmJson, stripCodeFence } from '../util/json-llm.js';
 import { cosineFromL2Distance, l2Distance, meanNormalize } from '../util/vector.js';
 import { purposeSignature } from './categorize-strategy.js';
+import type { AccountRepository } from '../repositories/account-repository.js';
+import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
+import type { LlmConfig } from '../config/schema.js';
+import { assertDiscoveryLocal, discoveryProvider } from './discovery-guard.js';
+import { stableHash, seededShuffle } from '../util/rand.js';
 
 const TWIN_COSINE_STRONG = 0.93;
 const TWIN_COSINE_SAME_PURPOSE = 0.9;
@@ -200,6 +205,9 @@ export class TopicDiscoveryService {
     private embeddings: EmbeddingRepository,
     private categories: CategoryRepository,
     private logger: Logger,
+    private accounts?: AccountRepository,
+    private audit?: DiscoveryAuditRepository,
+    private getConfig?: () => LlmConfig,
   ) {}
 
   /**
@@ -217,6 +225,19 @@ export class TopicDiscoveryService {
     this.running = true;
     try {
       return await this.runDiscovery(accountId, embeddingModelId, generationModelId);
+    } catch (err) {
+      const cfg = this.getConfig?.();
+      const provider = cfg ? discoveryProvider(cfg) : 'main';
+      this.audit?.log({
+        accountId,
+        flow: 'topic_discovery',
+        accountKind: this.accounts?.findById(accountId)?.kind ?? 'unknown',
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'failed',
+        modelId: generationModelId,
+        error: String(err),
+      });
+      throw err;
     } finally {
       this.running = false;
     }
@@ -232,9 +253,38 @@ export class TopicDiscoveryService {
     embeddingModelId: string,
     generationModelId: string,
   ): Promise<DiscoveryResult> {
+    const cfg = this.getConfig?.();
+    const provider = cfg ? discoveryProvider(cfg) : 'main';
+    const accountKind = this.accounts?.findById(accountId)?.kind ?? 'unknown';
+    if (this.accounts && !this.accounts.isDiscoveryEligible(accountId)) {
+      this.audit?.log({
+        accountId,
+        flow: 'topic_discovery',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'skipped',
+        modelId: generationModelId,
+      });
+      return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
+    }
+
+    const auditNoData = (poolSize: number): void =>
+      this.audit?.log({
+        accountId,
+        flow: 'topic_discovery',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'insufficient',
+        modelId: generationModelId,
+        poolSize,
+        sampleSize: 0,
+        emailsExposed: 0,
+      });
+
     const senders = this.emails.listSenders(accountId);
     const inboxSize = senders.length;
     if (inboxSize === 0) {
+      auditNoData(0);
       return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
     }
     const freq = domainFrequency(senders);
@@ -244,10 +294,15 @@ export class TopicDiscoveryService {
       freq.slice(0, TOP_DOMAIN_COUNT).map(([d]) => d),
     );
     if (pool.length === 0) {
+      auditNoData(pool.length);
       return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
     }
 
-    const sample = mixedSampleBySender(pool, SAMPLE_SIZE);
+    const sample = mixedSampleBySender(
+      pool,
+      SAMPLE_SIZE,
+      stableHash(`${accountId}|${embeddingModelId}`),
+    );
     this.logger.info(
       { accountId, sampleSize: sample.length, pool: pool.length, inboxSize },
       'topic discovery: sampling',
@@ -271,6 +326,27 @@ export class TopicDiscoveryService {
       `Highest-volume senders by domain: ${topDomains}\n\n` +
       `Identify ${TARGET_TOPIC_COUNT} recurring topics. Make sure each high-volume sender above has a fitting topic.`;
 
+    const insufficient = (): DiscoveryResult => {
+      this.audit?.log({
+        accountId,
+        flow: 'topic_discovery',
+        accountKind,
+        provider: provider === 'main' ? 'local' : 'cloud',
+        status: 'insufficient',
+        modelId: generationModelId,
+        poolSize: pool.length,
+        sampleSize: sample.length,
+        emailsExposed: sample.length,
+        fieldsRead: ['subject', 'from_addr'],
+      });
+      return {
+        status: 'insufficient_categories',
+        topicsCreated: 0,
+        emailsSampled: sample.length,
+        centroidsComputed: 0,
+      };
+    };
+
     let topics: DiscoveredTopic[];
     try {
       topics = await this.requestTopics(generationModelId, userPrompt);
@@ -288,12 +364,7 @@ export class TopicDiscoveryService {
           { accountId, err: retryErr },
           'topic discovery: stricter retry produced no usable topics, keeping existing taxonomy',
         );
-        return {
-          status: 'insufficient_categories',
-          topicsCreated: 0,
-          emailsSampled: sample.length,
-          centroidsComputed: 0,
-        };
+        return insufficient();
       }
     }
     const vague = topics.filter((t) => isVagueTopicLabel(t.label)).map((t) => t.label);
@@ -308,13 +379,6 @@ export class TopicDiscoveryService {
         this.logger.warn({ accountId, err }, 'topic discovery: retry failed, keeping first pass');
       }
     }
-
-    const insufficient = (): DiscoveryResult => ({
-      status: 'insufficient_categories',
-      topicsCreated: 0,
-      emailsSampled: sample.length,
-      centroidsComputed: 0,
-    });
 
     const concrete = dedupeNearLabels(topics.filter((t) => !isVagueTopicLabel(t.label)));
     const minCategories = minCategoriesFor(inboxSize);
@@ -397,11 +461,25 @@ export class TopicDiscoveryService {
       );
     }
 
-    const centroidsComputed = this.categories.reconcileAutoCategories(
+    const { live: centroidsComputed, omitted } = this.categories.reconcileAutoCategories(
       accountId,
       embeddingModelId,
       staged,
     );
+
+    this.audit?.log({
+      accountId,
+      flow: 'topic_discovery',
+      accountKind,
+      provider: provider === 'main' ? 'local' : 'cloud',
+      status: 'ok',
+      modelId: generationModelId,
+      poolSize: pool.length,
+      sampleSize: sample.length,
+      emailsExposed: sample.length,
+      fieldsRead: ['subject', 'from_addr'],
+      omittedCategories: omitted,
+    });
 
     return {
       status: 'ok',
@@ -483,9 +561,12 @@ export class TopicDiscoveryService {
 
   /** Send one topic-discovery prompt to the LLM and parse the JSON answer into topics. */
   private async requestTopics(model: string, userPrompt: string): Promise<DiscoveredTopic[]> {
+    const cfg = this.getConfig?.();
+    const provider = cfg ? discoveryProvider(cfg) : 'main';
+    if (cfg) assertDiscoveryLocal(cfg, provider);
     const raw = await this.llm.chat({
       model,
-      provider: 'main',
+      provider,
       messages: [
         { role: 'system', content: `/no_think\n${SYSTEM_PROMPT}` },
         { role: 'user', content: userPrompt },
@@ -796,20 +877,18 @@ export function domainFrequency(
 export function mixedSampleBySender<T extends { fromAddr: string | null }>(
   arr: T[],
   n: number,
+  seed: number,
 ): T[] {
   if (arr.length <= n) return [...arr];
 
   const half = Math.ceil(n / 2);
-  const diverse = diverseSampleBySender(arr, half);
+  const diverse = diverseSampleBySender(arr, half, seed);
   const chosen = new Set<T>(diverse);
 
-  const rest = arr.filter((e) => !chosen.has(e));
-  for (let i = rest.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = rest[i]!;
-    rest[i] = rest[j]!;
-    rest[j] = tmp;
-  }
+  const rest = seededShuffle(
+    arr.filter((e) => !chosen.has(e)),
+    (seed ^ 0x9e3779b9) >>> 0,
+  );
 
   const result = [...diverse];
   for (let i = 0; result.length < n && i < rest.length; i++) {
@@ -838,16 +917,11 @@ export function senderDomain(fromAddr: string | null): string {
 export function diverseSampleBySender<T extends { fromAddr: string | null }>(
   arr: T[],
   n: number,
+  seed: number,
 ): T[] {
   if (arr.length <= n) return [...arr];
 
-  const shuffled = [...arr];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = shuffled[i]!;
-    shuffled[i] = shuffled[j]!;
-    shuffled[j] = tmp;
-  }
+  const shuffled = seededShuffle(arr, seed);
 
   const seen = new Set<string>();
   const primary: T[] = [];

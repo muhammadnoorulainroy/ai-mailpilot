@@ -7,6 +7,7 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import type { CategoryRow } from '../repositories/category-repository.js';
 import type { CategoryDto } from '@ai-mailpilot/shared';
+import { discoveryProvider } from '../services/discovery-guard.js';
 
 const DiscoverBody = z.object({
   accountId: z.string().min(1),
@@ -88,11 +89,13 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       return;
     }
     const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
-    const useCloud = ctx.config.llm.categorizeUseChatProvider && !!ctx.config.llm.chatBaseUrl;
-    const provider = useCloud ? ('chat' as const) : ('main' as const);
-    const modelId = useCloud
-      ? ctx.config.llm.chatModel || ctx.config.llm.generationModel
-      : (parsed.data.generationModelId ?? ctx.config.llm.generationModel);
+    // Discovery and improvement share the allowCloudDiscovery privacy switch, not the
+    // categorizeUseChatProvider flag used by Refine. Local unless cloud discovery is opted in.
+    const provider = discoveryProvider(ctx.config.llm);
+    const modelId =
+      provider === 'chat'
+        ? ctx.config.llm.chatModel || ctx.config.llm.generationModel
+        : (parsed.data.generationModelId ?? ctx.config.llm.generationModel);
     try {
       return await ctx.services.categoryImprovement.suggest(
         parsed.data.accountId,
@@ -170,7 +173,7 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       return;
     }
 
-    const rows = ctx.repos.categories.listForAccount(parsed.data.accountId);
+    const rows = ctx.repos.categories.listActive(parsed.data.accountId);
     return {
       accountId: parsed.data.accountId,
       categories: rows.map(toDto),

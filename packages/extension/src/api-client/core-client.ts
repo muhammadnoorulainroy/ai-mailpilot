@@ -83,6 +83,7 @@ export interface ServerConfig {
     chatApiKeySet?: boolean;
     categorizeUseChatProvider?: boolean;
     priorityUseChatProvider?: boolean;
+    allowCloudDiscovery?: boolean;
   };
 }
 

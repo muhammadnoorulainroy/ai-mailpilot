@@ -3,9 +3,23 @@
  * migrations that build the tables, indexes, triggers, and vector tables.
  */
 import type { Migration } from './migrations.js';
+import { normalizeForMatch } from '../util/text.js';
 
 /** Dimensionality of the embedding vectors used by all vec0 tables. */
 export const EMBEDDING_DIM = 1024;
+
+/**
+ * Deterministic, per-account-unique canonical key derived from a label. Frozen once assigned so
+ * a category keeps its identity across discovery runs even when its cluster shifts.
+ */
+function canonicalKeyFor(label: string, taken: Set<string>): string {
+  const base = normalizeForMatch(label).replace(/\s+/g, '_').slice(0, 60) || 'category';
+  if (!taken.has(base)) return base;
+  for (let i = 2; ; i++) {
+    const candidate = `${base}_${i}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
 
 /** Ordered list of database migrations applied in sequence to build the schema. */
 export const migrations: Migration[] = [
@@ -450,6 +464,85 @@ export const migrations: Migration[] = [
           FOREIGN KEY (message_id, account_id) REFERENCES emails(message_id, account_id) ON DELETE CASCADE
         );
         CREATE INDEX idx_email_assistant_account ON email_assistant_summaries(account_id);
+      `);
+    },
+  },
+  {
+    version: 18,
+    name: 'discovery_foundation',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE categories ADD COLUMN canonical_key TEXT;
+        ALTER TABLE categories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'suggested', 'retired'));
+        ALTER TABLE categories ADD COLUMN first_seen_at INTEGER;
+        ALTER TABLE categories ADD COLUMN retired_at INTEGER;
+
+        ALTER TABLE accounts ADD COLUMN exclude_from_discovery INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE category_aliases (
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          category_id TEXT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+          alias TEXT NOT NULL,
+          normalized_alias TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto', 'user', 'imported', 'seed')),
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (account_id, normalized_alias)
+        );
+        CREATE INDEX idx_category_aliases_category ON category_aliases(category_id);
+
+        CREATE TABLE discovery_audit (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          ran_at INTEGER NOT NULL,
+          flow TEXT NOT NULL CHECK (flow IN ('topic_discovery', 'improve_categories')),
+          account_kind TEXT NOT NULL,
+          provider TEXT NOT NULL CHECK (provider IN ('local', 'cloud')),
+          status TEXT NOT NULL CHECK (status IN ('ok', 'blocked', 'failed', 'insufficient', 'skipped')),
+          model_id TEXT,
+          pool_size INTEGER NOT NULL DEFAULT 0,
+          sample_size INTEGER NOT NULL DEFAULT 0,
+          emails_exposed INTEGER NOT NULL DEFAULT 0,
+          fields_read TEXT NOT NULL DEFAULT '[]',
+          redacted INTEGER NOT NULL DEFAULT 0,
+          omitted_categories TEXT NOT NULL DEFAULT '[]',
+          error TEXT
+        );
+        CREATE INDEX idx_discovery_audit_account ON discovery_audit(account_id, ran_at);
+      `);
+
+      // Freeze a deterministic canonical_key on every existing category and stamp first_seen_at.
+      const rows = db
+        .prepare(
+          `SELECT id, account_id, label, created_at FROM categories ORDER BY account_id, created_at, id`,
+        )
+        .all() as Array<{ id: string; account_id: string; label: string; created_at: number }>;
+      const taken = new Map<string, Set<string>>();
+      const upd = db.prepare(
+        `UPDATE categories SET canonical_key = ?, first_seen_at = ? WHERE id = ?`,
+      );
+      for (const r of rows) {
+        const seen = taken.get(r.account_id) ?? new Set<string>();
+        const key = canonicalKeyFor(r.label, seen);
+        seen.add(key);
+        taken.set(r.account_id, seen);
+        upd.run(key, r.created_at, r.id);
+      }
+
+      db.exec(
+        `CREATE UNIQUE INDEX idx_categories_canonical ON categories(account_id, canonical_key);`,
+      );
+
+      // A unique index still allows multiple NULLs in SQLite; enforce non-null with triggers
+      // rather than a table rebuild (PRAGMA foreign_keys cannot toggle inside this transaction).
+      db.exec(`
+        CREATE TRIGGER trg_categories_canonical_not_null_insert
+        BEFORE INSERT ON categories WHEN NEW.canonical_key IS NULL
+        BEGIN SELECT RAISE(ABORT, 'canonical_key must not be null'); END;
+
+        CREATE TRIGGER trg_categories_canonical_not_null_update
+        BEFORE UPDATE ON categories WHEN NEW.canonical_key IS NULL
+        BEGIN SELECT RAISE(ABORT, 'canonical_key must not be null'); END;
       `);
     },
   },
