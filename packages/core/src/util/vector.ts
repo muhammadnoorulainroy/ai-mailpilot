@@ -43,6 +43,22 @@ export function cosineFromL2Distance(d: number): number {
   return cos;
 }
 
+/** Dot product of two equal-length vectors. For unit-normalized vectors this equals cosine similarity. */
+export function dot(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let s = 0;
+  const n = a.length;
+  for (let i = 0; i < n; i++) s += (a[i] as number) * (b[i] as number);
+  return s;
+}
+
+/** Cosine similarity in [-1, 1]; returns 0 when either vector is all zeros. */
+export function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  const na = Math.sqrt(dot(a, a));
+  const nb = Math.sqrt(dot(b, b));
+  if (na === 0 || nb === 0) return 0;
+  return dot(a, b) / (na * nb);
+}
+
 /**
  * Compute the L2-normalized centroid of a set of unit vectors.
  * Returns null if no valid vector is provided.
