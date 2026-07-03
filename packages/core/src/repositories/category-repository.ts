@@ -149,6 +149,7 @@ export class CategoryRepository {
     selectUserAssigned: Statement<unknown[]>;
     selectAssigned: Statement<unknown[]>;
     selectLlmProtected: Statement<unknown[]>;
+    selectCategoryMembersByAssignedBy: Statement<unknown[]>;
     listAutoWithUserFlag: Statement<unknown[]>;
     selectECByEmail: Statement<unknown[]>;
     selectECByEmailWithLabel: Statement<unknown[]>;
@@ -268,6 +269,9 @@ export class CategoryRepository {
       ),
       selectAssigned: db.prepare(
         'SELECT DISTINCT message_id FROM email_categories WHERE account_id = ?',
+      ),
+      selectCategoryMembersByAssignedBy: db.prepare(
+        'SELECT message_id FROM email_categories WHERE account_id = ? AND category_id = ? AND assigned_by = ?',
       ),
       selectLlmProtected: db.prepare(
         "SELECT DISTINCT message_id FROM email_categories WHERE account_id = ? AND (assigned_by = 'user' OR method IN ('llm', 'gate'))",
@@ -849,6 +853,16 @@ export class CategoryRepository {
   getUserAssignedMessageIds(accountId: string): Set<string> {
     const rows = this.stmts.selectUserAssigned.all(accountId) as Array<{ message_id: string }>;
     return new Set(rows.map((r) => r.message_id));
+  }
+
+  /** Message ids assigned to one category with the given provenance ('user' or 'auto'). */
+  listCategoryMemberIds(accountId: string, categoryId: string, assignedBy: AssignedBy): string[] {
+    const rows = this.stmts.selectCategoryMembersByAssignedBy.all(
+      accountId,
+      categoryId,
+      assignedBy,
+    ) as Array<{ message_id: string }>;
+    return rows.map((r) => r.message_id);
   }
 
   /** Message ids that already have any category. Skip set for the incremental fast pass. */

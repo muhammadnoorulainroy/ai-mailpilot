@@ -37,6 +37,7 @@ import { TopicDiscoveryService } from './services/topic-discovery-service.js';
 import { ResidualDiscoveryService } from './services/residual-discovery-service.js';
 import { DiscoveryProposalService } from './services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from './services/discovery-proposal-orchestrator.js';
+import { CategoryCentroidRebuildService } from './services/category-centroid-rebuild-service.js';
 import { TriageOrchestrator } from './services/triage-orchestrator.js';
 import { TriageService } from './services/triage-service.js';
 import { getLogger } from './util/logger.js';
@@ -69,6 +70,7 @@ export interface Services {
   topicDiscovery: TopicDiscoveryService;
   categoryImprovement: CategoryImprovementService;
   discoveryProposal: DiscoveryProposalOrchestrator;
+  categoryCentroidRebuild: CategoryCentroidRebuildService;
   category: CategoryOrchestrator;
   llmCategorize: LlmCategorizeOrchestrator;
   correction: CorrectionService;
@@ -169,6 +171,11 @@ export function buildContext(): AppContext {
       repos.accounts,
       repos.discoveryAudit,
       () => config.llm,
+      logger,
+    ),
+    categoryCentroidRebuild: new CategoryCentroidRebuildService(
+      repos.categories,
+      repos.embeddings,
       logger,
     ),
     category: new CategoryOrchestrator(

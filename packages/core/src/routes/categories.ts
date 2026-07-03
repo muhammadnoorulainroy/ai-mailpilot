@@ -23,6 +23,12 @@ const ProposalActionBody = z.object({
   accountId: z.string().min(1),
 });
 
+const RebuildCentroidBody = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
+  allowAutoFallback: z.boolean().optional(),
+});
+
 const CategorizeRunBody = z.object({
   accountId: z.string().min(1),
   embeddingModelId: z.string().optional(),
@@ -173,6 +179,33 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       ctx.logger.error({ err, proposalId: req.params.id }, 'dismiss proposal failed');
       reply.code(500).send({ error: 'failed to dismiss proposal', message });
     }
+  });
+
+  // Recompute a category's centroid from its user-confirmed member embeddings. Centroid-only: it
+  // changes no label, status, or assignment. Leaves the centroid unchanged when trusted data is thin.
+  app.post<{ Params: { id: string } }>('/categories/:id/rebuild-centroid', async (req, reply) => {
+    const parsed = RebuildCentroidBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const category = ctx.repos.categories.findById(req.params.id);
+    if (!category || category.accountId !== parsed.data.accountId) {
+      reply.code(404).send({ error: 'category not found for this account' });
+      return;
+    }
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    return ctx.services.categoryCentroidRebuild.rebuild(
+      parsed.data.accountId,
+      req.params.id,
+      embeddingModelId,
+      { allowAutoFallback: parsed.data.allowAutoFallback },
+    );
   });
 
   app.post('/categories/improve/suggest', async (req, reply) => {
