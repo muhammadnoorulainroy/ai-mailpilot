@@ -1793,12 +1793,19 @@ function proposalCard(p: ProposalDto): HTMLElement {
   ignore.className = 'btn btn-ghost btn-sm';
   ignore.type = 'button';
   ignore.textContent = 'Ignore';
-  ignore.addEventListener('click', () => void dismissProposal(p));
   const add = document.createElement('button');
   add.className = 'btn btn-primary btn-sm';
   add.type = 'button';
   add.textContent = 'Add';
-  add.addEventListener('click', () => void applyProposal(p));
+  // Disable both buttons on this card while its request is in flight, so a fast double-click cannot
+  // send a duplicate apply/dismiss. On success the queue refresh replaces the card; on failure the
+  // action re-enables them.
+  const setBusy = (busy: boolean): void => {
+    add.disabled = busy;
+    ignore.disabled = busy;
+  };
+  ignore.addEventListener('click', () => void dismissProposal(p, setBusy));
+  add.addEventListener('click', () => void applyProposal(p, setBusy));
   actions.append(ignore, add);
   card.appendChild(actions);
   return card;
@@ -1828,9 +1835,10 @@ async function generateProposals(): Promise<void> {
 }
 
 /** Approves a proposal, files its emails, and refreshes the queue and dashboard. */
-async function applyProposal(p: ProposalDto): Promise<void> {
+async function applyProposal(p: ProposalDto, setBusy: (busy: boolean) => void): Promise<void> {
   const accountId = state.currentAccountId;
   if (!accountId) return;
+  setBusy(true);
   try {
     const res = await coreClient.applyProposal(p.id, accountId);
     setStatus(
@@ -1842,19 +1850,22 @@ async function applyProposal(p: ProposalDto): Promise<void> {
     await refreshDashboard();
   } catch (err) {
     setStatus(err instanceof Error ? err.message : String(err));
+    setBusy(false);
   }
 }
 
 /** Dismisses a proposal so it leaves the queue and is not suggested again. */
-async function dismissProposal(p: ProposalDto): Promise<void> {
+async function dismissProposal(p: ProposalDto, setBusy: (busy: boolean) => void): Promise<void> {
   const accountId = state.currentAccountId;
   if (!accountId) return;
+  setBusy(true);
   try {
     await coreClient.dismissProposal(p.id, accountId);
     setStatus(`Ignored "${p.label}".`);
     await loadProposals();
   } catch (err) {
     setStatus(err instanceof Error ? err.message : String(err));
+    setBusy(false);
   }
 }
 
