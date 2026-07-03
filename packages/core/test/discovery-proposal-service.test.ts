@@ -26,8 +26,15 @@ function axis(dim: number): Float32Array {
 
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 
+interface CapturedChat {
+  provider?: string;
+  model?: string;
+  think?: unknown;
+  system?: string;
+}
+
 interface Harness {
-  captured: { provider?: string };
+  captured: CapturedChat;
   makeLlm: (answer: string) => LlmClient;
   accounts: AccountRepository;
   categories: CategoryRepository;
@@ -66,11 +73,19 @@ function harness(): Harness {
     }
   }
 
-  const captured: { provider?: string } = {};
+  const captured: CapturedChat = {};
   const makeLlm = (answer: string): LlmClient =>
     ({
-      async chat(opts: { provider?: string }) {
+      async chat(opts: {
+        provider?: string;
+        model?: string;
+        think?: unknown;
+        messages: Array<{ role: string; content: string }>;
+      }) {
         captured.provider = opts.provider;
+        captured.model = opts.model;
+        captured.think = opts.think;
+        captured.system = opts.messages?.[0]?.content;
         return answer;
       },
       async embed() {
@@ -134,16 +149,47 @@ describe('DiscoveryProposalService', () => {
 
     expect(result.clusterCount).toBe(2);
     expect(result.sampledEmails).toBeGreaterThan(0);
-    expect(result.accepted.map((c) => c.label).sort()).toEqual([
+    expect(result.accepted.map((a) => a.candidate.label).sort()).toEqual([
       'Flight Bookings',
       'Receipts & Invoices',
     ]);
-    // Each accepted candidate carries its cluster keyphrases as evidence for the later review UI.
-    expect(result.accepted.every((c) => c.evidence.length > 0)).toBe(true);
+    // Each accepted proposal carries its cluster and keyphrase evidence for persistence and review.
+    expect(result.accepted.every((a) => a.candidate.evidence.length > 0)).toBe(true);
+    expect(result.accepted.every((a) => a.cluster.size > 0)).toBe(true);
     // Read-only: no category was created and no run leaves state behind.
     expect(h.categories.listAll(h.accountId)).toHaveLength(0);
-    // Local by default: the discovery chat call used the local provider.
+    // Local by default: local provider, local model, and the Ollama-only controls are sent.
     expect(h.captured.provider).toBe('main');
+    expect(h.captured.model).toBe('qwen');
+    expect(h.captured.think).toBe(false);
+    expect(h.captured.system?.startsWith('/no_think')).toBe(true);
+  });
+
+  it('uses the cloud model and drops the Ollama-only controls when cloud discovery is opted in', async () => {
+    const h = harness();
+    const answer = JSON.stringify({
+      clusters: [
+        {
+          clusterIndex: 0,
+          action: 'new_category',
+          label: 'Receipts & Invoices',
+          description: 'Payment confirmations and invoices.',
+          suggestedKey: 'finance.invoices',
+        },
+      ],
+    });
+    const svc = service(h, answer, {
+      allowCloudDiscovery: true,
+      chatBaseUrl: 'https://api.example.com/v1',
+      chatModel: 'gpt-4o-mini',
+    });
+
+    await svc.propose(h.accountId, MODEL, 'qwen');
+
+    expect(h.captured.provider).toBe('chat');
+    expect(h.captured.model).toBe('gpt-4o-mini');
+    expect(h.captured.think).toBeUndefined();
+    expect(h.captured.system).not.toContain('/no_think');
   });
 
   it('lets the gate reject a vague or abandoned name from the model', async () => {

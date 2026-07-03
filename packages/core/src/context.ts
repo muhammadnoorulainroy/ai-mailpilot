@@ -12,6 +12,7 @@ import { AccountRepository } from './repositories/account-repository.js';
 import { AttachmentRepository } from './repositories/attachment-repository.js';
 import { CategoryRepository } from './repositories/category-repository.js';
 import { CategoryAliasRepository } from './repositories/category-alias-repository.js';
+import { CategoryProposalRepository } from './repositories/category-proposal-repository.js';
 import { DiscoveryAuditRepository } from './repositories/discovery-audit-repository.js';
 import { ConversationRepository } from './repositories/conversation-repository.js';
 import { EmailRepository } from './repositories/email-repository.js';
@@ -33,6 +34,9 @@ import { EmbeddingOrchestrator } from './services/embedding-orchestrator.js';
 import { LlmCategorizer } from './services/llm-categorizer.js';
 import { LlmCategorizeOrchestrator } from './services/llm-categorize-orchestrator.js';
 import { TopicDiscoveryService } from './services/topic-discovery-service.js';
+import { ResidualDiscoveryService } from './services/residual-discovery-service.js';
+import { DiscoveryProposalService } from './services/discovery-proposal-service.js';
+import { DiscoveryProposalOrchestrator } from './services/discovery-proposal-orchestrator.js';
 import { TriageOrchestrator } from './services/triage-orchestrator.js';
 import { TriageService } from './services/triage-service.js';
 import { getLogger } from './util/logger.js';
@@ -47,6 +51,7 @@ export interface Repositories {
   triage: TriageRepository;
   categories: CategoryRepository;
   categoryAliases: CategoryAliasRepository;
+  categoryProposals: CategoryProposalRepository;
   discoveryAudit: DiscoveryAuditRepository;
   conversations: ConversationRepository;
   attachments: AttachmentRepository;
@@ -63,6 +68,7 @@ export interface Services {
   triage: TriageOrchestrator;
   topicDiscovery: TopicDiscoveryService;
   categoryImprovement: CategoryImprovementService;
+  discoveryProposal: DiscoveryProposalOrchestrator;
   category: CategoryOrchestrator;
   llmCategorize: LlmCategorizeOrchestrator;
   correction: CorrectionService;
@@ -101,6 +107,7 @@ export function buildContext(): AppContext {
     triage: new TriageRepository(db),
     categories: new CategoryRepository(db),
     categoryAliases: new CategoryAliasRepository(db),
+    categoryProposals: new CategoryProposalRepository(db),
     discoveryAudit: new DiscoveryAuditRepository(db),
     conversations: new ConversationRepository(db),
     attachments: new AttachmentRepository(db),
@@ -112,6 +119,16 @@ export function buildContext(): AppContext {
   const triageService = new TriageService(llm, logger);
   const categorizationService = new CategorizationService(repos.categories, repos.embeddings);
   const llmCategorizer = new LlmCategorizer(llm);
+
+  const residualDiscovery = new ResidualDiscoveryService(repos.embeddings, repos.categories);
+  const discoveryProposalService = new DiscoveryProposalService(
+    residualDiscovery,
+    repos.emails,
+    repos.categories,
+    llm,
+    () => config.llm,
+    logger,
+  );
 
   const services: Services = {
     embedding: new EmbeddingOrchestrator(
@@ -142,6 +159,17 @@ export function buildContext(): AppContext {
       repos.accounts,
       repos.discoveryAudit,
       () => config.llm,
+    ),
+    discoveryProposal: new DiscoveryProposalOrchestrator(
+      db,
+      repos.categoryProposals,
+      repos.categories,
+      repos.emails,
+      discoveryProposalService,
+      repos.accounts,
+      repos.discoveryAudit,
+      () => config.llm,
+      logger,
     ),
     category: new CategoryOrchestrator(
       categorizationService,

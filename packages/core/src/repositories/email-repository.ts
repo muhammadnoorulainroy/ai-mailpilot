@@ -425,6 +425,27 @@ export class EmailRepository {
   }
 
   /**
+   * The subset of the given message ids that still exist for the account. Read-only, chunked. Used to
+   * skip members that were deleted between when a proposal was generated and when it is applied.
+   */
+  existingIds(accountId: string, messageIds: string[]): Set<string> {
+    const CHUNK = 400;
+    const out = new Set<string>();
+    for (let i = 0; i < messageIds.length; i += CHUNK) {
+      const chunk = messageIds.slice(i, i + CHUNK);
+      if (chunk.length === 0) continue;
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT message_id FROM emails WHERE account_id = ? AND message_id IN (${placeholders})`,
+        )
+        .all(accountId, ...chunk) as Array<{ message_id: string }>;
+      for (const r of rows) out.add(r.message_id);
+    }
+    return out;
+  }
+
+  /**
    * Summaries for a specific set of message ids, scoped to the account. Read-only. Chunked to stay
    * within SQLite's bound-parameter limit. Row order is not guaranteed; a caller that needs a stable
    * order should reorder by its own id list.

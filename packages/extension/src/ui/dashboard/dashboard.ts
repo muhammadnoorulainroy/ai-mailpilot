@@ -5,9 +5,12 @@
  */
 import { coreClient } from '../../api-client/core-client.js';
 import { renderMarkdown } from '../shared/markdown.js';
+import { proposalCountLabel, proposalsSummary, proposalsBadgeLabel } from './proposals-format.js';
 import type {
   AccountDto,
+  AssignmentMethodDto,
   CategoryEmailDto,
+  ProposalDto,
   ChatSourceDto,
   ConversationDto,
   ConversationSummaryDto,
@@ -144,6 +147,7 @@ async function refreshDashboard(): Promise<void> {
     renderRecent();
     setStatus(`Updated ${formatTime(data.generatedAt)}`);
     void loadFolderPlan(account);
+    void refreshProposalsBadge();
   } catch (err) {
     if (account !== state.currentAccountId) return;
     setStatus(err instanceof Error ? err.message : String(err));
@@ -1129,6 +1133,7 @@ function setCategoryActionsDisabled(disabled: boolean): void {
   $<HTMLButtonElement>('btn-refine-ai').disabled = disabled;
   $<HTMLButtonElement>('btn-retry-uncategorized').disabled = disabled;
   $<HTMLButtonElement>('btn-improve').disabled = disabled;
+  $<HTMLButtonElement>('btn-proposals').disabled = disabled;
 }
 
 /** Returns whether the user opted to recategorize every email rather than only new ones. */
@@ -1713,6 +1718,175 @@ async function applyImprovements(): Promise<void> {
   }
 }
 
+/** Opens the suggested-categories review modal and loads the pending queue. */
+async function openProposalsModal(): Promise<void> {
+  $('proposals-modal').hidden = false;
+  await loadProposals();
+}
+
+/** Closes the suggested-categories modal. */
+function closeProposalsModal(): void {
+  $('proposals-modal').hidden = true;
+}
+
+/** Fetches the pending proposals for the current account, renders them, and refreshes the button count. */
+async function loadProposals(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  $('proposals-summary').textContent = 'Loading suggestions...';
+  try {
+    const res = await coreClient.listProposals(accountId);
+    if (accountId !== state.currentAccountId) return;
+    renderProposals(res.proposals);
+    setProposalsBadge(res.proposals.length);
+  } catch (err) {
+    $('proposals-summary').textContent = err instanceof Error ? err.message : String(err);
+  }
+}
+
+/** Renders the review queue: one card per proposal with Add and Ignore actions. */
+function renderProposals(list: ProposalDto[]): void {
+  $('proposals-summary').textContent = proposalsSummary(list.length);
+  const body = $('proposals-body');
+  body.innerHTML = '';
+  for (const p of list) body.appendChild(proposalCard(p));
+}
+
+/** Builds one proposal card: label, estimated size, evidence keywords, and Add/Ignore buttons. */
+function proposalCard(p: ProposalDto): HTMLElement {
+  const card = document.createElement('div');
+  card.className = 'proposal-card';
+
+  const top = document.createElement('div');
+  top.className = 'proposal-top';
+  const label = document.createElement('div');
+  label.className = 'proposal-label';
+  label.textContent = p.label;
+  const count = document.createElement('span');
+  count.className = 'proposal-count';
+  count.textContent = proposalCountLabel(p.proposedCount);
+  top.append(label, count);
+  card.appendChild(top);
+
+  if (p.description) {
+    const desc = document.createElement('div');
+    desc.className = 'proposal-description';
+    desc.textContent = p.description;
+    card.appendChild(desc);
+  }
+
+  if (p.evidence.length > 0) {
+    const chips = document.createElement('div');
+    chips.className = 'proposal-evidence';
+    for (const term of p.evidence.slice(0, 6)) {
+      const chip = document.createElement('span');
+      chip.className = 'proposal-chip';
+      chip.textContent = term;
+      chips.appendChild(chip);
+    }
+    card.appendChild(chips);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'proposal-actions';
+  const ignore = document.createElement('button');
+  ignore.className = 'btn btn-ghost btn-sm';
+  ignore.type = 'button';
+  ignore.textContent = 'Ignore';
+  const add = document.createElement('button');
+  add.className = 'btn btn-primary btn-sm';
+  add.type = 'button';
+  add.textContent = 'Add';
+  // Disable both buttons on this card while its request is in flight, so a fast double-click cannot
+  // send a duplicate apply/dismiss. On success the queue refresh replaces the card; on failure the
+  // action re-enables them.
+  const setBusy = (busy: boolean): void => {
+    add.disabled = busy;
+    ignore.disabled = busy;
+  };
+  ignore.addEventListener('click', () => void dismissProposal(p, setBusy));
+  add.addEventListener('click', () => void applyProposal(p, setBusy));
+  actions.append(ignore, add);
+  card.appendChild(actions);
+  return card;
+}
+
+/** Runs discovery to find new proposals, then reloads the queue. */
+async function generateProposals(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  const btn = $<HTMLButtonElement>('proposals-generate');
+  btn.disabled = true;
+  $('proposals-summary').textContent = 'Looking for new categories in your emails...';
+  try {
+    const res = await coreClient.generateProposals({ accountId });
+    if (accountId !== state.currentAccountId) return;
+    setStatus(
+      res.created.length > 0
+        ? `Found ${res.created.length} new suggestion${res.created.length === 1 ? '' : 's'}.`
+        : 'No new categories found.',
+    );
+    await loadProposals();
+  } catch (err) {
+    $('proposals-summary').textContent = err instanceof Error ? err.message : String(err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** Approves a proposal, files its emails, and refreshes the queue and dashboard. */
+async function applyProposal(p: ProposalDto, setBusy: (busy: boolean) => void): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  setBusy(true);
+  try {
+    const res = await coreClient.applyProposal(p.id, accountId);
+    setStatus(
+      res.assigned > 0
+        ? `Added "${res.label}" and filed ${res.assigned} email${res.assigned === 1 ? '' : 's'}.`
+        : `Added "${res.label}".`,
+    );
+    await loadProposals();
+    await refreshDashboard();
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+    setBusy(false);
+  }
+}
+
+/** Dismisses a proposal so it leaves the queue and is not suggested again. */
+async function dismissProposal(p: ProposalDto, setBusy: (busy: boolean) => void): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  setBusy(true);
+  try {
+    await coreClient.dismissProposal(p.id, accountId);
+    setStatus(`Ignored "${p.label}".`);
+    await loadProposals();
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err));
+    setBusy(false);
+  }
+}
+
+/** Sets the toolbar button label to reflect the pending proposal count. */
+function setProposalsBadge(count: number): void {
+  $<HTMLButtonElement>('btn-proposals').textContent = proposalsBadgeLabel(count);
+}
+
+/** Refreshes the pending-proposal count on the toolbar button, non-fatally. */
+async function refreshProposalsBadge(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  try {
+    const res = await coreClient.listProposals(accountId);
+    if (accountId !== state.currentAccountId) return;
+    setProposalsBadge(res.proposals.length);
+  } catch {
+    // Non-fatal: leave the button label unchanged if the count cannot be fetched.
+  }
+}
+
 /** Shows the modal confirmation dialog and resolves true on confirm, false on cancel, backdrop click, or Escape. */
 function confirmDialog(title: string, message: string, okLabel = 'Confirm'): Promise<boolean> {
   return new Promise((resolve) => {
@@ -1864,11 +2038,11 @@ function renderCategoryEmails(container: HTMLElement, emails: CategoryEmailDto[]
 
 type ChipProvenance = {
   assignedBy: 'user' | 'auto';
-  method?: 'embed' | 'llm' | 'gate' | null;
+  method?: AssignmentMethodDto | null;
   confidence: number;
 };
 
-/** Builds a small provenance badge showing how a category was assigned (you, fast embed, gate, or AI), or null. */
+/** Builds a small provenance badge showing how a category was assigned (you, fast, or AI), or null. */
 function chipProvenance(cat: ChipProvenance): HTMLElement | null {
   let text: string;
   let kind: string;
@@ -1878,7 +2052,7 @@ function chipProvenance(cat: ChipProvenance): HTMLElement | null {
   } else if (cat.method === 'embed') {
     text = `Fast ${Math.round(cat.confidence * 100)}%`;
     kind = 'cp-fast';
-  } else if (cat.method === 'gate') {
+  } else if (cat.method === 'gate' || cat.method === 'proposal') {
     text = 'Fast';
     kind = 'cp-fast';
   } else if (cat.method === 'llm') {
@@ -2120,6 +2294,20 @@ function attachHandlers(): void {
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !$('improve-modal').hidden) closeImproveModal();
+  });
+
+  $<HTMLButtonElement>('btn-proposals').addEventListener('click', () => {
+    void openProposalsModal();
+  });
+  $<HTMLButtonElement>('proposals-generate').addEventListener('click', () => {
+    void generateProposals();
+  });
+  $<HTMLButtonElement>('proposals-close').addEventListener('click', closeProposalsModal);
+  $('proposals-modal').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeProposalsModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('proposals-modal').hidden) closeProposalsModal();
   });
 
   $<HTMLButtonElement>('btn-organize-folders').addEventListener('click', () => {

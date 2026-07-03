@@ -2404,6 +2404,7 @@ describe('LlmCategorizeOrchestrator.start (retryUncategorized guard + messageIds
       listForAccount: vi.fn(() => embedded),
     },
     categories: {
+      listActive: vi.fn(() => [{ id: 'c1', label: 'A', description: null }]),
       listForAccount: vi.fn(() => [{ id: 'c1', label: 'A', description: null }]),
       getLlmProtectedMessageIds: vi.fn(() => new Set<string>()),
       getNoneDecisionIds: vi.fn(() => new Set<string>()),

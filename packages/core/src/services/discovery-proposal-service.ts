@@ -14,7 +14,6 @@ import { domainFrequency, brandTokens } from './topic-discovery-service.js';
 import {
   clusterKeyphrases,
   validateBatch,
-  rankAccepted,
   type NamedCandidate,
   type ActiveCategoryRef,
   type RejectReason,
@@ -39,11 +38,21 @@ export interface RejectedProposal {
   reason: RejectReason;
 }
 
-/** Outcome of one proposal run. Accepted candidates are ranked by deterministic confidence. */
+/**
+ * An accepted proposal with the source cluster and deterministic confidence, so the persistence layer
+ * can seed a centroid and assign members without re-clustering.
+ */
+export interface AcceptedProposal {
+  candidate: NamedCandidate;
+  cluster: DiscoveredCluster;
+  confidence: number;
+}
+
+/** Outcome of one proposal run. Accepted proposals are ranked by deterministic confidence. */
 export interface ProposalRunResult {
   clusterCount: number;
   sampledEmails: number;
-  accepted: NamedCandidate[];
+  accepted: AcceptedProposal[];
   rejected: RejectedProposal[];
 }
 
@@ -95,14 +104,18 @@ export class DiscoveryProposalService {
     const cfg = this.getConfig();
     const provider = discoveryProvider(cfg);
     assertDiscoveryLocal(cfg, provider);
+    // On the cloud chat provider use the configured cloud model and drop the Ollama-only controls
+    // (`/no_think`, `think`), which would pollute or fail an OpenAI-style request.
+    const local = provider === 'main';
+    const model = local ? generationModelId : cfg.chatModel || generationModelId;
     const raw = await this.llm.chat({
-      model: generationModelId,
+      model,
       provider,
-      messages: buildNamingMessages(namingInputs),
+      messages: buildNamingMessages(namingInputs, { noThink: local }),
       responseFormat: 'json_object',
       temperature: 0.2,
       maxTokens: NAMING_OUTPUT_TOKENS,
-      think: false,
+      think: local ? false : undefined,
     });
 
     const parsed = parseNamedCandidates(raw, chosen.length);
@@ -128,7 +141,14 @@ export class DiscoveryProposalService {
       existingSuggestedKeys: suggested.map((s) => s.canonicalKey),
     }));
 
-    const accepted = rankAccepted(results);
+    const accepted: AcceptedProposal[] = results
+      .filter((r) => r.verdict.accepted)
+      .map((r) => ({
+        candidate: r.candidate,
+        cluster: chosen[r.candidate.clusterIndex]!,
+        confidence: r.verdict.confidence,
+      }))
+      .sort((a, b) => b.confidence - a.confidence);
     const rejected: RejectedProposal[] = results
       .filter((r) => !r.verdict.accepted)
       .map((r) => ({

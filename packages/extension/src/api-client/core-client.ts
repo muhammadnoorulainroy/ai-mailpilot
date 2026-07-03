@@ -54,6 +54,11 @@ import type {
   CategoryEmailListResponse,
   EmailCategoriesResponse,
   FolderPlanResponse,
+  GenerateProposalsRequest,
+  GenerateProposalsResponse,
+  ProposalListResponse,
+  ApplyProposalResponse,
+  DismissProposalResponse,
 } from '@ai-mailpilot/shared';
 
 const TOKEN_KEY = 'core_auth_token';
@@ -279,6 +284,36 @@ export class CoreClient {
   /** Apply selected category improvements. */
   improveApply(req: ApplyImprovementsRequest): Promise<ApplyImprovementsResponse> {
     return this.request('/categories/improve/apply', { method: 'POST', body: JSON.stringify(req) });
+  }
+
+  /** Run discovery and persist new category proposals for review. */
+  generateProposals(req: GenerateProposalsRequest): Promise<GenerateProposalsResponse> {
+    return this.request('/categories/proposals/generate', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
+  }
+
+  /** List the pending category proposals awaiting review for an account. */
+  listProposals(accountId: string): Promise<ProposalListResponse> {
+    const qs = new URLSearchParams({ accountId });
+    return this.request(`/categories/proposals?${qs.toString()}`);
+  }
+
+  /** Approve a proposal: promote it to an active category and file its still-uncategorized emails. */
+  applyProposal(proposalId: string, accountId: string): Promise<ApplyProposalResponse> {
+    return this.request(`/categories/proposals/${encodeURIComponent(proposalId)}/apply`, {
+      method: 'POST',
+      body: JSON.stringify({ accountId }),
+    });
+  }
+
+  /** Dismiss a proposal so it leaves the queue and is not proposed again. */
+  dismissProposal(proposalId: string, accountId: string): Promise<DismissProposalResponse> {
+    return this.request(`/categories/proposals/${encodeURIComponent(proposalId)}/dismiss`, {
+      method: 'POST',
+      body: JSON.stringify({ accountId }),
+    });
   }
 
   /** Start an embedding-based categorization run. */

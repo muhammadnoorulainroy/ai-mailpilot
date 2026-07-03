@@ -324,6 +324,9 @@ export interface CategoryMergeResponse {
   reassigned: number;
 }
 
+/** How an auto assignment was decided. 'proposal' is a discovery proposal the user approved. */
+export type AssignmentMethodDto = 'embed' | 'llm' | 'gate' | 'proposal';
+
 /** An email as listed within a category, with per-category provenance. */
 export interface CategoryEmailDto {
   messageId: string;
@@ -335,13 +338,13 @@ export interface CategoryEmailDto {
   hasAttachments: boolean;
   confidence: number;
   assignedBy: 'user' | 'auto';
-  method?: 'embed' | 'llm' | 'gate' | null;
+  method?: AssignmentMethodDto | null;
   categories: Array<{
     id: string;
     label: string;
     confidence: number;
     assignedBy: 'user' | 'auto';
-    method?: 'embed' | 'llm' | 'gate' | null;
+    method?: AssignmentMethodDto | null;
   }>;
 }
 
@@ -349,6 +352,80 @@ export interface CategoryEmailDto {
 export interface CategoryEmailListResponse {
   categoryId: string;
   emails: CategoryEmailDto[];
+}
+
+/** A pending category proposal awaiting review, with its deterministic quality metrics. */
+export interface ProposalDto {
+  id: string;
+  categoryId: string;
+  label: string;
+  description: string;
+  proposedCount: number;
+  cohesion: number;
+  separation: number;
+  confidence: number;
+  evidence: string[];
+  createdAt: number;
+}
+
+/** Response listing the pending review queue for an account. */
+export interface ProposalListResponse {
+  proposals: ProposalDto[];
+}
+
+/** Request to run discovery and persist new proposals. */
+export interface GenerateProposalsRequest {
+  accountId: string;
+  embeddingModelId?: string;
+  generationModelId?: string;
+}
+
+/** A newly persisted proposal from a generate run. */
+export interface GeneratedProposalDto {
+  id: string;
+  categoryId: string;
+  label: string;
+  description: string;
+  canonicalKey: string;
+  proposedCount: number;
+  cohesion: number;
+  confidence: number;
+  evidence: string[];
+}
+
+/** A cluster whose name the deterministic gate rejected, with the reason. */
+export interface RejectedProposalDto {
+  clusterIndex: number;
+  label: string;
+  reason: string;
+}
+
+/** Result of a generate run: what was created, deduped, and rejected. */
+export interface GenerateProposalsResponse {
+  runId: string;
+  clusterCount: number;
+  sampledEmails: number;
+  created: GeneratedProposalDto[];
+  skippedDuplicates: number;
+  rejected: RejectedProposalDto[];
+}
+
+/** Request to apply or dismiss a proposal: the account that owns it. */
+export interface ProposalActionRequest {
+  accountId: string;
+}
+
+/** Result of applying a proposal: the promoted category and how many emails it took. */
+export interface ApplyProposalResponse {
+  categoryId: string;
+  label: string;
+  assigned: number;
+}
+
+/** Result of dismissing a proposal. */
+export interface DismissProposalResponse {
+  dismissed: boolean;
+  categoryId: string;
 }
 
 /** Request to discover topics and seed categories for an account. */

@@ -204,8 +204,10 @@ export class LlmCategorizeOrchestrator {
       return { pending: this.progress.total - this.progress.processed, started: false };
     }
 
+    // Active only: the LLM may assign to live categories, never to a suggested proposal awaiting
+    // review or a retired category.
     const candidates: CategoryCandidate[] = this.categories
-      .listForAccount(accountId)
+      .listActive(accountId)
       .map((c) => ({ id: c.id, label: c.label, description: c.description }));
     if (opts.force || opts.retryUncategorized) {
       this.categories.clearNoneDecisions(accountId);

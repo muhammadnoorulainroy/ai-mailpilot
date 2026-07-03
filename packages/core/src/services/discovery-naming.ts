@@ -45,8 +45,15 @@ RULES:
 OUTPUT FORMAT:
 {"clusters": [{"clusterIndex": 0, "action": "new_category", "label": "Receipts & Invoices", "description": "Payment confirmations and invoices for purchases.", "suggestedKey": "finance.invoices"}]}`;
 
-/** Build the system and user messages that ask the model to name every given cluster. */
-export function buildNamingMessages(clusters: ClusterNamingInput[]): ChatMessage[] {
+/**
+ * Build the system and user messages that ask the model to name every given cluster. The `/no_think`
+ * control line is Ollama-specific, so it is added only for the local model (`noThink`); a cloud model
+ * must not receive it.
+ */
+export function buildNamingMessages(
+  clusters: ClusterNamingInput[],
+  opts: { noThink?: boolean } = {},
+): ChatMessage[] {
   const body = clusters
     .map((c) => {
       const keys = c.keyphrases.slice(0, 8).join(', ') || '(none)';
@@ -59,8 +66,9 @@ export function buildNamingMessages(clusters: ClusterNamingInput[]): ChatMessage
     })
     .join('\n\n');
   const user = `Name these ${clusters.length} clusters. Return one object per cluster in the "clusters" array.\n\n${body}`;
+  const system = opts.noThink ? `/no_think\n${SYSTEM_PROMPT}` : SYSTEM_PROMPT;
   return [
-    { role: 'system', content: `/no_think\n${SYSTEM_PROMPT}` },
+    { role: 'system', content: system },
     { role: 'user', content: user },
   ];
 }
