@@ -155,11 +155,20 @@ describe('CategoryProposalRepository', () => {
     const { proposals, categories, accountId, makeInput } = setup();
     const structural = (label: string, key: string, kind: 'split' | 'merge' | 'retire') => {
       const cat = categories.create({ accountId, label, source: 'auto', canonicalKey: key });
+      const sourceCategoryId =
+        kind === 'merge'
+          ? categories.create({
+              accountId,
+              label: `${label} src`,
+              source: 'auto',
+              canonicalKey: `${key}_src`,
+            }).id
+          : null;
       return proposals.createStructural({
         accountId,
         kind,
         categoryId: cat.id,
-        sourceCategoryId: null,
+        sourceCategoryId,
         runId: 'run-1',
         label,
         description: 'd',
@@ -271,5 +280,153 @@ describe('CategoryProposalRepository', () => {
     expect([...proposals.resolvedStructuralSuppressionKeys(other.id)]).toEqual(['retire:b']);
     expect(proposals.listForAccount(accountId).map((p) => p.id)).toEqual([pA.id]);
     expect(proposals.listForAccount(other.id).map((p) => p.id)).toEqual([pB.id]);
+  });
+
+  it('trims the stored suppression key', () => {
+    const { proposals, categories, accountId } = setup();
+    const cat = categories.create({ accountId, label: 'X', source: 'auto', canonicalKey: 'x' });
+    const p = proposals.createStructural({
+      accountId,
+      kind: 'retire',
+      categoryId: cat.id,
+      sourceCategoryId: null,
+      runId: 'r',
+      label: 'X',
+      description: 'd',
+      canonicalKey: 'x',
+      suppressionKey: '  retire:x  ',
+      embeddingModelId: 'bge-m3',
+      confidence: 0.5,
+      evidence: [],
+    });
+    expect(p.suppressionKey).toBe('retire:x');
+    expect(proposals.findById(p.id)!.suppressionKey).toBe('retire:x');
+  });
+
+  it('rejects invalid structural proposals', () => {
+    const { proposals, categories, accountId } = setup();
+    const target = categories.create({ accountId, label: 'T', source: 'auto', canonicalKey: 't' });
+    const src = categories.create({
+      accountId,
+      label: 'Src',
+      source: 'auto',
+      canonicalKey: 't_src',
+    });
+    const base = {
+      accountId,
+      categoryId: target.id,
+      runId: 'r',
+      label: 'T',
+      description: 'd',
+      canonicalKey: 't',
+      embeddingModelId: 'bge-m3',
+      confidence: 0.5,
+      evidence: [] as string[],
+    };
+    // Empty suppression key.
+    expect(() =>
+      proposals.createStructural({
+        ...base,
+        kind: 'retire',
+        sourceCategoryId: null,
+        suppressionKey: '   ',
+      }),
+    ).toThrow(/suppressionKey/i);
+    // Merge without a source, or source equal to target.
+    expect(() =>
+      proposals.createStructural({
+        ...base,
+        kind: 'merge',
+        sourceCategoryId: null,
+        suppressionKey: 'merge:t',
+      }),
+    ).toThrow(/source/i);
+    expect(() =>
+      proposals.createStructural({
+        ...base,
+        kind: 'merge',
+        sourceCategoryId: target.id,
+        suppressionKey: 'merge:t',
+      }),
+    ).toThrow(/differ/i);
+    // Split or retire carrying a source.
+    expect(() =>
+      proposals.createStructural({
+        ...base,
+        kind: 'split',
+        sourceCategoryId: src.id,
+        suppressionKey: 'split:t',
+      }),
+    ).toThrow(/null sourceCategoryId/i);
+    expect(() =>
+      proposals.createStructural({
+        ...base,
+        kind: 'retire',
+        sourceCategoryId: src.id,
+        suppressionKey: 'retire:t',
+      }),
+    ).toThrow(/null sourceCategoryId/i);
+    // A valid merge with a distinct source still works.
+    const ok = proposals.createStructural({
+      ...base,
+      kind: 'merge',
+      sourceCategoryId: src.id,
+      suppressionKey: 'merge:t',
+    });
+    expect(ok.sourceCategoryId).toBe(src.id);
+  });
+
+  it('rejects createChild for a missing, non-split, or non-pending proposal', () => {
+    const { proposals, categories, accountId } = setup();
+    const child = (proposalId: string) => ({
+      proposalId,
+      label: 'C',
+      description: 'd',
+      canonicalKey: 'c',
+      embeddingModelId: 'bge-m3',
+      centroid: centroid(1),
+      memberIds: ['m1'],
+      proposedCount: 1,
+      cohesion: 0.5,
+      separation: 0.5,
+      confidence: 0.5,
+    });
+    expect(() => proposals.createChild(child('missing'))).toThrow(/missing proposal/i);
+
+    const rc = categories.create({ accountId, label: 'R', source: 'auto', canonicalKey: 'r' });
+    const retire = proposals.createStructural({
+      accountId,
+      kind: 'retire',
+      categoryId: rc.id,
+      sourceCategoryId: null,
+      runId: 'r',
+      label: 'R',
+      description: 'd',
+      canonicalKey: 'r',
+      suppressionKey: 'retire:r',
+      embeddingModelId: 'bge-m3',
+      confidence: 0.5,
+      evidence: [],
+    });
+    expect(() => proposals.createChild(child(retire.id))).toThrow(/split/i);
+
+    const sc = categories.create({ accountId, label: 'S', source: 'auto', canonicalKey: 's' });
+    const split = proposals.createStructural({
+      accountId,
+      kind: 'split',
+      categoryId: sc.id,
+      sourceCategoryId: null,
+      runId: 'r',
+      label: 'S',
+      description: 'd',
+      canonicalKey: 's',
+      suppressionKey: 'split:s',
+      embeddingModelId: 'bge-m3',
+      confidence: 0.5,
+      evidence: [],
+    });
+    proposals.createChild(child(split.id)); // allowed while pending
+    proposals.markDismissed(split.id);
+    expect(() => proposals.createChild(child(split.id))).toThrow(/dismissed/i);
   });
 });

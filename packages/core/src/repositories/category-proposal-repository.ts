@@ -222,7 +222,7 @@ export class CategoryProposalRepository {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       listChildren: db.prepare(
-        `SELECT ${CHILD_COLS} FROM category_proposal_children WHERE proposal_id = ? ORDER BY created_at`,
+        `SELECT ${CHILD_COLS} FROM category_proposal_children WHERE proposal_id = ? ORDER BY created_at, id`,
       ),
     };
   }
@@ -276,6 +276,20 @@ export class CategoryProposalRepository {
    * split cluster data is stored per child via createChild. categoryId is the surviving/target category.
    */
   createStructural(input: CreateStructuralProposalInput): CategoryProposal {
+    const suppressionKey = input.suppressionKey.trim();
+    if (suppressionKey === '') {
+      throw new Error('structural proposal requires a non-empty suppressionKey');
+    }
+    if (input.kind === 'merge') {
+      if (!input.sourceCategoryId) {
+        throw new Error('merge proposal requires a sourceCategoryId');
+      }
+      if (input.sourceCategoryId === input.categoryId) {
+        throw new Error('merge proposal sourceCategoryId must differ from the target categoryId');
+      }
+    } else if (input.sourceCategoryId !== null) {
+      throw new Error(`${input.kind} proposal must have a null sourceCategoryId`);
+    }
     const now = Date.now();
     const id = randomUUID();
     const emptyCentroid = new Float32Array(0);
@@ -303,7 +317,7 @@ export class CategoryProposalRepository {
       null,
       input.kind,
       input.sourceCategoryId,
-      input.suppressionKey,
+      suppressionKey,
     );
     return {
       id,
@@ -317,7 +331,7 @@ export class CategoryProposalRepository {
       description: input.description,
       canonicalKey: input.canonicalKey,
       suggestedKey: '',
-      suppressionKey: input.suppressionKey,
+      suppressionKey,
       embeddingModelId: input.embeddingModelId,
       centroid: emptyCentroid,
       memberIds: [],
@@ -333,8 +347,20 @@ export class CategoryProposalRepository {
     };
   }
 
-  /** Record one child category of a split proposal. */
+  /** Record one child category of a split proposal. Only a pending split proposal may have children. */
   createChild(input: CreateProposalChildInput): CategoryProposalChild {
+    const proposal = this.findById(input.proposalId);
+    if (!proposal) {
+      throw new Error('cannot add a child to a missing proposal');
+    }
+    if (proposal.kind !== 'split') {
+      throw new Error(
+        `cannot add a child to a ${proposal.kind} proposal; only split proposals have children`,
+      );
+    }
+    if (proposal.status !== 'pending') {
+      throw new Error(`cannot add a child to a ${proposal.status} proposal`);
+    }
     const now = Date.now();
     const id = randomUUID();
     this.stmts.insertChild.run(
