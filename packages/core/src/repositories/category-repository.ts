@@ -782,11 +782,21 @@ export class CategoryRepository {
 
   /**
    * Move every email assigned to sourceId over to targetId, then delete the source
-   * category. If an email is already in the target, keep the higher confidence
-   * assignment. Runs in a single transaction so a half-merge can't leak.
+   * category. When an email is already in the target, USER provenance dominates: the
+   * winning row is the user one if either side is user, otherwise the higher-confidence
+   * row; the winner's method and assigned_at are kept, and confidence is the max. A user
+   * assignment is never overwritten by an auto one, even at equal or higher auto confidence.
+   * Runs in a single transaction so a half-merge can't leak.
    */
   mergeInto(sourceId: string, targetId: string): { reassigned: number } {
     if (sourceId === targetId) return { reassigned: 0 };
+
+    // The incoming (source) row wins the conflict when it is a user row over an auto row,
+    // or when both share provenance and it has strictly higher confidence. Otherwise the
+    // existing (target) row is kept. Reused for assigned_by, method, and assigned_at.
+    const takeExcluded =
+      `(excluded.assigned_by = 'user' AND assigned_by = 'auto') ` +
+      `OR (excluded.assigned_by = assigned_by AND excluded.confidence > confidence)`;
 
     const tx = this.db.transaction((src: string, dst: string): number => {
       const moved = this.db
@@ -796,12 +806,9 @@ export class CategoryRepository {
                FROM email_categories
               WHERE category_id = ?
            ON CONFLICT (message_id, account_id, category_id) DO UPDATE SET
-             assigned_by = CASE WHEN excluded.confidence > confidence
-                                THEN excluded.assigned_by ELSE assigned_by END,
-             method = CASE WHEN excluded.confidence > confidence
-                                THEN excluded.method ELSE method END,
-             assigned_at = CASE WHEN excluded.confidence > confidence
-                                THEN excluded.assigned_at ELSE assigned_at END,
+             assigned_by = CASE WHEN ${takeExcluded} THEN excluded.assigned_by ELSE assigned_by END,
+             method = CASE WHEN ${takeExcluded} THEN excluded.method ELSE method END,
+             assigned_at = CASE WHEN ${takeExcluded} THEN excluded.assigned_at ELSE assigned_at END,
              confidence = MAX(confidence, excluded.confidence)`,
         )
         .run(dst, src).changes;
@@ -815,7 +822,9 @@ export class CategoryRepository {
 
   /**
    * The single primary category for every categorized email in an account, used to file
-   * each email into exactly one folder. Primary is highest confidence, then a user
+   * each email into exactly one folder. Only ACTIVE categories are considered, so a retired
+   * or suggested category is never chosen as a primary (and an email whose only assignments
+   * are to non-active categories does not appear). Primary is highest confidence, then a user
    * assignment over auto, then label order as a stable tiebreak.
    */
   getPrimaryCategoryPerEmail(accountId: string): Array<{ messageId: string; categoryId: string }> {
@@ -829,7 +838,7 @@ export class CategoryRepository {
                   ) AS rn
              FROM email_categories ec
              JOIN categories c ON c.id = ec.category_id
-            WHERE ec.account_id = ?
+            WHERE ec.account_id = ? AND c.status = 'active'
          ) WHERE rn = 1`,
       )
       .all(accountId) as Array<{ message_id: string; category_id: string }>;

@@ -39,6 +39,16 @@ function vec(second = 0): Float32Array {
   return arr;
 }
 
+/** Reads the stored assignment method for one (email, category) directly (getEmailCategories omits it). */
+function methodOf(messageId: string, accountId: string, categoryId: string): string | null {
+  const row = db
+    .prepare(
+      'SELECT method FROM email_categories WHERE message_id = ? AND account_id = ? AND category_id = ?',
+    )
+    .get(messageId, accountId, categoryId) as { method: string | null } | undefined;
+  return row?.method ?? null;
+}
+
 beforeEach(() => {
   db = openDatabase(':memory:');
   accounts = new AccountRepository(db);
@@ -272,15 +282,140 @@ describe('CategoryRepository.mergeInto provenance (M2)', () => {
     expect(remaining[0]!.assignedBy).toBe('user');
   });
 
-  it('adopts the source provenance when the source confidence is higher', () => {
+  it('keeps user provenance even when the source auto confidence is higher', () => {
+    // Target is a user assignment; a higher-confidence auto source must NOT overwrite it.
     const { sourceId, targetId } = setupEmailInTwoCategories(0.5, 'user', 0.95, 'auto');
     const acctId = accounts.list()[0]!.id;
     categories.mergeInto(sourceId, targetId);
 
     const remaining = categories.getEmailCategories('msg', acctId);
     expect(remaining).toHaveLength(1);
-    expect(remaining[0]!.confidence).toBeCloseTo(0.95);
+    expect(remaining[0]!.assignedBy).toBe('user');
+    expect(remaining[0]!.confidence).toBeCloseTo(0.95); // confidence is the max
+  });
+
+  it('keeps user provenance on an equal-confidence tie against auto (the fixed hole)', () => {
+    // Source user 1.0 vs target auto 1.0: the user row must win the tie.
+    const { sourceId, targetId } = setupEmailInTwoCategories(1.0, 'auto', 1.0, 'user');
+    const acctId = accounts.list()[0]!.id;
+    categories.mergeInto(sourceId, targetId);
+
+    const remaining = categories.getEmailCategories('msg', acctId);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.assignedBy).toBe('user');
+    expect(remaining[0]!.confidence).toBeCloseTo(1.0);
+  });
+
+  it('adopts the source user provenance over a higher-confidence target auto row', () => {
+    // Source user 0.8 vs target auto 1.0: user still wins; confidence is the max.
+    const { sourceId, targetId } = setupEmailInTwoCategories(1.0, 'auto', 0.8, 'user');
+    const acctId = accounts.list()[0]!.id;
+    categories.mergeInto(sourceId, targetId);
+
+    const remaining = categories.getEmailCategories('msg', acctId);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.assignedBy).toBe('user');
+    expect(remaining[0]!.confidence).toBeCloseTo(1.0);
+  });
+
+  it('keeps the higher-confidence row and its method among same-provenance auto rows', () => {
+    const acct = accounts.create({ address: 'mm@y.z', kind: 'work' });
+    emails.upsertBatch([{ messageId: 'msg', accountId: acct.id, folder: 'INBOX' }]);
+    const target = categories.create({ accountId: acct.id, label: 'T', source: 'auto' });
+    const source = categories.create({ accountId: acct.id, label: 'S', source: 'auto' });
+    categories.replaceEmailAssignments('msg', acct.id, [
+      {
+        messageId: 'msg',
+        accountId: acct.id,
+        categoryId: target.id,
+        confidence: 0.6,
+        assignedBy: 'auto',
+        assignedAt: 1,
+        method: 'embed',
+      },
+      {
+        messageId: 'msg',
+        accountId: acct.id,
+        categoryId: source.id,
+        confidence: 0.9,
+        assignedBy: 'auto',
+        assignedAt: 2,
+        method: 'gate',
+      },
+    ]);
+    categories.mergeInto(source.id, target.id);
+
+    const remaining = categories.getEmailCategories('msg', acct.id);
+    expect(remaining).toHaveLength(1);
     expect(remaining[0]!.assignedBy).toBe('auto');
+    expect(remaining[0]!.confidence).toBeCloseTo(0.9);
+    expect(methodOf('msg', acct.id, target.id)).toBe('gate'); // the winning row's method
+  });
+
+  it('moves all source rows to the target and deletes the source category', () => {
+    const acct = accounts.create({ address: 'am@y.z', kind: 'work' });
+    const target = categories.create({ accountId: acct.id, label: 'T', source: 'auto' });
+    const source = categories.create({ accountId: acct.id, label: 'S', source: 'auto' });
+    for (const id of ['a', 'b', 'c']) {
+      emails.upsertBatch([{ messageId: id, accountId: acct.id, folder: 'INBOX' }]);
+      categories.replaceEmailAssignments(id, acct.id, [
+        {
+          messageId: id,
+          accountId: acct.id,
+          categoryId: source.id,
+          confidence: 0.7,
+          assignedBy: 'auto',
+          assignedAt: 1,
+          method: 'embed',
+        },
+      ]);
+    }
+    const { reassigned } = categories.mergeInto(source.id, target.id);
+
+    expect(reassigned).toBe(3);
+    expect(categories.findById(source.id)).toBeNull();
+    for (const id of ['a', 'b', 'c']) {
+      expect(categories.getEmailCategories(id, acct.id).map((r) => r.categoryId)).toEqual([
+        target.id,
+      ]);
+    }
+  });
+
+  it('leaves an email membership in an unrelated category untouched', () => {
+    const acct = accounts.create({ address: 'un@y.z', kind: 'work' });
+    const target = categories.create({ accountId: acct.id, label: 'T', source: 'auto' });
+    const source = categories.create({ accountId: acct.id, label: 'S', source: 'auto' });
+    const other = categories.create({ accountId: acct.id, label: 'O', source: 'auto' });
+    emails.upsertBatch([{ messageId: 'm1', accountId: acct.id, folder: 'INBOX' }]);
+    // m1 is multi-labeled: in the source AND an unrelated category.
+    categories.replaceEmailAssignments('m1', acct.id, [
+      {
+        messageId: 'm1',
+        accountId: acct.id,
+        categoryId: source.id,
+        confidence: 0.7,
+        assignedBy: 'auto',
+        assignedAt: 1,
+        method: 'embed',
+      },
+      {
+        messageId: 'm1',
+        accountId: acct.id,
+        categoryId: other.id,
+        confidence: 0.9,
+        assignedBy: 'auto',
+        assignedAt: 1,
+        method: 'gate',
+      },
+    ]);
+    categories.mergeInto(source.id, target.id);
+
+    const m1 = categories.getEmailCategories('m1', acct.id);
+    expect(m1.map((r) => r.categoryId).sort()).toEqual([other.id, target.id].sort());
+    const otherRow = m1.find((r) => r.categoryId === other.id)!;
+    expect(otherRow.confidence).toBeCloseTo(0.9);
+    expect(methodOf('m1', acct.id, other.id)).toBe('gate');
+    expect(categories.findById(other.id)).not.toBeNull();
   });
 });
 
@@ -394,6 +529,83 @@ describe('CategoryRepository.getPrimaryCategoryPerEmail (folders)', () => {
     const { acctId, catB } = emailInTwoCats(0.8, 'auto', 0.8, 'user');
     const primary = categories.getPrimaryCategoryPerEmail(acctId);
     expect(primary[0]!.categoryId).toBe(catB);
+  });
+
+  it('ignores a retired category and selects the active one, even at lower confidence', () => {
+    const acct = accounts.create({ address: 'pr2@x.y', kind: 'work' });
+    const active = categories.create({ accountId: acct.id, label: 'Active', source: 'auto' });
+    const retired = categories.create({
+      accountId: acct.id,
+      label: 'Retired',
+      source: 'auto',
+      status: 'retired',
+    });
+    emails.upsertBatch([{ messageId: 'e0', accountId: acct.id, folder: 'INBOX' }]);
+    categories.replaceEmailAssignments('e0', acct.id, [
+      {
+        messageId: 'e0',
+        accountId: acct.id,
+        categoryId: retired.id,
+        confidence: 0.99,
+        assignedBy: 'auto',
+        assignedAt: 1,
+      },
+      {
+        messageId: 'e0',
+        accountId: acct.id,
+        categoryId: active.id,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: 1,
+      },
+    ]);
+    expect(categories.getPrimaryCategoryPerEmail(acct.id)).toEqual([
+      { messageId: 'e0', categoryId: active.id },
+    ]);
+  });
+
+  it('returns no primary when the only assignment is to a retired category', () => {
+    const acct = accounts.create({ address: 'pr3@x.y', kind: 'work' });
+    const retired = categories.create({
+      accountId: acct.id,
+      label: 'Retired',
+      source: 'auto',
+      status: 'retired',
+    });
+    emails.upsertBatch([{ messageId: 'e0', accountId: acct.id, folder: 'INBOX' }]);
+    categories.replaceEmailAssignments('e0', acct.id, [
+      {
+        messageId: 'e0',
+        accountId: acct.id,
+        categoryId: retired.id,
+        confidence: 0.9,
+        assignedBy: 'auto',
+        assignedAt: 1,
+      },
+    ]);
+    expect(categories.getPrimaryCategoryPerEmail(acct.id)).toEqual([]);
+  });
+
+  it('returns no primary when the only assignment is to a suggested category', () => {
+    const acct = accounts.create({ address: 'pr4@x.y', kind: 'work' });
+    const suggested = categories.create({
+      accountId: acct.id,
+      label: 'Suggested',
+      source: 'auto',
+      status: 'suggested',
+    });
+    emails.upsertBatch([{ messageId: 'e0', accountId: acct.id, folder: 'INBOX' }]);
+    categories.replaceEmailAssignments('e0', acct.id, [
+      {
+        messageId: 'e0',
+        accountId: acct.id,
+        categoryId: suggested.id,
+        confidence: 0.9,
+        assignedBy: 'auto',
+        assignedAt: 1,
+      },
+    ]);
+    expect(categories.getPrimaryCategoryPerEmail(acct.id)).toEqual([]);
   });
 });
 
@@ -1127,7 +1339,9 @@ describe('EmailAssistantService', () => {
 
     const first = await svc.summarize(acct.id, 'm1', { modelId: 'gpt-4o-mini', provider: 'cloud' });
     expect(first.cached).toBe(false);
-    expect(first.attachments).toEqual([{ filename: 'plan.txt', status: 'extracted', included: true }]);
+    expect(first.attachments).toEqual([
+      { filename: 'plan.txt', status: 'extracted', included: true },
+    ]);
     expect(calls).toBe(1);
 
     const second = await svc.summarize(acct.id, 'm1', {
@@ -1300,12 +1514,10 @@ describe('EmailAssistantService', () => {
       silentLogger,
     );
 
-    const out = await svc.draftReply(
-      acct.id,
-      'm2',
-      'Keep it short.',
-      { modelId: 'gpt-4o-mini', provider: 'cloud' },
-    );
+    const out = await svc.draftReply(acct.id, 'm2', 'Keep it short.', {
+      modelId: 'gpt-4o-mini',
+      provider: 'cloud',
+    });
     expect(out.draft).toContain('Tomorrow works');
     expect(out.draft).toBe('Hi Max,\n\nTomorrow works for me.\n\nBest,\nNoor');
     expect(req).toMatchObject({
@@ -1316,7 +1528,11 @@ describe('EmailAssistantService', () => {
   });
 
   it('repairs a one-paragraph model draft into professional email format', async () => {
-    const acct = accounts.create({ address: 'noor@example.com', displayName: 'Noor', kind: 'work' });
+    const acct = accounts.create({
+      address: 'noor@example.com',
+      displayName: 'Noor',
+      kind: 'work',
+    });
     emails.upsert({
       messageId: 'm3',
       accountId: acct.id,
@@ -1338,12 +1554,10 @@ describe('EmailAssistantService', () => {
       silentLogger,
     );
 
-    const out = await svc.draftReply(
-      acct.id,
-      'm3',
-      undefined,
-      { modelId: 'gpt-4o-mini', provider: 'cloud' },
-    );
+    const out = await svc.draftReply(acct.id, 'm3', undefined, {
+      modelId: 'gpt-4o-mini',
+      provider: 'cloud',
+    });
     expect(out.draft).toBe(
       'Hello Claire,\n\nThank you for the update, Claire. I appreciate the information regarding the review process.\n\nBest regards,\nNoor',
     );
