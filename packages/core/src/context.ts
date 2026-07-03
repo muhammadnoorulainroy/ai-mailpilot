@@ -38,6 +38,7 @@ import { ResidualDiscoveryService } from './services/residual-discovery-service.
 import { DiscoveryProposalService } from './services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from './services/discovery-proposal-orchestrator.js';
 import { CategoryCentroidRebuildService } from './services/category-centroid-rebuild-service.js';
+import { CategoryHealthService } from './services/category-health-service.js';
 import { TriageOrchestrator } from './services/triage-orchestrator.js';
 import { TriageService } from './services/triage-service.js';
 import { getLogger } from './util/logger.js';
@@ -71,6 +72,7 @@ export interface Services {
   categoryImprovement: CategoryImprovementService;
   discoveryProposal: DiscoveryProposalOrchestrator;
   categoryCentroidRebuild: CategoryCentroidRebuildService;
+  categoryHealth: CategoryHealthService;
   category: CategoryOrchestrator;
   llmCategorize: LlmCategorizeOrchestrator;
   correction: CorrectionService;
@@ -178,6 +180,7 @@ export function buildContext(): AppContext {
       repos.embeddings,
       logger,
     ),
+    categoryHealth: new CategoryHealthService(repos.categories, repos.embeddings),
     category: new CategoryOrchestrator(
       categorizationService,
       repos.emails,
