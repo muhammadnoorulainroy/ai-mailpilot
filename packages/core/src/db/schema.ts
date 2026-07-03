@@ -609,4 +609,39 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 20,
+    name: 'structural_proposals',
+    up: (db) => {
+      // Phase 3.3 foundation: let category_proposals carry structural (split/merge/retire) proposals.
+      // kind defaults to 'new_category' so existing rows keep their behavior. source_category_id is a
+      // plain (non-cascading) column: a merge deletes the source, and it must NOT cascade-delete the
+      // proposal (whose category_id points at the surviving target). suppression_key keeps a re-run
+      // from re-proposing a resolved structural suggestion. The parent's cluster columns are left as
+      // deterministic placeholders for structural kinds; split cluster data lives in the children table.
+      db.exec(`
+        ALTER TABLE category_proposals ADD COLUMN kind TEXT NOT NULL DEFAULT 'new_category'
+          CHECK (kind IN ('new_category', 'split', 'merge', 'retire'));
+        ALTER TABLE category_proposals ADD COLUMN source_category_id TEXT;
+        ALTER TABLE category_proposals ADD COLUMN suppression_key TEXT NOT NULL DEFAULT '';
+
+        CREATE TABLE category_proposal_children (
+          id TEXT PRIMARY KEY,
+          proposal_id TEXT NOT NULL REFERENCES category_proposals(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          canonical_key TEXT NOT NULL,
+          embedding_model_id TEXT NOT NULL,
+          centroid BLOB NOT NULL,
+          member_ids TEXT NOT NULL DEFAULT '[]',
+          proposed_count INTEGER NOT NULL DEFAULT 0,
+          cohesion REAL NOT NULL DEFAULT 0,
+          separation REAL NOT NULL DEFAULT 0,
+          confidence REAL NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX idx_proposal_children_proposal ON category_proposal_children(proposal_id);
+      `);
+    },
+  },
 ];
