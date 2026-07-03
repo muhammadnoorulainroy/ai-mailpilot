@@ -312,12 +312,7 @@ export class DiscoveryProposalOrchestrator {
       case 'merge':
         return this.applyMerge(accountId, proposal);
       case 'split':
-        // Split needs a targeted per-member move primitive that does not exist yet; applying it now
-        // would either do nothing or partially move mail. Block with zero writes until it ships.
-        throw new ProposalApplyError(
-          'split apply is not supported yet; split write semantics ship in a later change',
-          409,
-        );
+        return this.applySplit(accountId, proposal);
       default: {
         const exhaustive: never = proposal.kind;
         throw new Error(`unsupported proposal kind: ${String(exhaustive)}`);
@@ -487,6 +482,120 @@ export class DiscoveryProposalOrchestrator {
       'discovery proposal: merged categories',
     );
     return { kind: 'merge', categoryId: target.id, label: target.label, assigned: reassigned };
+  }
+
+  /**
+   * split (3.3): turn the source category into its proposed child categories, relocating only the
+   * source's AUTO members into the child that lists them. Conservative and user-safe:
+   *  - Blocks (zero writes) when the source is missing/not active, fewer than two children are
+   *    proposed, or any child label/key collides with an existing or sibling category.
+   *  - Moves an auto member only when exactly one child lists it and its email still exists; a member
+   *    listed by two children is ambiguous and stays on the source. User assignments are never moved
+   *    (moveAutoAssignment only touches auto rows), so no user-confirmed label is destroyed or hidden.
+   *  - Retires the source only when nothing remains on it after the moves; otherwise it stays active,
+   *    so a leftover auto member or any user member keeps the source visible.
+   * Child creation, centroid saves, moves, the optional retire, and markApplied run in ONE
+   * transaction: any failure rolls the whole split back and the proposal stays pending.
+   */
+  private applySplit(accountId: string, proposal: CategoryProposal): ApplyResult {
+    const source = this.categories.findById(proposal.categoryId);
+    if (!source || source.accountId !== accountId) {
+      throw new ProposalApplyError('split source category not found', 404);
+    }
+    if (source.status !== 'active') {
+      throw new ProposalApplyError(`split source is ${source.status}, not active`, 409);
+    }
+    const children = this.proposals.listChildren(proposal.id);
+    if (children.length < 2) {
+      throw new ProposalApplyError('split needs at least two child categories', 409);
+    }
+
+    // Collision check BEFORE any write: a child label or canonical key must not already exist as a
+    // category, and the children must not collide with each other. A collision blocks the whole split
+    // (zero writes); the user must resolve it and re-propose rather than have it partially apply.
+    const seenKeys = new Set<string>();
+    const seenLabels = new Set<string>();
+    for (const child of children) {
+      if (
+        this.categories.findByCanonicalKey(accountId, child.canonicalKey) ||
+        this.categories.findByLabel(accountId, child.label) ||
+        seenKeys.has(child.canonicalKey) ||
+        seenLabels.has(child.label)
+      ) {
+        throw new ProposalApplyError(
+          `split child "${child.label}" collides with an existing or duplicate category; resolve it and re-propose`,
+          409,
+        );
+      }
+      seenKeys.add(child.canonicalKey);
+      seenLabels.add(child.label);
+    }
+
+    // Eligible move set per child: an auto member of the source whose email still exists, listed by
+    // exactly one child. A message listed by two children is ambiguous and is left on the source.
+    const autoOnSource = new Set(
+      this.categories.listCategoryMemberIds(accountId, source.id, 'auto'),
+    );
+    const allChildMemberIds = children.flatMap((c) => c.memberIds);
+    const existing = this.emails.existingIds(accountId, allChildMemberIds);
+    const childCount = new Map<string, number>();
+    for (const id of allChildMemberIds) {
+      childCount.set(id, (childCount.get(id) ?? 0) + 1);
+    }
+    const moveSets = children.map((child) =>
+      child.memberIds.filter(
+        (id) => autoOnSource.has(id) && existing.has(id) && childCount.get(id) === 1,
+      ),
+    );
+
+    const run = this.db.transaction(() => {
+      const createdIds: string[] = [];
+      let moved = 0;
+      children.forEach((child, i) => {
+        const created = this.categories.create({
+          accountId,
+          label: child.label,
+          description: child.description,
+          source: 'auto',
+          status: 'active',
+          canonicalKey: child.canonicalKey,
+        });
+        createdIds.push(created.id);
+        this.categories.saveCentroid(
+          created.id,
+          child.embeddingModelId,
+          child.centroid,
+          child.proposedCount,
+        );
+        for (const messageId of moveSets[i]!) {
+          if (this.categories.moveAutoAssignment(messageId, accountId, source.id, created.id)) {
+            moved += 1;
+          }
+        }
+      });
+      // Retire the source only when nothing remains on it (every member moved, no user member left).
+      let sourceRetired = false;
+      if (this.categories.countEmails(source.id) === 0) {
+        this.categories.retire(source.id);
+        sourceRetired = true;
+      }
+      this.proposals.markApplied(proposal.id);
+      return { createdIds, moved, sourceRetired };
+    });
+    const { createdIds, moved, sourceRetired } = run();
+
+    this.logger.info(
+      {
+        accountId,
+        proposalId: proposal.id,
+        sourceId: source.id,
+        childIds: createdIds,
+        moved,
+        sourceRetired,
+      },
+      'discovery proposal: split applied',
+    );
+    return { kind: 'split', categoryId: source.id, label: source.label, assigned: moved };
   }
 
   /**

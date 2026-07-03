@@ -155,6 +155,21 @@ function assignmentsFor(db: Database, accountId: string, messageId: string) {
   }>;
 }
 
+/** The single assignment row for an email, including the confidence and assigned_at that a move must preserve. */
+function fullAssignmentFor(db: Database, accountId: string, messageId: string) {
+  return db
+    .prepare(
+      'SELECT category_id, assigned_by, method, confidence, assigned_at FROM email_categories WHERE account_id = ? AND message_id = ?',
+    )
+    .get(accountId, messageId) as {
+    category_id: string;
+    assigned_by: string;
+    method: string | null;
+    confidence: number;
+    assigned_at: number;
+  };
+}
+
 describe('DiscoveryProposalOrchestrator.generate', () => {
   it('persists suggested categories with no active category, no assignment, and no centroid', async () => {
     const h = harness();
@@ -420,6 +435,67 @@ function retireProposal(h: Harness, categoryId: string, key: string) {
     embeddingModelId: MODEL,
     confidence: 0.9,
     evidence: [],
+  });
+}
+
+function seedAutoOnSource(
+  h: Harness,
+  messageId: string,
+  categoryId: string,
+  method: 'embed' | 'gate' | 'llm' | 'proposal' = 'embed',
+  confidence = 0.5,
+) {
+  seedEmailWithEmbedding(h, messageId, 2);
+  h.categories.addAutoAssignments(h.accountId, [
+    {
+      messageId,
+      accountId: h.accountId,
+      categoryId,
+      confidence,
+      assignedBy: 'auto',
+      assignedAt: Date.now(),
+      method,
+    },
+  ]);
+}
+
+function splitProposal(h: Harness, sourceId: string, key: string) {
+  return h.proposals.createStructural({
+    accountId: h.accountId,
+    kind: 'split',
+    categoryId: sourceId,
+    sourceCategoryId: null,
+    runId: 'run-split',
+    label: 'Split',
+    description: '',
+    canonicalKey: key,
+    suppressionKey: `split:${key}`,
+    embeddingModelId: MODEL,
+    confidence: 0.9,
+    evidence: [],
+  });
+}
+
+function addChild(
+  h: Harness,
+  proposalId: string,
+  label: string,
+  key: string,
+  memberIds: string[],
+  centroid: Float32Array = axis(0),
+) {
+  return h.proposals.createChild({
+    proposalId,
+    label,
+    description: '',
+    canonicalKey: key,
+    embeddingModelId: MODEL,
+    centroid,
+    memberIds,
+    proposedCount: memberIds.length,
+    cohesion: 0,
+    separation: 0,
+    confidence: 0,
   });
 }
 
@@ -689,44 +765,209 @@ describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
     expect(h.categories.findById(target.id)!.status).toBe('active');
   });
 
-  it('split apply is blocked and leaves the source and proposal untouched', () => {
+  it('split creates child categories, seeds their centroids, and moves eligible auto members', () => {
     const h = harness();
     const source = activeCategory(h, 'Big', 'big');
-    const p = h.proposals.createStructural({
-      accountId: h.accountId,
-      kind: 'split',
-      categoryId: source.id,
-      sourceCategoryId: null,
-      runId: 'run-split',
-      label: 'Split',
-      description: '',
-      canonicalKey: 'big',
-      suppressionKey: 'split:big',
-      embeddingModelId: MODEL,
-      confidence: 0.9,
-      evidence: [],
-    });
-    for (const child of ['Child A', 'Child B']) {
-      h.proposals.createChild({
-        proposalId: p.id,
-        label: child,
-        description: '',
-        canonicalKey: child.toLowerCase().replace(' ', '_'),
-        embeddingModelId: MODEL,
-        centroid: axis(0),
-        memberIds: [],
-        proposedCount: 0,
-        cohesion: 0,
-        separation: 0,
-        confidence: 0,
-      });
-    }
+    // Two auto members on the source, one destined for each child.
+    seedAutoOnSource(h, 'a-1', source.id, 'gate', 0.7);
+    seedAutoOnSource(h, 'b-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['b-1'], axis(5));
 
-    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/split apply is not supported/i);
-    // Zero writes: the source stays active, no child category was created, the proposal stays pending.
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.kind).toBe('split');
+    expect(result.assigned).toBe(2);
+    const childA = h.categories.findByLabel(h.accountId, 'Child A')!;
+    const childB = h.categories.findByLabel(h.accountId, 'Child B')!;
+    expect(childA.status).toBe('active');
+    expect(childB.status).toBe('active');
+    // The auto members moved to their child, preserving provenance and method.
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: childA.id, assigned_by: 'auto', method: 'gate' },
+    ]);
+    expect(assignmentsFor(h.db, h.accountId, 'b-1')).toEqual([
+      { category_id: childB.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    // Each child centroid was seeded from the child proposal data.
+    expect(h.categories.getCentroid(childA.id, MODEL)!.vector[4]).toBeGreaterThan(0.9);
+    expect(h.categories.getCentroid(childB.id, MODEL)!.vector[5]).toBeGreaterThan(0.9);
+    // The source is empty after the moves, so it is retired.
+    expect(h.categories.findById(source.id)!.status).toBe('retired');
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+  });
+
+  it('split leaves user assignments on the source and keeps the source active', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    // A user member and an auto member; both are listed by a child.
+    seedEmailWithEmbedding(h, 'u-1', 2);
+    assignUser(h, 'u-1', source.id);
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1', 'u-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['b-unknown'], axis(5));
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.assigned).toBe(1); // only the auto member moved
+    const childA = h.categories.findByLabel(h.accountId, 'Child A')!;
+    // The user member is untouched: still on the source, still user.
+    expect(assignmentsFor(h.db, h.accountId, 'u-1')).toEqual([
+      { category_id: source.id, assigned_by: 'user', method: null },
+    ]);
+    // The auto member moved to its child.
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: childA.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    // A user assignment remains, so the source stays active.
     expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+  });
+
+  it('split does not move a member listed by more than one child', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    seedAutoOnSource(h, 'dup', source.id, 'embed', 0.6); // listed by both children
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6); // listed by one child
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['dup', 'a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['dup'], axis(5));
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.assigned).toBe(1); // only a-1 moved; dup is ambiguous
+    const childA = h.categories.findByLabel(h.accountId, 'Child A')!;
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: childA.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    // The ambiguous member stays on the source, so the source stays active.
+    expect(assignmentsFor(h.db, h.accountId, 'dup')).toEqual([
+      { category_id: source.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+  });
+
+  it('split preserves a moved auto member confidence, method, and assigned_at exactly', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    seedEmailWithEmbedding(h, 'a-1', 2);
+    h.categories.addAutoAssignments(h.accountId, [
+      {
+        messageId: 'a-1',
+        accountId: h.accountId,
+        categoryId: source.id,
+        confidence: 0.73,
+        assignedBy: 'auto',
+        assignedAt: 111222333,
+        method: 'gate',
+      },
+    ]);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', [], axis(5));
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    const childA = h.categories.findByLabel(h.accountId, 'Child A')!;
+    const row = fullAssignmentFor(h.db, h.accountId, 'a-1');
+    expect(row).toEqual({
+      category_id: childA.id,
+      assigned_by: 'auto',
+      method: 'gate',
+      confidence: 0.73,
+      assigned_at: 111222333,
+    });
+  });
+
+  it('split blocks on a label-only collision with an existing category and writes nothing', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    // An existing category shares only the LABEL a child would take (its key differs).
+    activeCategory(h, 'Taken Label', 'taken_label_key');
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Taken Label', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', [], axis(5));
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/collides/i);
+    // Zero writes: no child created, the source keeps its member and stays active, proposal pending.
+    expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(h.categories.findByCanonicalKey(h.accountId, 'child_a')).toBeNull();
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: source.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
+
+  it('split blocks on a key-only collision with an existing category and writes nothing', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    // An existing category shares only the canonical KEY a child would take (its label differs).
+    activeCategory(h, 'Other Label', 'dup_key');
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'dup_key', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', [], axis(5));
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/collides/i);
     expect(h.categories.findByLabel(h.accountId, 'Child A')).toBeNull();
     expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
+
+  it('split blocks when two children share a canonical key and writes nothing', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    // Two siblings collide on the key (distinct labels), so no pre-existing category is involved.
+    addChild(h, p.id, 'Child A', 'dup_key', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'dup_key', [], axis(5));
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/collides/i);
+    expect(h.categories.findByLabel(h.accountId, 'Child A')).toBeNull();
+    expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
+
+  it('split blocks when two children share a label and writes nothing', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    // Two siblings collide on the label (distinct keys).
+    addChild(h, p.id, 'Same Label', 'key_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Same Label', 'key_b', [], axis(5));
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/collides/i);
+    expect(h.categories.findByCanonicalKey(h.accountId, 'key_a')).toBeNull();
+    expect(h.categories.findByCanonicalKey(h.accountId, 'key_b')).toBeNull();
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
+
+  it('rolls back the whole split and leaves the proposal pending when a centroid save fails', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    // Child B has a malformed (wrong-dimension) centroid, so saveCentroid throws mid-transaction.
+    addChild(h, p.id, 'Child B', 'child_b', [], new Float32Array(1));
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow();
+    // Everything rolled back: neither child exists, the member is still on the source, and the
+    // source and proposal are untouched.
+    expect(h.categories.findByLabel(h.accountId, 'Child A')).toBeNull();
+    expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: source.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    expect(h.categories.findById(source.id)!.status).toBe('active');
     expect(h.proposals.findById(p.id)!.status).toBe('pending');
   });
 });
@@ -746,6 +987,30 @@ describe('DiscoveryProposalOrchestrator.dismiss (structural kinds)', () => {
     expect(h.categories.findById(source.id)!.status).toBe('active');
     expect(h.categories.findById(target.id)!.status).toBe('active');
     // The suppression key survives so a re-run does not re-propose the same merge.
+    expect(h.proposals.resolvedStructuralSuppressionKeys(h.accountId).has(p.suppressionKey)).toBe(
+      true,
+    );
+  });
+
+  it('dismissing a split proposal only records the dismissal and touches no category or assignment', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', [], axis(5));
+
+    const res = h.orchestrator.dismiss(h.accountId, p.id);
+
+    expect(res.dismissed).toBe(true);
+    expect(h.proposals.findById(p.id)!.status).toBe('dismissed');
+    // No child was created, the source stays active, and its member is untouched.
+    expect(h.categories.findByLabel(h.accountId, 'Child A')).toBeNull();
+    expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: source.id, assigned_by: 'auto', method: 'embed' },
+    ]);
     expect(h.proposals.resolvedStructuralSuppressionKeys(h.accountId).has(p.suppressionKey)).toBe(
       true,
     );

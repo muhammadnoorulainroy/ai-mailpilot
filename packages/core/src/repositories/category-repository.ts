@@ -678,6 +678,41 @@ export class CategoryRepository {
   }
 
   /**
+   * Move one email's AUTO assignment from sourceCategoryId to targetCategoryId, preserving its
+   * confidence, method, and assigned_at. Only the auto (message, account, source) row is touched, so
+   * a user assignment is never moved and the email keeps its memberships in every other category.
+   * Returns true when a row moved (false when the email had no auto assignment on the source, or a
+   * target row already existed). Used by split apply to relocate a source member into its child.
+   */
+  moveAutoAssignment(
+    messageId: string,
+    accountId: string,
+    sourceCategoryId: string,
+    targetCategoryId: string,
+  ): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const inserted = this.db
+        .prepare(
+          `INSERT INTO email_categories (message_id, account_id, category_id, confidence, assigned_by, assigned_at, method)
+             SELECT message_id, account_id, ?, confidence, assigned_by, assigned_at, method
+               FROM email_categories
+              WHERE message_id = ? AND account_id = ? AND category_id = ? AND assigned_by = 'auto'
+           ON CONFLICT (message_id, account_id, category_id) DO NOTHING`,
+        )
+        .run(targetCategoryId, messageId, accountId, sourceCategoryId).changes;
+      if (inserted === 0) return false;
+      this.db
+        .prepare(
+          `DELETE FROM email_categories
+            WHERE message_id = ? AND account_id = ? AND category_id = ? AND assigned_by = 'auto'`,
+        )
+        .run(messageId, accountId, sourceCategoryId);
+      return true;
+    });
+    return tx();
+  }
+
+  /**
    * Emails assigned to a category, newest first. Joins on the emails table so the UI can
    * render subject, from, and date without extra round-trips.
    */
