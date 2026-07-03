@@ -546,4 +546,67 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 19,
+    name: 'category_proposals',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE category_proposals (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          category_id TEXT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL,
+          cluster_index INTEGER NOT NULL,
+          label TEXT NOT NULL,
+          description TEXT NOT NULL,
+          canonical_key TEXT NOT NULL,
+          suggested_key TEXT NOT NULL DEFAULT '',
+          embedding_model_id TEXT NOT NULL,
+          centroid BLOB NOT NULL,
+          member_ids TEXT NOT NULL,
+          proposed_count INTEGER NOT NULL,
+          cohesion REAL NOT NULL,
+          separation REAL NOT NULL,
+          confidence REAL NOT NULL,
+          evidence TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'applied', 'dismissed')),
+          created_at INTEGER NOT NULL,
+          applied_at INTEGER,
+          dismissed_at INTEGER
+        );
+        CREATE INDEX idx_category_proposals_account_status
+          ON category_proposals(account_id, status, created_at DESC);
+        CREATE INDEX idx_category_proposals_category ON category_proposals(category_id);
+      `);
+
+      // Rebuild discovery_audit to widen the flow CHECK to the new discovery_proposal run. SQLite
+      // cannot alter a CHECK in place, so copy the append-only table through a new definition.
+      db.exec(`
+        CREATE TABLE discovery_audit_new (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          ran_at INTEGER NOT NULL,
+          flow TEXT NOT NULL
+            CHECK (flow IN ('topic_discovery', 'improve_categories', 'discovery_proposal')),
+          account_kind TEXT NOT NULL,
+          provider TEXT NOT NULL CHECK (provider IN ('local', 'cloud')),
+          status TEXT NOT NULL
+            CHECK (status IN ('ok', 'blocked', 'failed', 'insufficient', 'skipped')),
+          model_id TEXT,
+          pool_size INTEGER NOT NULL DEFAULT 0,
+          sample_size INTEGER NOT NULL DEFAULT 0,
+          emails_exposed INTEGER NOT NULL DEFAULT 0,
+          fields_read TEXT NOT NULL DEFAULT '[]',
+          redacted INTEGER NOT NULL DEFAULT 0,
+          omitted_categories TEXT NOT NULL DEFAULT '[]',
+          error TEXT
+        );
+        INSERT INTO discovery_audit_new SELECT * FROM discovery_audit;
+        DROP TABLE discovery_audit;
+        ALTER TABLE discovery_audit_new RENAME TO discovery_audit;
+        CREATE INDEX idx_discovery_audit_account ON discovery_audit(account_id, ran_at);
+      `);
+    },
+  },
 ];

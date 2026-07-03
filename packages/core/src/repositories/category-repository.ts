@@ -25,7 +25,16 @@ const RECONCILE_KEEP_MIN_ASSIGNMENTS = 3;
  * How an auto assignment was produced. 'embed' is the nearest-centroid pass, 'llm' is an LLM
  * judgement, 'gate' is a confident embedding match with no LLM call. Null for user corrections.
  */
-export type AssignmentMethod = 'embed' | 'llm' | 'gate';
+export type AssignmentMethod = 'embed' | 'llm' | 'gate' | 'proposal';
+
+/**
+ * The base canonical key for a label, before per-account collision suffixing. Deterministic and
+ * frozen: callers that need to check whether a purpose already exists (discovery dedup) derive the
+ * same base and look it up with findByCanonicalKey.
+ */
+export function canonicalKeyBase(label: string): string {
+  return normalizeForMatch(label).replace(/\s+/g, '_').slice(0, 60) || 'category';
+}
 
 /** A category as stored, with timestamps. */
 export interface CategoryRow {
@@ -362,7 +371,7 @@ export class CategoryRepository {
         (r) => r.canonical_key,
       ),
     );
-    const base = normalizeForMatch(label).replace(/\s+/g, '_').slice(0, 60) || 'category';
+    const base = canonicalKeyBase(label);
     if (!taken.has(base)) return base;
     for (let i = 2; ; i++) {
       const candidate = `${base}_${i}`;

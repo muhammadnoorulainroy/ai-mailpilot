@@ -6,7 +6,7 @@ import type { Database, Statement } from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 
 /** Which flow produced the run. */
-export type DiscoveryFlow = 'topic_discovery' | 'improve_categories';
+export type DiscoveryFlow = 'topic_discovery' | 'improve_categories' | 'discovery_proposal';
 
 /** Outcome of a discovery run. */
 export type DiscoveryStatus = 'ok' | 'blocked' | 'failed' | 'insufficient' | 'skipped';
