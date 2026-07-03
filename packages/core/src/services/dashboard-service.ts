@@ -97,8 +97,9 @@ export class DashboardService {
 
     const recentSummaries = this.emails.listSummaries({ accountId, limit: opts.recentLimit });
 
-    const categoriesAll = this.categories.listForAccount(accountId);
-    const topCategories = [...categoriesAll]
+    // Active only: suggested and retired categories never appear on the dashboard.
+    const activeCategories = this.categories.listActive(accountId);
+    const topCategories = [...activeCategories]
       .sort((a, b) => b.emailCount - a.emailCount)
       .slice(0, opts.topCategoriesLimit)
       .map((c) => ({
@@ -125,7 +126,7 @@ export class DashboardService {
         date: e.date,
         hasAttachments: e.hasAttachments,
       })),
-      categoryCount: categoriesAll.length,
+      categoryCount: activeCategories.length,
       categories: topCategories,
     };
   }

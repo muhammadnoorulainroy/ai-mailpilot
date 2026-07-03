@@ -500,7 +500,11 @@ export class TopicDiscoveryService {
     embeddingModelId: string,
     kept: Array<{ topic: DiscoveredTopic; vec: Float32Array }>,
   ): Promise<void> {
-    const existing = this.categories.listForAccount(accountId).filter((c) => c.source === 'auto');
+    // Active auto categories only: never merge into or rename a suggested proposal or a retired
+    // category, so discovery proposals awaiting review are left untouched.
+    const existing = this.categories
+      .listForAccount(accountId)
+      .filter((c) => c.source === 'auto' && c.status === 'active');
     if (existing.length === 0) return;
 
     const embedded: Array<{ id: string; label: string; vec: Float32Array; emailCount: number }> =
