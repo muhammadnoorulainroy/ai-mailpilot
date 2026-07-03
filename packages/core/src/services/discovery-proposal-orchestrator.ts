@@ -20,7 +20,11 @@ import type { CategoryRepository } from '../repositories/category-repository.js'
 import type { AccountRepository } from '../repositories/account-repository.js';
 import type { EmailRepository } from '../repositories/email-repository.js';
 import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
-import type { CategoryProposalRepository } from '../repositories/category-proposal-repository.js';
+import type {
+  CategoryProposal,
+  CategoryProposalRepository,
+  ProposalKind,
+} from '../repositories/category-proposal-repository.js';
 import type {
   AcceptedProposal,
   DiscoveryProposalService,
@@ -64,11 +68,26 @@ export interface ProposalView {
   createdAt: number;
 }
 
-/** Result of applying a proposal. */
+/** Result of applying a proposal. `assigned` is the members assigned (new_category) or reassigned (merge), 0 for retire. */
 export interface ApplyResult {
+  kind: ProposalKind;
   categoryId: string;
   label: string;
   assigned: number;
+}
+
+/**
+ * A precondition or block failure during apply, carrying the HTTP status the route should return.
+ * A block is a client-actionable conflict (409) or a missing referent (404), never a 500.
+ */
+export class ProposalApplyError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+  ) {
+    super(message);
+    this.name = 'ProposalApplyError';
+  }
 }
 
 function clamp01(x: number): number {
@@ -267,9 +286,10 @@ export class DiscoveryProposalOrchestrator {
   }
 
   /**
-   * Approve a proposal: promote its suggested category to active, seed the centroid from the accepted
-   * cluster, and assign the members that are still uncategorized. User-assigned mail and members that
-   * already carry any assignment are left untouched, so no existing label is removed.
+   * Approve a pending proposal, branching on its kind. `new_category` promotes and assigns (2c);
+   * `retire` and `merge` apply the structural change (3.3); `split` is blocked until its safe write
+   * semantics ship. Every kind marks the proposal applied only after its change commits, and every
+   * block check throws before any write so a blocked apply leaves the proposal pending and retry-safe.
    */
   apply(accountId: string, proposalId: string): ApplyResult {
     const proposal = this.proposals.findById(proposalId);
@@ -279,6 +299,33 @@ export class DiscoveryProposalOrchestrator {
     if (proposal.status !== 'pending') {
       throw new Error(`proposal is ${proposal.status}, not pending`);
     }
+    switch (proposal.kind) {
+      case 'new_category':
+        return this.applyNewCategory(accountId, proposal);
+      case 'retire':
+        return this.applyRetire(accountId, proposal);
+      case 'merge':
+        return this.applyMerge(accountId, proposal);
+      case 'split':
+        // Split needs a targeted per-member move primitive that does not exist yet; applying it now
+        // would either do nothing or partially move mail. Block with zero writes until it ships.
+        throw new ProposalApplyError(
+          'split apply is not supported yet; split write semantics ship in a later change',
+          409,
+        );
+      default: {
+        const exhaustive: never = proposal.kind;
+        throw new Error(`unsupported proposal kind: ${String(exhaustive)}`);
+      }
+    }
+  }
+
+  /**
+   * new_category (2c): promote the suggested category to active, seed the centroid from the accepted
+   * cluster, and assign the members that are still uncategorized. User-assigned mail and members that
+   * already carry any assignment are left untouched, so no existing label is removed.
+   */
+  private applyNewCategory(accountId: string, proposal: CategoryProposal): ApplyResult {
     const category = this.categories.findById(proposal.categoryId);
     if (!category) {
       throw new Error('proposal category no longer exists');
@@ -317,21 +364,110 @@ export class DiscoveryProposalOrchestrator {
           })),
         );
       }
-      this.proposals.markApplied(proposalId);
+      this.proposals.markApplied(proposal.id);
     });
     run();
 
     this.logger.info(
-      { accountId, proposalId, categoryId: proposal.categoryId, assigned: toAssign.length },
+      {
+        accountId,
+        proposalId: proposal.id,
+        categoryId: proposal.categoryId,
+        assigned: toAssign.length,
+      },
       'discovery proposal: applied',
     );
-    return { categoryId: proposal.categoryId, label: proposal.label, assigned: toAssign.length };
+    return {
+      kind: 'new_category',
+      categoryId: proposal.categoryId,
+      label: proposal.label,
+      assigned: toAssign.length,
+    };
   }
 
   /**
-   * Dismiss a proposal (soft): retire its suggested category and mark the proposal dismissed. The
-   * proposal row and the retired category keep the canonical key, so a re-run suppresses the same
-   * purpose. No active category, assignment, or user correction is touched.
+   * retire (3.3): hide the target category, keeping its rows and history. Blocks (zero writes) when
+   * the target is missing or not active, or when it has any user-confirmed member. This commit has no
+   * confirmation path, so a category the user has filed mail into is never silently retired; the user
+   * must resolve those assignments first.
+   */
+  private applyRetire(accountId: string, proposal: CategoryProposal): ApplyResult {
+    const category = this.categories.findById(proposal.categoryId);
+    if (!category || category.accountId !== accountId) {
+      throw new ProposalApplyError('retire target category not found', 404);
+    }
+    if (category.status !== 'active') {
+      throw new ProposalApplyError(`retire target is ${category.status}, not active`, 409);
+    }
+    const userMembers = this.categories.listCategoryMemberIds(accountId, category.id, 'user');
+    if (userMembers.length > 0) {
+      throw new ProposalApplyError(
+        `cannot retire "${category.label}": it has ${userMembers.length} user-confirmed assignment(s); confirmation is required`,
+        409,
+      );
+    }
+
+    const run = this.db.transaction(() => {
+      this.categories.retire(category.id);
+      this.proposals.markApplied(proposal.id);
+    });
+    run();
+
+    this.logger.info(
+      { accountId, proposalId: proposal.id, categoryId: category.id },
+      'discovery proposal: retired category',
+    );
+    return { kind: 'retire', categoryId: category.id, label: category.label, assigned: 0 };
+  }
+
+  /**
+   * merge (3.3): absorb the source category into the target with the hardened, user-dominant
+   * mergeInto (rows move preserving provenance, then the source is deleted). Blocks (zero writes) when
+   * either category is missing or not active, when the proposal carries no source, or when source and
+   * target are the same. Marks applied only after the merge commits.
+   */
+  private applyMerge(accountId: string, proposal: CategoryProposal): ApplyResult {
+    const target = this.categories.findById(proposal.categoryId);
+    if (!target || target.accountId !== accountId) {
+      throw new ProposalApplyError('merge target category not found', 404);
+    }
+    if (proposal.sourceCategoryId === null) {
+      throw new ProposalApplyError('merge proposal has no source category', 409);
+    }
+    const source = this.categories.findById(proposal.sourceCategoryId);
+    if (!source || source.accountId !== accountId) {
+      throw new ProposalApplyError('merge source category not found', 404);
+    }
+    if (source.id === target.id) {
+      throw new ProposalApplyError('merge source and target must differ', 409);
+    }
+    if (target.status !== 'active') {
+      throw new ProposalApplyError(`merge target is ${target.status}, not active`, 409);
+    }
+    if (source.status !== 'active') {
+      throw new ProposalApplyError(`merge source is ${source.status}, not active`, 409);
+    }
+
+    let reassigned = 0;
+    const run = this.db.transaction(() => {
+      reassigned = this.categories.mergeInto(source.id, target.id).reassigned;
+      this.proposals.markApplied(proposal.id);
+    });
+    run();
+
+    this.logger.info(
+      { accountId, proposalId: proposal.id, sourceId: source.id, targetId: target.id, reassigned },
+      'discovery proposal: merged categories',
+    );
+    return { kind: 'merge', categoryId: target.id, label: target.label, assigned: reassigned };
+  }
+
+  /**
+   * Dismiss a pending proposal (soft), branching on kind. For `new_category` the linked SUGGESTED
+   * category is retired (it exists only for this proposal). For a structural proposal (split / merge /
+   * retire) the target is a LIVE active category the user still uses, so dismiss touches no category or
+   * assignment at all; it only records the dismissal. Every kind keeps the proposal row and its
+   * suppression key so a re-run does not re-propose the same purpose.
    */
   dismiss(accountId: string, proposalId: string): { dismissed: true; categoryId: string } {
     const proposal = this.proposals.findById(proposalId);
@@ -341,18 +477,20 @@ export class DiscoveryProposalOrchestrator {
     if (proposal.status !== 'pending') {
       throw new Error(`proposal is ${proposal.status}, not pending`);
     }
-    const category = this.categories.findById(proposal.categoryId);
 
     const run = this.db.transaction(() => {
-      if (category && category.status === 'suggested') {
-        this.categories.retire(proposal.categoryId);
+      if (proposal.kind === 'new_category') {
+        const category = this.categories.findById(proposal.categoryId);
+        if (category && category.status === 'suggested') {
+          this.categories.retire(proposal.categoryId);
+        }
       }
       this.proposals.markDismissed(proposalId);
     });
     run();
 
     this.logger.info(
-      { accountId, proposalId, categoryId: proposal.categoryId },
+      { accountId, proposalId, kind: proposal.kind, categoryId: proposal.categoryId },
       'discovery proposal: dismissed',
     );
     return { dismissed: true, categoryId: proposal.categoryId };

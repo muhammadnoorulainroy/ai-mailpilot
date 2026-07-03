@@ -272,6 +272,7 @@ describe('DiscoveryProposalOrchestrator.apply', () => {
     ]);
 
     const result = h.orchestrator.apply(h.accountId, target.id);
+    expect(result.kind).toBe('new_category');
 
     // The category is now active with a centroid; the proposal is applied.
     const active = h.categories.listActive(h.accountId).find((c) => c.id === target.categoryId);
@@ -352,5 +353,282 @@ describe('DiscoveryProposalOrchestrator.dismiss', () => {
     const rerun = await h.orchestrator.generate(h.accountId, MODEL, 'qwen');
     expect(rerun.created.map((c) => c.label)).not.toContain(target.label);
     expect(rerun.skippedDuplicates).toBeGreaterThanOrEqual(1);
+  });
+});
+
+type Harness = ReturnType<typeof harness>;
+
+function activeCategory(h: Harness, label: string, key: string) {
+  return h.categories.create({
+    accountId: h.accountId,
+    label,
+    source: 'auto',
+    status: 'active',
+    canonicalKey: key,
+  });
+}
+
+function seedEmail(h: Harness, messageId: string) {
+  h.emails.upsertBatch([
+    {
+      messageId,
+      accountId: h.accountId,
+      folder: 'INBOX',
+      subject: `s ${messageId}`,
+      fromAddr: 'a@b.com',
+    },
+  ]);
+}
+
+function retireProposal(h: Harness, categoryId: string, key: string) {
+  return h.proposals.createStructural({
+    accountId: h.accountId,
+    kind: 'retire',
+    categoryId,
+    sourceCategoryId: null,
+    runId: 'run-retire',
+    label: 'Retire',
+    description: '',
+    canonicalKey: key,
+    suppressionKey: `retire:${key}`,
+    embeddingModelId: MODEL,
+    confidence: 0.9,
+    evidence: [],
+  });
+}
+
+function mergeProposal(
+  h: Harness,
+  sourceId: string,
+  targetId: string,
+  sourceKey: string,
+  targetKey: string,
+) {
+  return h.proposals.createStructural({
+    accountId: h.accountId,
+    kind: 'merge',
+    categoryId: targetId,
+    sourceCategoryId: sourceId,
+    runId: 'run-merge',
+    label: 'Merge',
+    description: '',
+    canonicalKey: targetKey,
+    suppressionKey: `merge:${[sourceKey, targetKey].sort().join('|')}`,
+    embeddingModelId: MODEL,
+    confidence: 0.9,
+    evidence: [],
+  });
+}
+
+describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
+  it('retire hides a target with only auto members, keeps its rows, and marks applied', () => {
+    const h = harness();
+    const cat = activeCategory(h, 'Noise', 'noise');
+    seedEmail(h, 'n-1');
+    h.categories.addAutoAssignments(h.accountId, [
+      {
+        messageId: 'n-1',
+        accountId: h.accountId,
+        categoryId: cat.id,
+        confidence: 0.3,
+        assignedBy: 'auto',
+        assignedAt: Date.now(),
+        method: 'embed',
+      },
+    ]);
+    const p = retireProposal(h, cat.id, 'noise');
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.kind).toBe('retire');
+    expect(result.assigned).toBe(0);
+    expect(h.categories.findById(cat.id)!.status).toBe('retired');
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+    // The auto assignment row is kept (retire preserves history, hides only the label).
+    expect(assignmentsFor(h.db, h.accountId, 'n-1')).toEqual([
+      { category_id: cat.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+  });
+
+  it('retire blocks when the target has user-confirmed members and writes nothing', () => {
+    const h = harness();
+    const cat = activeCategory(h, 'Kept', 'kept');
+    seedEmail(h, 'k-1');
+    h.categories.replaceEmailAssignments('k-1', h.accountId, [
+      {
+        messageId: 'k-1',
+        accountId: h.accountId,
+        categoryId: cat.id,
+        confidence: 1,
+        assignedBy: 'user',
+        assignedAt: Date.now(),
+        method: null,
+      },
+    ]);
+    const p = retireProposal(h, cat.id, 'kept');
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/user-confirmed/i);
+    // Nothing changed: the category stays active and the proposal stays pending.
+    expect(h.categories.findById(cat.id)!.status).toBe('active');
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+    expect(assignmentsFor(h.db, h.accountId, 'k-1')).toEqual([
+      { category_id: cat.id, assigned_by: 'user', method: null },
+    ]);
+  });
+
+  it('retire blocks when the target is not active', () => {
+    const h = harness();
+    const cat = h.categories.create({
+      accountId: h.accountId,
+      label: 'Already',
+      source: 'auto',
+      status: 'retired',
+      canonicalKey: 'already',
+    });
+    const p = retireProposal(h, cat.id, 'already');
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/not active/i);
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
+
+  it('merge moves source rows to the target, keeps user provenance over an equal-confidence auto row, and applies', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    const now = Date.now();
+    seedEmail(h, 'm-1');
+    seedEmail(h, 'm-2');
+    // m-1: a user row on the source and an equal-confidence auto (gate) row already on the target.
+    h.categories.replaceEmailAssignments('m-1', h.accountId, [
+      {
+        messageId: 'm-1',
+        accountId: h.accountId,
+        categoryId: source.id,
+        confidence: 1,
+        assignedBy: 'user',
+        assignedAt: now,
+        method: null,
+      },
+      {
+        messageId: 'm-1',
+        accountId: h.accountId,
+        categoryId: target.id,
+        confidence: 1,
+        assignedBy: 'auto',
+        assignedAt: now,
+        method: 'gate',
+      },
+    ]);
+    // m-2: an auto row on the source only.
+    h.categories.addAutoAssignments(h.accountId, [
+      {
+        messageId: 'm-2',
+        accountId: h.accountId,
+        categoryId: source.id,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: now,
+        method: 'embed',
+      },
+    ]);
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.kind).toBe('merge');
+    expect(h.categories.findById(source.id)).toBeNull(); // source absorbed and deleted
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+    // m-1 on the target stays user (provenance dominates the equal-confidence auto row).
+    expect(assignmentsFor(h.db, h.accountId, 'm-1')).toEqual([
+      { category_id: target.id, assigned_by: 'user', method: null },
+    ]);
+    // m-2 moved to the target keeping its auto provenance and method.
+    expect(assignmentsFor(h.db, h.accountId, 'm-2')).toEqual([
+      { category_id: target.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+  });
+
+  it('merge blocks when the source category is missing and writes nothing', () => {
+    const h = harness();
+    const target = activeCategory(h, 'Dst', 'dst');
+    const p = h.proposals.createStructural({
+      accountId: h.accountId,
+      kind: 'merge',
+      categoryId: target.id,
+      sourceCategoryId: 'ghost-source',
+      runId: 'run-merge',
+      label: 'Merge',
+      description: '',
+      canonicalKey: 'dst',
+      suppressionKey: 'merge:dst|ghost',
+      embeddingModelId: MODEL,
+      confidence: 0.9,
+      evidence: [],
+    });
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/source category not found/i);
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+    expect(h.categories.findById(target.id)!.status).toBe('active');
+  });
+
+  it('split apply is blocked and leaves the source and proposal untouched', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    const p = h.proposals.createStructural({
+      accountId: h.accountId,
+      kind: 'split',
+      categoryId: source.id,
+      sourceCategoryId: null,
+      runId: 'run-split',
+      label: 'Split',
+      description: '',
+      canonicalKey: 'big',
+      suppressionKey: 'split:big',
+      embeddingModelId: MODEL,
+      confidence: 0.9,
+      evidence: [],
+    });
+    for (const child of ['Child A', 'Child B']) {
+      h.proposals.createChild({
+        proposalId: p.id,
+        label: child,
+        description: '',
+        canonicalKey: child.toLowerCase().replace(' ', '_'),
+        embeddingModelId: MODEL,
+        centroid: axis(0),
+        memberIds: [],
+        proposedCount: 0,
+        cohesion: 0,
+        separation: 0,
+        confidence: 0,
+      });
+    }
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/split apply is not supported/i);
+    // Zero writes: the source stays active, no child category was created, the proposal stays pending.
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.categories.findByLabel(h.accountId, 'Child A')).toBeNull();
+    expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
+});
+
+describe('DiscoveryProposalOrchestrator.dismiss (structural kinds)', () => {
+  it('records the dismissal, preserves the suppression key, and never touches the live categories', () => {
+    const h = harness();
+    const source = activeCategory(h, 'S', 's');
+    const target = activeCategory(h, 'T', 't');
+    const p = mergeProposal(h, source.id, target.id, 's', 't');
+
+    const res = h.orchestrator.dismiss(h.accountId, p.id);
+
+    expect(res.dismissed).toBe(true);
+    expect(h.proposals.findById(p.id)!.status).toBe('dismissed');
+    // Neither the merge source nor the target is retired or deleted by a dismiss.
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.categories.findById(target.id)!.status).toBe('active');
+    // The suppression key survives so a re-run does not re-propose the same merge.
+    expect(h.proposals.resolvedStructuralSuppressionKeys(h.accountId).has(p.suppressionKey)).toBe(
+      true,
+    );
   });
 });

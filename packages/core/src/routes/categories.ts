@@ -8,6 +8,7 @@ import type { AppContext } from '../context.js';
 import type { CategoryRow } from '../repositories/category-repository.js';
 import type { CategoryDto } from '@ai-mailpilot/shared';
 import { discoveryProvider } from '../services/discovery-guard.js';
+import { ProposalApplyError } from '../services/discovery-proposal-orchestrator.js';
 
 const DiscoverBody = z.object({
   accountId: z.string().min(1),
@@ -142,6 +143,11 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
     try {
       return ctx.services.discoveryProposal.apply(parsed.data.accountId, req.params.id);
     } catch (err) {
+      // A structural block/precondition failure carries its own status (409 conflict or 404 missing).
+      if (err instanceof ProposalApplyError) {
+        reply.code(err.httpStatus).send({ error: err.message });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       if (message.includes('not found')) {
         reply.code(404).send({ error: message });
