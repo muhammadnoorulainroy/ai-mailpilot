@@ -30,6 +30,10 @@ import type {
   DiscoveryProposalService,
   RejectedProposal,
 } from './discovery-proposal-service.js';
+import type {
+  CategoryCentroidRebuildService,
+  RebuildResult,
+} from './category-centroid-rebuild-service.js';
 
 /** A newly persisted proposal, returned from a generate run. */
 export interface GeneratedProposal {
@@ -104,6 +108,7 @@ export class DiscoveryProposalOrchestrator {
     private proposalService: DiscoveryProposalService,
     private accounts: AccountRepository,
     private audit: DiscoveryAuditRepository,
+    private centroidRebuild: CategoryCentroidRebuildService,
     private getConfig: () => LlmConfig,
     private logger: Logger,
   ) {}
@@ -422,9 +427,12 @@ export class DiscoveryProposalOrchestrator {
 
   /**
    * merge (3.3): absorb the source category into the target with the hardened, user-dominant
-   * mergeInto (rows move preserving provenance, then the source is deleted). Blocks (zero writes) when
-   * either category is missing or not active, when the proposal carries no source, or when source and
-   * target are the same. Marks applied only after the merge commits.
+   * mergeInto (rows move preserving provenance, then the source is deleted), then rebuild the target
+   * centroid from its now-merged members so future categorization learns from the combined category.
+   * Blocks (zero writes) when either category is missing or not active, when the proposal carries no
+   * source, or when source and target are the same. The move, the centroid rebuild, and markApplied
+   * run in ONE transaction, so if the rebuild throws the whole merge rolls back and the proposal stays
+   * pending; the proposal is marked applied only after all three succeed.
    */
   private applyMerge(accountId: string, proposal: CategoryProposal): ApplyResult {
     const target = this.categories.findById(proposal.categoryId);
@@ -448,15 +456,34 @@ export class DiscoveryProposalOrchestrator {
       throw new ProposalApplyError(`merge source is ${source.status}, not active`, 409);
     }
 
-    let reassigned = 0;
-    const run = this.db.transaction(() => {
-      reassigned = this.categories.mergeInto(source.id, target.id).reassigned;
+    const run = this.db.transaction((): { reassigned: number; rebuild: RebuildResult } => {
+      const reassigned = this.categories.mergeInto(source.id, target.id).reassigned;
+      // Rebuild the target centroid from its merged members with Phase 3.1 semantics: user-confirmed
+      // members dominate, and auto members are used only when the target has zero user members. When
+      // there is too little trusted data the rebuild leaves the existing target centroid untouched
+      // (a safe fallback, not a failure), so the merge still applies.
+      const rebuild = this.centroidRebuild.rebuild(
+        accountId,
+        target.id,
+        proposal.embeddingModelId,
+        {
+          allowAutoFallback: true,
+        },
+      );
       this.proposals.markApplied(proposal.id);
+      return { reassigned, rebuild };
     });
-    run();
+    const { reassigned, rebuild } = run();
 
     this.logger.info(
-      { accountId, proposalId: proposal.id, sourceId: source.id, targetId: target.id, reassigned },
+      {
+        accountId,
+        proposalId: proposal.id,
+        sourceId: source.id,
+        targetId: target.id,
+        reassigned,
+        centroidRebuild: rebuild.status,
+      },
       'discovery proposal: merged categories',
     );
     return { kind: 'merge', categoryId: target.id, label: target.label, assigned: reassigned };

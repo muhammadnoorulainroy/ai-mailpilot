@@ -20,6 +20,7 @@ import type { LlmConfig } from '../src/config/schema.js';
 import { ResidualDiscoveryService } from '../src/services/residual-discovery-service.js';
 import { DiscoveryProposalService } from '../src/services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from '../src/services/discovery-proposal-orchestrator.js';
+import { CategoryCentroidRebuildService } from '../src/services/category-centroid-rebuild-service.js';
 
 const MODEL = 'bge-m3';
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
@@ -49,7 +50,7 @@ const NAMING = JSON.stringify({
   ],
 });
 
-function harness(answer: string = NAMING) {
+function harness(answer: string = NAMING, centroidRebuildOverride?: CategoryCentroidRebuildService) {
   const db = openDatabase(':memory:');
   const accounts = new AccountRepository(db);
   const categories = new CategoryRepository(db);
@@ -109,6 +110,9 @@ function harness(answer: string = NAMING) {
     getConfig,
     silentLogger,
   );
+  const centroidRebuild =
+    centroidRebuildOverride ??
+    new CategoryCentroidRebuildService(categories, embeddings, silentLogger);
   const orchestrator = new DiscoveryProposalOrchestrator(
     db,
     proposals,
@@ -117,6 +121,7 @@ function harness(answer: string = NAMING) {
     proposalService,
     accounts,
     audit,
+    centroidRebuild,
     getConfig,
     silentLogger,
   );
@@ -128,6 +133,8 @@ function harness(answer: string = NAMING) {
     proposals,
     audit,
     emails,
+    embeddings,
+    centroidRebuild,
     orchestrator,
     accountId: acc.id,
     setAnswer: (a: string) => {
@@ -380,6 +387,25 @@ function seedEmail(h: Harness, messageId: string) {
   ]);
 }
 
+function seedEmailWithEmbedding(h: Harness, messageId: string, dim: number) {
+  seedEmail(h, messageId);
+  h.embeddings.saveEmbedding({ messageId, accountId: h.accountId, modelId: MODEL }, axis(dim));
+}
+
+function assignUser(h: Harness, messageId: string, categoryId: string) {
+  h.categories.replaceEmailAssignments(messageId, h.accountId, [
+    {
+      messageId,
+      accountId: h.accountId,
+      categoryId,
+      confidence: 1,
+      assignedBy: 'user',
+      assignedAt: Date.now(),
+      method: null,
+    },
+  ]);
+}
+
 function retireProposal(h: Harness, categoryId: string, key: string) {
   return h.proposals.createStructural({
     accountId: h.accountId,
@@ -544,6 +570,99 @@ describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
     // m-2 moved to the target keeping its auto provenance and method.
     expect(assignmentsFor(h.db, h.accountId, 'm-2')).toEqual([
       { category_id: target.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+  });
+
+  it('merge rebuilds the target centroid from the merged members', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    // Seed the target with a centroid on a different axis so a real rebuild is observable.
+    h.categories.saveCentroid(target.id, MODEL, axis(0), 1);
+    // Three user-confirmed source members whose embeddings sit on axis 3.
+    for (const id of ['g-1', 'g-2', 'g-3']) {
+      seedEmailWithEmbedding(h, id, 3);
+      assignUser(h, id, source.id);
+    }
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.kind).toBe('merge');
+    expect(h.categories.findById(source.id)).toBeNull();
+    // The three user members now belong to the target.
+    expect(h.categories.listCategoryMemberIds(h.accountId, target.id, 'user').sort()).toEqual([
+      'g-1',
+      'g-2',
+      'g-3',
+    ]);
+    // The centroid was rebuilt from those members: it points along axis 3 now, not the old axis 0.
+    const centroid = h.categories.getCentroid(target.id, MODEL)!;
+    expect(centroid.vector[3]).toBeGreaterThan(0.9);
+    expect(centroid.vector[0]).toBeLessThan(0.1);
+    expect(centroid.emailCount).toBe(3);
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+  });
+
+  it('merge with no usable member embeddings does not crash and keeps the existing target centroid', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    // Existing target centroid on axis 0; the merged members have NO embeddings, so a rebuild has no
+    // usable vectors and must fall back to leaving this centroid untouched.
+    h.categories.saveCentroid(target.id, MODEL, axis(0), 1);
+    for (const id of ['h-1', 'h-2', 'h-3']) {
+      seedEmail(h, id); // no embedding saved
+      assignUser(h, id, source.id);
+    }
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    expect(result.kind).toBe('merge');
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+    // Insufficient trusted data: the target keeps its existing centroid unchanged (safe fallback).
+    const centroid = h.categories.getCentroid(target.id, MODEL)!;
+    expect(centroid.vector[0]).toBeGreaterThan(0.9);
+    expect(centroid.emailCount).toBe(1);
+    // Members still moved to the target.
+    expect(h.categories.listCategoryMemberIds(h.accountId, target.id, 'user').sort()).toEqual([
+      'h-1',
+      'h-2',
+      'h-3',
+    ]);
+  });
+
+  it('rolls back the whole merge and leaves the proposal pending when the centroid rebuild throws', () => {
+    const throwing = {
+      rebuild() {
+        throw new Error('rebuild boom');
+      },
+    } as unknown as CategoryCentroidRebuildService;
+    const h = harness(NAMING, throwing);
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    seedEmail(h, 'r-1');
+    h.categories.addAutoAssignments(h.accountId, [
+      {
+        messageId: 'r-1',
+        accountId: h.accountId,
+        categoryId: source.id,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: Date.now(),
+        method: 'embed',
+      },
+    ]);
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/rebuild boom/);
+    // The whole merge rolled back: the source still exists, its assignment is intact, and the
+    // proposal is still pending (never marked applied).
+    expect(h.categories.findById(source.id)).not.toBeNull();
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+    expect(assignmentsFor(h.db, h.accountId, 'r-1')).toEqual([
+      { category_id: source.id, assigned_by: 'auto', method: 'embed' },
     ]);
   });
 

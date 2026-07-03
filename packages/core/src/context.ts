@@ -133,6 +133,11 @@ export function buildContext(): AppContext {
     () => config.llm,
     logger,
   );
+  const categoryCentroidRebuild = new CategoryCentroidRebuildService(
+    repos.categories,
+    repos.embeddings,
+    logger,
+  );
 
   const services: Services = {
     embedding: new EmbeddingOrchestrator(
@@ -172,14 +177,11 @@ export function buildContext(): AppContext {
       discoveryProposalService,
       repos.accounts,
       repos.discoveryAudit,
+      categoryCentroidRebuild,
       () => config.llm,
       logger,
     ),
-    categoryCentroidRebuild: new CategoryCentroidRebuildService(
-      repos.categories,
-      repos.embeddings,
-      logger,
-    ),
+    categoryCentroidRebuild,
     categoryHealth: new CategoryHealthService(repos.categories, repos.embeddings),
     category: new CategoryOrchestrator(
       categorizationService,

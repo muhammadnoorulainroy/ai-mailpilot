@@ -20,6 +20,7 @@ import type { AppContext } from '../src/context.js';
 import { ResidualDiscoveryService } from '../src/services/residual-discovery-service.js';
 import { DiscoveryProposalService } from '../src/services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from '../src/services/discovery-proposal-orchestrator.js';
+import { CategoryCentroidRebuildService } from '../src/services/category-centroid-rebuild-service.js';
 import { registerCategoryRoutes } from '../src/routes/categories.js';
 
 const MODEL = 'bge-m3';
@@ -108,6 +109,7 @@ async function buildApp() {
     getConfig,
     silentLogger,
   );
+  const centroidRebuild = new CategoryCentroidRebuildService(categories, embeddings, silentLogger);
   const orchestrator = new DiscoveryProposalOrchestrator(
     db,
     proposals,
@@ -116,6 +118,7 @@ async function buildApp() {
     proposalService,
     accounts,
     audit,
+    centroidRebuild,
     getConfig,
     silentLogger,
   );
