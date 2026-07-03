@@ -149,12 +149,13 @@ describe('DiscoveryProposalService', () => {
 
     expect(result.clusterCount).toBe(2);
     expect(result.sampledEmails).toBeGreaterThan(0);
-    expect(result.accepted.map((c) => c.label).sort()).toEqual([
+    expect(result.accepted.map((a) => a.candidate.label).sort()).toEqual([
       'Flight Bookings',
       'Receipts & Invoices',
     ]);
-    // Each accepted candidate carries its cluster keyphrases as evidence for the later review UI.
-    expect(result.accepted.every((c) => c.evidence.length > 0)).toBe(true);
+    // Each accepted proposal carries its cluster and keyphrase evidence for persistence and review.
+    expect(result.accepted.every((a) => a.candidate.evidence.length > 0)).toBe(true);
+    expect(result.accepted.every((a) => a.cluster.size > 0)).toBe(true);
     // Read-only: no category was created and no run leaves state behind.
     expect(h.categories.listAll(h.accountId)).toHaveLength(0);
     // Local by default: local provider, local model, and the Ollama-only controls are sent.

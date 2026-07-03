@@ -14,7 +14,6 @@ import { domainFrequency, brandTokens } from './topic-discovery-service.js';
 import {
   clusterKeyphrases,
   validateBatch,
-  rankAccepted,
   type NamedCandidate,
   type ActiveCategoryRef,
   type RejectReason,
@@ -39,11 +38,21 @@ export interface RejectedProposal {
   reason: RejectReason;
 }
 
-/** Outcome of one proposal run. Accepted candidates are ranked by deterministic confidence. */
+/**
+ * An accepted proposal with the source cluster and deterministic confidence, so the persistence layer
+ * can seed a centroid and assign members without re-clustering.
+ */
+export interface AcceptedProposal {
+  candidate: NamedCandidate;
+  cluster: DiscoveredCluster;
+  confidence: number;
+}
+
+/** Outcome of one proposal run. Accepted proposals are ranked by deterministic confidence. */
 export interface ProposalRunResult {
   clusterCount: number;
   sampledEmails: number;
-  accepted: NamedCandidate[];
+  accepted: AcceptedProposal[];
   rejected: RejectedProposal[];
 }
 
@@ -132,7 +141,14 @@ export class DiscoveryProposalService {
       existingSuggestedKeys: suggested.map((s) => s.canonicalKey),
     }));
 
-    const accepted = rankAccepted(results);
+    const accepted: AcceptedProposal[] = results
+      .filter((r) => r.verdict.accepted)
+      .map((r) => ({
+        candidate: r.candidate,
+        cluster: chosen[r.candidate.clusterIndex]!,
+        confidence: r.verdict.confidence,
+      }))
+      .sort((a, b) => b.confidence - a.confidence);
     const rejected: RejectedProposal[] = results
       .filter((r) => !r.verdict.accepted)
       .map((r) => ({

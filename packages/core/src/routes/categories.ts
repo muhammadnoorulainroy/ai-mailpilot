@@ -19,6 +19,10 @@ const ListQuery = z.object({
   accountId: z.string().min(1),
 });
 
+const ProposalActionBody = z.object({
+  accountId: z.string().min(1),
+});
+
 const CategorizeRunBody = z.object({
   accountId: z.string().min(1),
   embeddingModelId: z.string().optional(),
@@ -74,6 +78,100 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
         error: 'topic discovery failed',
         message: err instanceof Error ? err.message : String(err),
       });
+    }
+  });
+
+  // Run discovery and persist the review queue: cluster residual mail, name it locally, validate, and
+  // store accepted names as suggested categories. Creates nothing active and assigns no mail.
+  app.post('/categories/proposals/generate', async (req, reply) => {
+    const parsed = DiscoverBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    const generationModelId = parsed.data.generationModelId ?? ctx.config.llm.generationModel;
+    try {
+      return await ctx.services.discoveryProposal.generate(
+        parsed.data.accountId,
+        embeddingModelId,
+        generationModelId,
+      );
+    } catch (err) {
+      ctx.logger.error({ err }, 'discovery proposal generation failed');
+      reply.code(500).send({
+        error: 'discovery proposal generation failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // The pending review queue for an account.
+  app.get('/categories/proposals', async (req, reply) => {
+    const parsed = ListQuery.safeParse(req.query);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid query', issues: parsed.error.issues });
+      return;
+    }
+    if (!ctx.repos.accounts.findById(parsed.data.accountId)) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    return { proposals: ctx.services.discoveryProposal.listPending(parsed.data.accountId) };
+  });
+
+  // Approve a proposal: promote the suggested category to active, seed its centroid, and assign the
+  // still-uncategorized members.
+  app.post<{ Params: { id: string } }>('/categories/proposals/:id/apply', async (req, reply) => {
+    const parsed = ProposalActionBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    try {
+      return ctx.services.discoveryProposal.apply(parsed.data.accountId, req.params.id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('not found')) {
+        reply.code(404).send({ error: message });
+        return;
+      }
+      if (message.includes('not pending') || message.includes('not suggested')) {
+        reply.code(409).send({ error: message });
+        return;
+      }
+      ctx.logger.error({ err, proposalId: req.params.id }, 'apply proposal failed');
+      reply.code(500).send({ error: 'failed to apply proposal', message });
+    }
+  });
+
+  // Dismiss a proposal (soft): retire the suggested category, keep the record so a re-run does not
+  // re-propose the same purpose.
+  app.post<{ Params: { id: string } }>('/categories/proposals/:id/dismiss', async (req, reply) => {
+    const parsed = ProposalActionBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    try {
+      return ctx.services.discoveryProposal.dismiss(parsed.data.accountId, req.params.id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('not found')) {
+        reply.code(404).send({ error: message });
+        return;
+      }
+      if (message.includes('not pending')) {
+        reply.code(409).send({ error: message });
+        return;
+      }
+      ctx.logger.error({ err, proposalId: req.params.id }, 'dismiss proposal failed');
+      reply.code(500).send({ error: 'failed to dismiss proposal', message });
     }
   });
 
