@@ -39,6 +39,7 @@ import { DiscoveryProposalService } from './services/discovery-proposal-service.
 import { DiscoveryProposalOrchestrator } from './services/discovery-proposal-orchestrator.js';
 import { CategoryCentroidRebuildService } from './services/category-centroid-rebuild-service.js';
 import { CategoryHealthService } from './services/category-health-service.js';
+import { StructuralProposalService } from './services/structural-proposal-service.js';
 import { TriageOrchestrator } from './services/triage-orchestrator.js';
 import { TriageService } from './services/triage-service.js';
 import { getLogger } from './util/logger.js';
@@ -73,6 +74,7 @@ export interface Services {
   discoveryProposal: DiscoveryProposalOrchestrator;
   categoryCentroidRebuild: CategoryCentroidRebuildService;
   categoryHealth: CategoryHealthService;
+  structuralProposal: StructuralProposalService;
   category: CategoryOrchestrator;
   llmCategorize: LlmCategorizeOrchestrator;
   correction: CorrectionService;
@@ -138,6 +140,7 @@ export function buildContext(): AppContext {
     repos.embeddings,
     logger,
   );
+  const categoryHealth = new CategoryHealthService(repos.categories, repos.embeddings);
 
   const services: Services = {
     embedding: new EmbeddingOrchestrator(
@@ -182,7 +185,13 @@ export function buildContext(): AppContext {
       logger,
     ),
     categoryCentroidRebuild,
-    categoryHealth: new CategoryHealthService(repos.categories, repos.embeddings),
+    categoryHealth,
+    structuralProposal: new StructuralProposalService(
+      repos.categories,
+      repos.categoryProposals,
+      categoryHealth,
+      logger,
+    ),
     category: new CategoryOrchestrator(
       categorizationService,
       repos.emails,
