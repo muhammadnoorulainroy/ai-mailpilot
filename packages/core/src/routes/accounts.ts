@@ -11,6 +11,11 @@ const CreateAccountBody = z.object({
   address: z.string().email(),
   displayName: z.string().optional(),
   kind: z.enum(['personal', 'work', 'institutional']),
+  discoveryEnabled: z.boolean().optional(),
+});
+
+const UpdateDiscoveryBody = z.object({
+  discoveryEnabled: z.boolean(),
 });
 
 /**
@@ -22,6 +27,7 @@ function toDto(account: Account): AccountDto {
     address: account.address,
     displayName: account.displayName,
     kind: account.kind,
+    discoveryEnabled: account.discoveryEnabled,
     createdAt: account.createdAt,
   };
 }
@@ -51,6 +57,23 @@ export async function registerAccountRoutes(app: FastifyInstance, ctx: AppContex
       return;
     }
     const account = ctx.repos.accounts.upsertByAddress(parsed.data);
+    return { account: toDto(account) };
+  });
+
+  app.patch<{ Params: { id: string } }>('/accounts/:id/discovery', async (req, reply) => {
+    const parsed = UpdateDiscoveryBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.setDiscoveryEnabled(
+      req.params.id,
+      parsed.data.discoveryEnabled,
+    );
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
     return { account: toDto(account) };
   });
 

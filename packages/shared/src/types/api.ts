@@ -24,6 +24,8 @@ export interface AccountDto {
   address: string;
   displayName: string | null;
   kind: AccountKind;
+  /** Whether topic discovery, category proposals, and cleanup suggestions may inspect this account. */
+  discoveryEnabled: boolean;
   createdAt: number;
 }
 
@@ -32,6 +34,8 @@ export interface CreateAccountRequest {
   address: string;
   displayName?: string;
   kind: AccountKind;
+  /** Defaults to false for personal accounts and true for work/institutional accounts. */
+  discoveryEnabled?: boolean;
 }
 
 /** Response listing all accounts. */
@@ -42,6 +46,11 @@ export interface AccountListResponse {
 /** Response wrapping a single account. */
 export interface AccountResponse {
   account: AccountDto;
+}
+
+/** Request to opt an account in or out of AI discovery and category cleanup. */
+export interface UpdateAccountDiscoveryRequest {
+  discoveryEnabled: boolean;
 }
 
 /** Metadata for a mailbox folder. */

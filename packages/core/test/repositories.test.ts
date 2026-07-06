@@ -61,6 +61,43 @@ afterEach(() => {
   db.close();
 });
 
+describe('AccountRepository discovery eligibility', () => {
+  it('defaults personal accounts off and work accounts on for discovery', () => {
+    const personal = accounts.create({ address: 'personal@x.y', kind: 'personal' });
+    const work = accounts.create({ address: 'work@x.y', kind: 'work' });
+
+    expect(personal.discoveryEnabled).toBe(false);
+    expect(accounts.isDiscoveryEligible(personal.id)).toBe(false);
+    expect(work.discoveryEnabled).toBe(true);
+    expect(accounts.isDiscoveryEligible(work.id)).toBe(true);
+  });
+
+  it('allows explicit personal opt-in and preserves it across metadata refreshes', () => {
+    const personal = accounts.create({ address: 'personal2@x.y', kind: 'personal' });
+    expect(accounts.setDiscoveryEnabled(personal.id, true)?.discoveryEnabled).toBe(true);
+    expect(accounts.isDiscoveryEligible(personal.id)).toBe(true);
+
+    const refreshed = accounts.upsertByAddress({
+      address: 'personal2@x.y',
+      displayName: 'Personal Two',
+      kind: 'personal',
+    });
+    expect(refreshed.discoveryEnabled).toBe(true);
+    expect(refreshed.displayName).toBe('Personal Two');
+    expect(accounts.isDiscoveryEligible(personal.id)).toBe(true);
+  });
+
+  it('turns discovery off when an existing account is reclassified as personal', () => {
+    const acct = accounts.create({ address: 'maybe@x.y', kind: 'work' });
+    expect(accounts.isDiscoveryEligible(acct.id)).toBe(true);
+
+    const refreshed = accounts.upsertByAddress({ address: 'maybe@x.y', kind: 'personal' });
+    expect(refreshed.kind).toBe('personal');
+    expect(refreshed.discoveryEnabled).toBe(false);
+    expect(accounts.isDiscoveryEligible(acct.id)).toBe(false);
+  });
+});
+
 describe('CategorizeJobRepository (restart recovery)', () => {
   /** Builds a categorize progress record with consistent counts derived from processed. */
   const progress = (

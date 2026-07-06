@@ -167,7 +167,7 @@ describe('v21 category proposal suggested_key backfill', () => {
       'merge:source-cat:target-cat',
     );
 
-    expect(runMigrations(db, migrations)).toEqual([21]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 21))).toEqual([21]);
 
     const cols = db.prepare('PRAGMA table_info(category_proposals)').all() as Array<{
       name: string;
@@ -179,6 +179,50 @@ describe('v21 category proposal suggested_key backfill', () => {
     expect(rows).toEqual([
       { id: 'merge-proposal', suggested_key: '' },
       { id: 'new-proposal', suggested_key: 'finance_invoices' },
+    ]);
+    db.close();
+  });
+});
+
+describe('v22 personal discovery opt-in default', () => {
+  it('excludes already-synced personal accounts without changing work accounts', () => {
+    const db = new BetterSqlite3(':memory:');
+    db.exec(`
+      CREATE TABLE migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      CREATE TABLE accounts (
+        id TEXT PRIMARY KEY,
+        address TEXT NOT NULL,
+        display_name TEXT,
+        kind TEXT NOT NULL,
+        exclude_from_discovery INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO accounts
+        (id, address, kind, exclude_from_discovery, created_at)
+      VALUES
+        ('personal', 'p@example.com', 'personal', 0, 1),
+        ('work', 'w@example.com', 'work', 0, 1),
+        ('already-off', 'off@example.com', 'personal', 1, 1);
+    `);
+    const migrationInsert = db.prepare(
+      'INSERT INTO migrations (version, name, applied_at) VALUES (?, ?, ?)',
+    );
+    for (const m of migrations.filter((migration) => migration.version <= 21)) {
+      migrationInsert.run(m.version, m.name, 1000 + m.version);
+    }
+
+    expect(runMigrations(db, migrations)).toEqual([22]);
+
+    const rows = db.prepare('SELECT id, exclude_from_discovery FROM accounts ORDER BY id').all() as
+      Array<{ id: string; exclude_from_discovery: number }>;
+    expect(rows).toEqual([
+      { id: 'already-off', exclude_from_discovery: 1 },
+      { id: 'personal', exclude_from_discovery: 1 },
+      { id: 'work', exclude_from_discovery: 0 },
     ]);
     db.close();
   });

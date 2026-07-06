@@ -5,6 +5,7 @@
  */
 import { coreClient } from '../../api-client/core-client.js';
 import { MailboxSnapshot, type MailboxAccount } from '../../thunderbird/mailbox.js';
+import type { AccountDto } from '@ai-mailpilot/shared';
 import {
   loadSyncPrefs,
   saveSyncPrefs,
@@ -22,6 +23,7 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
 interface State {
   prefs: SyncPrefs;
   accounts: MailboxAccount[];
+  coreAccounts: AccountDto[];
   availableModels: string[];
   savedChatBaseUrl: string | null;
   savedChatModel: string | null;
@@ -30,6 +32,7 @@ interface State {
 const state: State = {
   prefs: { enabledAddresses: [], excludedAddresses: [], excludedFolderPaths: [], applyTags: true },
   accounts: [],
+  coreAccounts: [],
   availableModels: [],
   savedChatBaseUrl: null,
   savedChatModel: null,
@@ -48,6 +51,7 @@ async function init(): Promise<void> {
 
   try {
     await Promise.all([refreshConnection(), refreshAuth(), loadAccounts(), loadPrefs()]);
+    await loadCoreAccounts();
     renderAccounts();
     renderFolders();
     renderApplyTagsToggle();
@@ -118,6 +122,19 @@ async function loadPrefs(): Promise<void> {
   state.prefs = await loadSyncPrefs();
 }
 
+/** Loads Core's account records so settings can show per-account AI discovery consent. */
+async function loadCoreAccounts(): Promise<void> {
+  if (!coreClient.hasToken()) {
+    state.coreAccounts = [];
+    return;
+  }
+  try {
+    state.coreAccounts = (await coreClient.listAccounts()).accounts;
+  } catch {
+    state.coreAccounts = [];
+  }
+}
+
 /** Renders one toggle row per account, persisting enabled and excluded lists on change. */
 function renderAccounts(): void {
   const list = $('accounts-list');
@@ -131,6 +148,9 @@ function renderAccounts(): void {
 
   for (const account of state.accounts) {
     const decision = shouldSyncAccount(account.address, account.kind, state.prefs);
+    const coreAccount =
+      state.coreAccounts.find((a) => a.address.toLowerCase() === account.address.toLowerCase()) ??
+      null;
     const row = document.createElement('div');
     row.className = 'account-row';
     row.innerHTML = `
@@ -141,18 +161,41 @@ function renderAccounts(): void {
           <span class="account-address"></span>
           <span class="account-kind"></span>
         </div>
+        <div class="account-discovery-hint"></div>
       </div>
-      <label class="toggle">
-        <input type="checkbox" />
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </label>
+      <div class="account-controls">
+        <label class="account-toggle">
+          <span>Sync</span>
+          <span class="toggle">
+            <input class="sync-toggle" type="checkbox" />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </span>
+        </label>
+        <label class="account-toggle">
+          <span>AI discovery</span>
+          <span class="toggle">
+            <input class="discovery-toggle" type="checkbox" />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </span>
+        </label>
+      </div>
     `;
 
     (row.querySelector('.account-name') as HTMLElement).textContent = account.name;
     (row.querySelector('.account-address') as HTMLElement).textContent = account.address;
     (row.querySelector('.account-kind') as HTMLElement).textContent = account.kind;
+    const hint = row.querySelector('.account-discovery-hint') as HTMLElement;
+    if (!coreAccount) {
+      hint.textContent = 'AI discovery setting appears after this account is synced.';
+    } else if (coreAccount.discoveryEnabled) {
+      hint.textContent =
+        'AI discovery can inspect this account to suggest categories and cleanup. Discovery stays local unless cloud discovery is explicitly enabled.';
+    } else {
+      hint.textContent =
+        'AI discovery is off. Topic discovery, category proposals, and cleanup suggestions skip this account.';
+    }
 
-    const checkbox = row.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    const checkbox = row.querySelector('.sync-toggle') as HTMLInputElement;
     checkbox.checked = decision.sync;
     checkbox.addEventListener('change', async () => {
       if (checkbox.checked) {
@@ -172,6 +215,40 @@ function renderAccounts(): void {
       }
       await saveSyncPrefs(state.prefs);
       renderAccounts();
+    });
+
+    const discovery = row.querySelector('.discovery-toggle') as HTMLInputElement;
+    discovery.checked = coreAccount?.discoveryEnabled ?? false;
+    discovery.disabled = !coreAccount;
+    discovery.addEventListener('change', async () => {
+      if (!coreAccount) return;
+      const next = discovery.checked;
+      if (next) {
+        const ok = window.confirm(
+          `Allow AI discovery for ${account.address}? This lets AI MailPilot inspect this account's subjects, snippets, and embeddings to discover categories and cleanup suggestions. Discovery runs locally unless you explicitly enable cloud discovery in Core.`,
+        );
+        if (!ok) {
+          discovery.checked = false;
+          return;
+        }
+      }
+      discovery.disabled = true;
+      try {
+        const updated = await coreClient.updateAccountDiscovery(coreAccount.id, {
+          discoveryEnabled: next,
+        });
+        state.coreAccounts = state.coreAccounts.map((a) =>
+          a.id === updated.account.id ? updated.account : a,
+        );
+      } catch (err) {
+        setStatus(
+          'models-status',
+          `Could not save AI discovery setting: ${err instanceof Error ? err.message : String(err)}`,
+          'error',
+        );
+      } finally {
+        renderAccounts();
+      }
     });
 
     list.appendChild(row);
@@ -536,6 +613,8 @@ function attachHandlers(): void {
         type: 'mailpilot:sync-progress',
       })) as SyncProgress | undefined;
       renderSyncBanner(final?.phase ? final : emptyProgress('done'));
+      await loadCoreAccounts();
+      renderAccounts();
       btn.textContent = 'Sync complete';
     } catch (err) {
       renderSyncBanner({

@@ -8,6 +8,7 @@ import type {
   AccountListResponse,
   AccountResponse,
   CreateAccountRequest,
+  UpdateAccountDiscoveryRequest,
   PushEmailsRequest,
   PushEmailsResponse,
   IngestAttachmentsRequest,
@@ -218,6 +219,14 @@ export class CoreClient {
   /** Fetch a single account by id. */
   getAccount(id: string): Promise<AccountResponse> {
     return this.request(`/accounts/${id}`);
+  }
+
+  /** Opt an account in or out of AI discovery and category cleanup. */
+  updateAccountDiscovery(id: string, req: UpdateAccountDiscoveryRequest): Promise<AccountResponse> {
+    return this.request(`/accounts/${id}/discovery`, {
+      method: 'PATCH',
+      body: JSON.stringify(req),
+    });
   }
 
   /** Push a batch of emails to the server. */

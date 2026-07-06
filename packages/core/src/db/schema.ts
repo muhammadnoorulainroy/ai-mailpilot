@@ -676,4 +676,26 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 22,
+    name: 'personal_discovery_opt_in_default',
+    up: (db) => {
+      const table = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'accounts'")
+        .get();
+      if (!table) return;
+
+      const cols = db.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'exclude_from_discovery')) return;
+
+      // Personal accounts remain excluded from AI discovery unless the user explicitly opts in via
+      // settings. Work and institutional accounts keep the existing default-enabled behavior.
+      db.exec(`
+        UPDATE accounts
+           SET exclude_from_discovery = 1
+         WHERE kind = 'personal'
+           AND exclude_from_discovery = 0
+      `);
+    },
+  },
 ];
