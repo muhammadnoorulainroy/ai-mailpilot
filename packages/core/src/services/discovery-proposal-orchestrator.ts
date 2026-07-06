@@ -474,6 +474,7 @@ export class DiscoveryProposalOrchestrator {
         rebuild: RebuildResult;
         aliasesMoved: number;
         skippedAliases: string[];
+        dismissedSiblings: number;
       } => {
         // Keep the target answering to the absorbed source's names so a re-run does not re-propose the
         // merged-away purpose and categorization still recognizes its mail. Re-point the source's own
@@ -499,11 +500,19 @@ export class DiscoveryProposalOrchestrator {
             allowAutoFallback: true,
           },
         );
+        // Other pending merge proposals that named this now-deleted source can never apply
+        // (source_category_id is non-cascading, so their source is gone) and would linger in the queue
+        // as failing cards; dismiss them in this same transaction so the queue self-heals atomically.
+        const dismissedSiblings = this.proposals.dismissPendingMergesForSource(
+          accountId,
+          source.id,
+          proposal.id,
+        );
         this.proposals.markApplied(proposal.id);
-        return { reassigned, rebuild, aliasesMoved, skippedAliases };
+        return { reassigned, rebuild, aliasesMoved, skippedAliases, dismissedSiblings };
       },
     );
-    const { reassigned, rebuild, aliasesMoved, skippedAliases } = run();
+    const { reassigned, rebuild, aliasesMoved, skippedAliases, dismissedSiblings } = run();
 
     this.logger.info(
       {
@@ -515,6 +524,7 @@ export class DiscoveryProposalOrchestrator {
         centroidRebuild: rebuild.status,
         aliasesMoved,
         skippedAliases,
+        dismissedSiblings,
       },
       'discovery proposal: merged categories',
     );

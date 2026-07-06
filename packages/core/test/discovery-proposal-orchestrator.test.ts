@@ -869,6 +869,62 @@ describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
     expect(h.proposals.findById(p.id)!.status).toBe('pending');
   });
 
+  it('dismisses sibling merge proposals that shared the deleted source on merge apply', () => {
+    const h = harness();
+    const s = activeCategory(h, 'S', 's');
+    const t = activeCategory(h, 'T', 't');
+    const u = activeCategory(h, 'U', 'u');
+    const mST = mergeProposal(h, s.id, t.id, 's', 't');
+    const mSU = mergeProposal(h, s.id, u.id, 's', 'u');
+
+    h.orchestrator.apply(h.accountId, mST.id);
+
+    expect(h.categories.findById(s.id)).toBeNull();
+    expect(h.proposals.findById(mST.id)!.status).toBe('applied');
+    // The sibling merge that also named S as its source is dismissed, not left as a failing card.
+    expect(h.proposals.findById(mSU.id)!.status).toBe('dismissed');
+    expect(h.orchestrator.listPending(h.accountId).some((p) => p.id === mSU.id)).toBe(false);
+  });
+
+  it('does not dismiss a merge with a different source, and a merge targeting S is cascade-removed not source-dismissed', () => {
+    const h = harness();
+    const s = activeCategory(h, 'S', 's');
+    const t = activeCategory(h, 'T', 't');
+    const u = activeCategory(h, 'U', 'u');
+    const x = activeCategory(h, 'X', 'x');
+    const y = activeCategory(h, 'Y', 'y');
+    const mST = mergeProposal(h, s.id, t.id, 's', 't');
+    const mXY = mergeProposal(h, x.id, y.id, 'x', 'y'); // unrelated source
+    const mUS = mergeProposal(h, u.id, s.id, 'u', 's'); // S is the TARGET (category_id = s)
+
+    h.orchestrator.apply(h.accountId, mST.id);
+
+    // A pending merge with an unrelated source is untouched.
+    expect(h.proposals.findById(mXY.id)!.status).toBe('pending');
+    // The merge whose target was S is removed by ON DELETE CASCADE (category_id), not by this cleanup.
+    expect(h.proposals.findById(mUS.id)).toBeNull();
+  });
+
+  it('rolls back the sibling dismissal when the merge fails', () => {
+    const throwing = {
+      rebuild() {
+        throw new Error('rebuild boom');
+      },
+    } as unknown as CategoryCentroidRebuildService;
+    const h = harness(NAMING, throwing);
+    const s = activeCategory(h, 'S', 's');
+    const t = activeCategory(h, 'T', 't');
+    const u = activeCategory(h, 'U', 'u');
+    const mST = mergeProposal(h, s.id, t.id, 's', 't');
+    const mSU = mergeProposal(h, s.id, u.id, 's', 'u');
+
+    expect(() => h.orchestrator.apply(h.accountId, mST.id)).toThrow(/rebuild boom/);
+    // All-or-nothing: source still exists, both merges still pending.
+    expect(h.categories.findById(s.id)).not.toBeNull();
+    expect(h.proposals.findById(mST.id)!.status).toBe('pending');
+    expect(h.proposals.findById(mSU.id)!.status).toBe('pending');
+  });
+
   it('merge blocks when the source category is missing and writes nothing', () => {
     const h = harness();
     const target = activeCategory(h, 'Dst', 'dst');

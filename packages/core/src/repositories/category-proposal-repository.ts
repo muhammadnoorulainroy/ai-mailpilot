@@ -182,6 +182,7 @@ export class CategoryProposalRepository {
     resolvedStructuralSuppressionKeys: Statement<unknown[]>;
     markApplied: Statement<unknown[]>;
     markDismissed: Statement<unknown[]>;
+    dismissPendingMergesForSource: Statement<unknown[]>;
     insertChild: Statement<unknown[]>;
     listChildren: Statement<unknown[]>;
   };
@@ -216,6 +217,11 @@ export class CategoryProposalRepository {
       ),
       markDismissed: db.prepare(
         `UPDATE category_proposals SET status = 'dismissed', dismissed_at = ? WHERE id = ?`,
+      ),
+      dismissPendingMergesForSource: db.prepare(
+        `UPDATE category_proposals SET status = 'dismissed', dismissed_at = ?
+         WHERE account_id = ? AND kind = 'merge' AND source_category_id = ?
+           AND status = 'pending' AND id <> ?`,
       ),
       insertChild: db.prepare(
         `INSERT INTO category_proposal_children (${CHILD_COLS})
@@ -438,6 +444,24 @@ export class CategoryProposalRepository {
   /** Mark a proposal dismissed. The row is kept so a re-run can suppress the same purpose. */
   markDismissed(id: string): void {
     this.stmts.markDismissed.run(Date.now(), id);
+  }
+
+  /**
+   * Dismiss every other pending merge proposal that names the given source category. Used after a
+   * merge deletes its source: those siblings can never apply (source_category_id is non-cascading, so
+   * their source is gone) and would otherwise linger in the queue. Returns the number dismissed.
+   */
+  dismissPendingMergesForSource(
+    accountId: string,
+    sourceCategoryId: string,
+    exceptProposalId: string,
+  ): number {
+    return this.stmts.dismissPendingMergesForSource.run(
+      Date.now(),
+      accountId,
+      sourceCategoryId,
+      exceptProposalId,
+    ).changes;
   }
 
   private fromRow(row: ProposalDbRow): CategoryProposal {
