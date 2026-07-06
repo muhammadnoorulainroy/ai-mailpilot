@@ -107,25 +107,26 @@ function tableCounts(db: Database) {
 }
 
 describe('StructuralProposalService merge detection', () => {
-  it('creates one merge proposal for two clearly overlapping active auto categories', () => {
+  it('creates one merge proposal for two clearly overlapping same-purpose active auto categories', () => {
     const h = harness();
+    // Invoices and Receipts both map to the same known purpose group, so a high-overlap merge is safe.
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
-    makeCategory(h, 'Bills', 'bills', { centroid: axis(0), members: 5, memberDim: 0 });
+    makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
 
     const result = h.service.generate(h.accountId, MODEL);
 
     const merges = result.created.filter((c) => c.kind === 'merge');
     expect(merges).toHaveLength(1);
-    const bills = h.categories.findByLabel(h.accountId, 'Bills')!;
+    const receipts = h.categories.findByLabel(h.accountId, 'Receipts')!;
     const invoices = h.categories.findByLabel(h.accountId, 'Invoices')!;
-    // The larger category (Bills, 5) survives as the target; the smaller (Invoices, 3) is the source.
-    expect(merges[0]!.categoryId).toBe(bills.id);
+    // The larger category (Receipts, 5) survives as the target; the smaller (Invoices, 3) is the source.
+    expect(merges[0]!.categoryId).toBe(receipts.id);
     expect(merges[0]!.sourceCategoryId).toBe(invoices.id);
-    expect(merges[0]!.suppressionKey).toBe('merge:bills|invoices');
+    expect(merges[0]!.suppressionKey).toBe('merge:invoices|receipts');
     // It is stored as a real pending merge proposal via createStructural.
     const pending = h.proposals.listPending(h.accountId).filter((p) => p.kind === 'merge');
     expect(pending).toHaveLength(1);
-    expect(pending[0]!.categoryId).toBe(bills.id);
+    expect(pending[0]!.categoryId).toBe(receipts.id);
     expect(pending[0]!.sourceCategoryId).toBe(invoices.id);
   });
 
@@ -160,8 +161,47 @@ describe('StructuralProposalService merge detection', () => {
     const h = harness();
     // Overlap 0.95: above MERGE_MIN_OVERLAP (0.9) but well short of the identical-centroid case.
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
-    makeCategory(h, 'Bills', 'bills', {
+    makeCategory(h, 'Receipts', 'receipts', {
       centroid: tiltedFromAxis0(0.95, 0.3122498999199199),
+      members: 5,
+      memberDim: 0,
+    });
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(1);
+  });
+
+  it('does not merge two distinct-purpose categories even at very high overlap', () => {
+    const h = harness();
+    // Two transactional categories that collapse in embedding space (identical centroid axis) but map
+    // to DIFFERENT known purposes: invoices vs shipping. A raw-overlap merge here would be wrong.
+    makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 4, memberDim: 0 });
+    makeCategory(h, 'Shipping Updates', 'shipping_updates', {
+      centroid: axis(0),
+      members: 4,
+      memberDim: 0,
+    });
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
+    // The pair was overlap-eligible (counted as a candidate) but rejected on purpose, not filtered
+    // out earlier by the overlap threshold.
+    expect(result.mergeCandidates).toBeGreaterThanOrEqual(1);
+  });
+
+  it('merges near-duplicate-labelled categories that match no known purpose', () => {
+    const h = harness();
+    // Neither label maps to a known purpose group, but the labels are near-duplicate, so a merge is
+    // still a safe suggestion.
+    makeCategory(h, 'Client Portal', 'client_portal', {
+      centroid: axis(0),
+      members: 3,
+      memberDim: 0,
+    });
+    makeCategory(h, 'Client Portal Access', 'client_portal_access', {
+      centroid: axis(0),
       members: 5,
       memberDim: 0,
     });
@@ -281,7 +321,7 @@ describe('StructuralProposalService safety and dedup', () => {
   it('does not duplicate an equivalent pending structural proposal', () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
-    makeCategory(h, 'Bills', 'bills', { centroid: axis(0), members: 5, memberDim: 0 });
+    makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
 
     const first = h.service.generate(h.accountId, MODEL);
     expect(first.created.filter((c) => c.kind === 'merge')).toHaveLength(1);
@@ -296,7 +336,7 @@ describe('StructuralProposalService safety and dedup', () => {
   it('does not recreate a dismissed proposal with the same suppression key', () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
-    makeCategory(h, 'Bills', 'bills', { centroid: axis(0), members: 5, memberDim: 0 });
+    makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
 
     const first = h.service.generate(h.accountId, MODEL);
     const mergeId = first.created.find((c) => c.kind === 'merge')!.id;
@@ -310,7 +350,7 @@ describe('StructuralProposalService safety and dedup', () => {
   it('writes nothing but proposal rows', () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
-    makeCategory(h, 'Bills', 'bills', { centroid: axis(0), members: 5, memberDim: 0 });
+    makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
     makeCategory(h, 'Empty', 'empty');
 
     const before = tableCounts(h.db);

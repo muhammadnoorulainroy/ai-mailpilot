@@ -263,19 +263,21 @@ function seedStructuralFixture(
   emails: EmailRepository,
   accountId: string,
 ) {
+  // Same-purpose labels (both map to the invoices/receipts purpose group) so the F1 merge-quality
+  // gate accepts the pair; the variable names are kept generic.
   const src = categories.create({
     accountId,
-    label: 'Src',
+    label: 'Invoices',
     source: 'auto',
     status: 'active',
-    canonicalKey: 'src',
+    canonicalKey: 'invoices',
   });
   const dst = categories.create({
     accountId,
-    label: 'Dst',
+    label: 'Receipts',
     source: 'auto',
     status: 'active',
-    canonicalKey: 'dst',
+    canonicalKey: 'receipts',
   });
   const empty = categories.create({
     accountId,

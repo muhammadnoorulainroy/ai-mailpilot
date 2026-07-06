@@ -15,6 +15,8 @@ import type { Logger } from 'pino';
 import type { CategoryRepository, CategoryWithCount } from '../repositories/category-repository.js';
 import type { CategoryProposalRepository } from '../repositories/category-proposal-repository.js';
 import type { CategoryHealthService } from './category-health-service.js';
+import { purposeSignature } from './categorize-strategy.js';
+import { isNearDuplicateLabel } from './topic-discovery-service.js';
 
 /** Lowest overlap (cosine of stored centroids) at which two auto categories are proposed for merge. */
 export const MERGE_MIN_OVERLAP = 0.9;
@@ -47,6 +49,22 @@ function survivorFirst(
     return a.emailCount > b.emailCount ? [a, b] : [b, a];
   }
   return a.canonicalKey <= b.canonicalKey ? [a, b] : [b, a];
+}
+
+/**
+ * Conservative same-purpose gate for a merge pair (F1). High stored-centroid overlap alone is not
+ * enough: transactional categories (invoices vs shipping vs security) collapse in embedding space, so
+ * a raw-overlap merge can pair genuinely different purposes. Deterministic, no LLM: reject when the
+ * two labels/descriptions map to DIFFERENT known purpose groups; otherwise require a positive
+ * same-purpose signal (the same known purpose group, or near-duplicate labels). A wrong merge is
+ * worse than a missed one, so with no positive signal we do not propose.
+ */
+function sameMergePurpose(a: CategoryWithCount, b: CategoryWithCount): boolean {
+  const sigA = purposeSignature(a.label, a.description);
+  const sigB = purposeSignature(b.label, b.description);
+  if (sigA !== null && sigB !== null && sigA !== sigB) return false;
+  if (sigA !== null && sigA === sigB) return true;
+  return isNearDuplicateLabel(a.label, [b.label]);
 }
 
 /** Detects safe merge and retire proposals from health metrics. Never applies a change. */
@@ -82,6 +100,7 @@ export class StructuralProposalService {
     let mergeCandidates = 0;
     let retireCandidates = 0;
     let skippedExisting = 0;
+    let rejectedDistinctPurpose = 0;
 
     // RETIRE: an active auto category with no assigned mail. User-created categories are never
     // proposed (their retire would be applicable), and a category with any assignment is left alone.
@@ -136,6 +155,16 @@ export class StructuralProposalService {
       // merging it would conflict with its own retire proposal for the same category this run.
       if (a.emailCount === 0 || b.emailCount === 0) continue;
       mergeCandidates += 1;
+      // Conservative F1 gate: high centroid overlap can pair distinct transactional purposes that
+      // collapse in embedding space. Require a deterministic same-purpose label signal.
+      if (!sameMergePurpose(a, b)) {
+        rejectedDistinctPurpose += 1;
+        this.logger.debug(
+          { accountId, a: a.id, b: b.id, aLabel: a.label, bLabel: b.label, overlap: m.overlap },
+          'structural: merge rejected (no same-purpose signal)',
+        );
+        continue;
+      }
       const key = `merge:${[a.canonicalKey, b.canonicalKey].sort().join('|')}`;
       if (existingKeys.has(key)) {
         skippedExisting += 1;
@@ -179,6 +208,7 @@ export class StructuralProposalService {
         mergeCandidates,
         retireCandidates,
         skippedExisting,
+        rejectedDistinctPurpose,
       },
       'structural proposal generation',
     );
