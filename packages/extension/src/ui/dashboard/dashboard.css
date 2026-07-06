@@ -578,6 +578,30 @@
   gap: var(--space-3);
 }
 
+.proposal-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.proposal-kind {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border-radius: var(--radius-full);
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+
+.proposal-generate-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
 .proposal-label {
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);

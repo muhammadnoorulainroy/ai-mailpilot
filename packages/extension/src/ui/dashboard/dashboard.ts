@@ -5,7 +5,15 @@
  */
 import { coreClient } from '../../api-client/core-client.js';
 import { renderMarkdown } from '../shared/markdown.js';
-import { proposalCountLabel, proposalsSummary, proposalsBadgeLabel } from './proposals-format.js';
+import {
+  proposalCountLabel,
+  proposalsSummary,
+  proposalsBadgeLabel,
+  proposalKindTag,
+  proposalActionLabel,
+  proposalIsApplyable,
+  proposalApplySuccessCopy,
+} from './proposals-format.js';
 import type {
   AccountDto,
   AssignmentMethodDto,
@@ -1752,20 +1760,34 @@ function renderProposals(list: ProposalDto[]): void {
   for (const p of list) body.appendChild(proposalCard(p));
 }
 
-/** Builds one proposal card: label, estimated size, evidence keywords, and Add/Ignore buttons. */
+/**
+ * Builds one proposal card. A kind tag plus a kind-specific action label keep a merge/retire/split
+ * visually distinct from an add-category suggestion. The estimated size is shown only for a
+ * new-category cluster (structural proposals carry none). A split cannot be approved from here
+ * because its child detail is not exposed, so its primary action is disabled with a clear note.
+ */
 function proposalCard(p: ProposalDto): HTMLElement {
   const card = document.createElement('div');
   card.className = 'proposal-card';
 
   const top = document.createElement('div');
   top.className = 'proposal-top';
+  const heading = document.createElement('div');
+  heading.className = 'proposal-heading';
   const label = document.createElement('div');
   label.className = 'proposal-label';
   label.textContent = p.label;
-  const count = document.createElement('span');
-  count.className = 'proposal-count';
-  count.textContent = proposalCountLabel(p.proposedCount);
-  top.append(label, count);
+  const tag = document.createElement('span');
+  tag.className = 'proposal-kind';
+  tag.textContent = proposalKindTag(p.kind);
+  heading.append(label, tag);
+  top.appendChild(heading);
+  if (p.kind === 'new_category') {
+    const count = document.createElement('span');
+    count.className = 'proposal-count';
+    count.textContent = proposalCountLabel(p.proposedCount);
+    top.appendChild(count);
+  }
   card.appendChild(top);
 
   if (p.description) {
@@ -1787,26 +1809,41 @@ function proposalCard(p: ProposalDto): HTMLElement {
     card.appendChild(chips);
   }
 
+  const applyable = proposalIsApplyable(p.kind);
+  if (!applyable) {
+    const note = document.createElement('div');
+    note.className = 'proposal-description';
+    note.textContent =
+      'Split details are not available in this view yet. You can ignore it for now.';
+    card.appendChild(note);
+  }
+
   const actions = document.createElement('div');
   actions.className = 'proposal-actions';
   const ignore = document.createElement('button');
   ignore.className = 'btn btn-ghost btn-sm';
   ignore.type = 'button';
   ignore.textContent = 'Ignore';
-  const add = document.createElement('button');
-  add.className = 'btn btn-primary btn-sm';
-  add.type = 'button';
-  add.textContent = 'Add';
+  const apply = document.createElement('button');
+  apply.className = 'btn btn-primary btn-sm';
+  apply.type = 'button';
+  apply.textContent = proposalActionLabel(p.kind);
   // Disable both buttons on this card while its request is in flight, so a fast double-click cannot
   // send a duplicate apply/dismiss. On success the queue refresh replaces the card; on failure the
-  // action re-enables them.
+  // action re-enables them. A non-applyable (split) card keeps its primary action permanently
+  // disabled, even after a failed Ignore.
   const setBusy = (busy: boolean): void => {
-    add.disabled = busy;
+    if (applyable) apply.disabled = busy;
     ignore.disabled = busy;
   };
   ignore.addEventListener('click', () => void dismissProposal(p, setBusy));
-  add.addEventListener('click', () => void applyProposal(p, setBusy));
-  actions.append(ignore, add);
+  if (applyable) {
+    apply.addEventListener('click', () => void applyProposal(p, setBusy));
+  } else {
+    apply.disabled = true;
+    apply.title = 'Split details are not available in this view yet.';
+  }
+  actions.append(ignore, apply);
   card.appendChild(actions);
   return card;
 }
@@ -1834,6 +1871,32 @@ async function generateProposals(): Promise<void> {
   }
 }
 
+/**
+ * Runs structural detection (merge/retire) over existing categories and reloads the queue. Kept
+ * separate from "Find new categories": this proposes cleanups to the taxonomy you already have.
+ */
+async function findCleanupSuggestions(): Promise<void> {
+  const accountId = state.currentAccountId;
+  if (!accountId) return;
+  const btn = $<HTMLButtonElement>('proposals-generate-structural');
+  btn.disabled = true;
+  $('proposals-summary').textContent = 'Looking for categories to merge or retire...';
+  try {
+    const res = await coreClient.generateStructuralProposals({ accountId });
+    if (accountId !== state.currentAccountId) return;
+    setStatus(
+      res.created.length > 0
+        ? `Found ${res.created.length} cleanup suggestion${res.created.length === 1 ? '' : 's'}.`
+        : 'No cleanup suggestions found.',
+    );
+    await loadProposals();
+  } catch (err) {
+    $('proposals-summary').textContent = err instanceof Error ? err.message : String(err);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 /** Approves a proposal, files its emails, and refreshes the queue and dashboard. */
 async function applyProposal(p: ProposalDto, setBusy: (busy: boolean) => void): Promise<void> {
   const accountId = state.currentAccountId;
@@ -1841,11 +1904,7 @@ async function applyProposal(p: ProposalDto, setBusy: (busy: boolean) => void): 
   setBusy(true);
   try {
     const res = await coreClient.applyProposal(p.id, accountId);
-    setStatus(
-      res.assigned > 0
-        ? `Added "${res.label}" and filed ${res.assigned} email${res.assigned === 1 ? '' : 's'}.`
-        : `Added "${res.label}".`,
-    );
+    setStatus(proposalApplySuccessCopy(res.kind, res.label, res.assigned));
     await loadProposals();
     await refreshDashboard();
   } catch (err) {
@@ -2301,6 +2360,9 @@ function attachHandlers(): void {
   });
   $<HTMLButtonElement>('proposals-generate').addEventListener('click', () => {
     void generateProposals();
+  });
+  $<HTMLButtonElement>('proposals-generate-structural').addEventListener('click', () => {
+    void findCleanupSuggestions();
   });
   $<HTMLButtonElement>('proposals-close').addEventListener('click', closeProposalsModal);
   $('proposals-modal').addEventListener('click', (e) => {
