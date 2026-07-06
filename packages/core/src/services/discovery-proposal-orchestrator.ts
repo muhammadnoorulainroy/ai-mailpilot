@@ -411,6 +411,16 @@ export class DiscoveryProposalOrchestrator {
         409,
       );
     }
+    // The proposal was generated for an empty category, but a categorize/refine run may have
+    // auto-assigned mail into it since. Re-check total emptiness against live state so retiring never
+    // hides mail the category has gained; the user should refresh the queue and re-run cleanup.
+    const totalMembers = this.categories.countEmails(category.id);
+    if (totalMembers !== 0) {
+      throw new ProposalApplyError(
+        `cannot retire "${category.label}": it is no longer empty (${totalMembers} assigned email(s)); refresh the queue and re-run cleanup`,
+        409,
+      );
+    }
 
     const run = this.db.transaction(() => {
       this.categories.retire(category.id);

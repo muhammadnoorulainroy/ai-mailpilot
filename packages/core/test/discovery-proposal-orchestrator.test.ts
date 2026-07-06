@@ -19,7 +19,10 @@ import type { LlmClient } from '../src/llm/client.js';
 import type { LlmConfig } from '../src/config/schema.js';
 import { ResidualDiscoveryService } from '../src/services/residual-discovery-service.js';
 import { DiscoveryProposalService } from '../src/services/discovery-proposal-service.js';
-import { DiscoveryProposalOrchestrator } from '../src/services/discovery-proposal-orchestrator.js';
+import {
+  DiscoveryProposalOrchestrator,
+  ProposalApplyError,
+} from '../src/services/discovery-proposal-orchestrator.js';
 import { CategoryCentroidRebuildService } from '../src/services/category-centroid-rebuild-service.js';
 
 const MODEL = 'bge-m3';
@@ -523,21 +526,9 @@ function mergeProposal(
 }
 
 describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
-  it('retire hides a target with only auto members, keeps its rows, and marks applied', () => {
+  it('retire applies for an empty active category and marks it applied', () => {
     const h = harness();
     const cat = activeCategory(h, 'Noise', 'noise');
-    seedEmail(h, 'n-1');
-    h.categories.addAutoAssignments(h.accountId, [
-      {
-        messageId: 'n-1',
-        accountId: h.accountId,
-        categoryId: cat.id,
-        confidence: 0.3,
-        assignedBy: 'auto',
-        assignedAt: Date.now(),
-        method: 'embed',
-      },
-    ]);
     const p = retireProposal(h, cat.id, 'noise');
 
     const result = h.orchestrator.apply(h.accountId, p.id);
@@ -546,8 +537,40 @@ describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
     expect(result.assigned).toBe(0);
     expect(h.categories.findById(cat.id)!.status).toBe('retired');
     expect(h.proposals.findById(p.id)!.status).toBe('applied');
-    // The auto assignment row is kept (retire preserves history, hides only the label).
-    expect(assignmentsFor(h.db, h.accountId, 'n-1')).toEqual([
+  });
+
+  it('retire blocks when the target gained auto mail after the proposal was generated', () => {
+    const h = harness();
+    const cat = activeCategory(h, 'Was Empty', 'was_empty');
+    // The retire proposal is generated while the category is empty.
+    const p = retireProposal(h, cat.id, 'was_empty');
+    // A categorize/refine run auto-assigns mail into it before the user approves.
+    seedEmail(h, 'auto-1');
+    h.categories.addAutoAssignments(h.accountId, [
+      {
+        messageId: 'auto-1',
+        accountId: h.accountId,
+        categoryId: cat.id,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: Date.now(),
+        method: 'embed',
+      },
+    ]);
+
+    let thrown: unknown;
+    try {
+      h.orchestrator.apply(h.accountId, p.id);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProposalApplyError);
+    expect((thrown as ProposalApplyError).httpStatus).toBe(409);
+    expect((thrown as Error).message).toMatch(/no longer empty/i);
+    // Zero writes: the category stays active, the proposal stays pending, the auto assignment is kept.
+    expect(h.categories.findById(cat.id)!.status).toBe('active');
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+    expect(assignmentsFor(h.db, h.accountId, 'auto-1')).toEqual([
       { category_id: cat.id, assigned_by: 'auto', method: 'embed' },
     ]);
   });
