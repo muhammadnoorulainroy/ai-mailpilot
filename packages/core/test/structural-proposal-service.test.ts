@@ -188,6 +188,30 @@ describe('StructuralProposalService merge detection', () => {
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
     expect(result.mergeCandidates).toBe(0);
   });
+
+  it('never merges an empty category that carries a stale overlapping centroid; only retires it', () => {
+    const h = harness();
+    // Empty auto category with a saved centroid but zero assignments (a stale centroid), overlapping
+    // a non-empty auto category. Without the guard the merge loop would also propose merging it.
+    const empty = makeCategory(h, 'Empty', 'empty', { centroid: axis(0), members: 0 });
+    makeCategory(h, 'Full', 'full', { centroid: axis(0), members: 3, memberDim: 0 });
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    // Retire is the only structural proposal for the empty category.
+    const retires = result.created.filter((c) => c.kind === 'retire');
+    expect(retires).toHaveLength(1);
+    expect(retires[0]!.categoryId).toBe(empty.id);
+    // No merge proposal is created, and none references the empty category on either side.
+    expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
+    expect(result.mergeCandidates).toBe(0);
+    expect(
+      result.created.some(
+        (c) =>
+          c.kind === 'merge' && (c.categoryId === empty.id || c.sourceCategoryId === empty.id),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe('StructuralProposalService retire detection', () => {

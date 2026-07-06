@@ -131,6 +131,10 @@ export class StructuralProposalService {
       const a = byId.get(m.categoryId);
       const b = byId.get(m.nearestCategoryId);
       if (!a || !b || a.source !== 'auto' || b.source !== 'auto') continue;
+      // An empty category (retire candidate) may still carry a stale centroid that reports high
+      // overlap. Never merge one: retire is the only structural proposal for an empty category, and
+      // merging it would conflict with its own retire proposal for the same category this run.
+      if (a.emailCount === 0 || b.emailCount === 0) continue;
       mergeCandidates += 1;
       const key = `merge:${[a.canonicalKey, b.canonicalKey].sort().join('|')}`;
       if (existingKeys.has(key)) {
