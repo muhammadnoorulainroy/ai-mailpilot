@@ -416,6 +416,31 @@ export interface GenerateProposalsResponse {
   rejected: RejectedProposalDto[];
 }
 
+/** Request to generate structural (merge/retire) proposals from category health metrics. */
+export interface GenerateStructuralProposalsRequest {
+  accountId: string;
+  embeddingModelId?: string;
+}
+
+/** One structural proposal produced by a generate-structural run. */
+export interface GeneratedStructuralProposalDto {
+  id: string;
+  kind: 'merge' | 'retire';
+  categoryId: string;
+  sourceCategoryId: string | null;
+  suppressionKey: string;
+  label: string;
+}
+
+/** Result of a structural generate run: what was created and why others were skipped. */
+export interface GenerateStructuralProposalsResponse {
+  runId: string;
+  created: GeneratedStructuralProposalDto[];
+  mergeCandidates: number;
+  retireCandidates: number;
+  skippedExisting: number;
+}
+
 /** Request to apply or dismiss a proposal: the account that owns it. */
 export interface ProposalActionRequest {
   accountId: string;

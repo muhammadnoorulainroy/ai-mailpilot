@@ -24,6 +24,11 @@ const ProposalActionBody = z.object({
   accountId: z.string().min(1),
 });
 
+const GenerateStructuralBody = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
+});
+
 const RebuildCentroidBody = z.object({
   accountId: z.string().min(1),
   embeddingModelId: z.string().optional(),
@@ -113,6 +118,31 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       ctx.logger.error({ err }, 'discovery proposal generation failed');
       reply.code(500).send({
         error: 'discovery proposal generation failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Generate structural (merge/retire) proposals from category health metrics and add them to the
+  // review queue. Writes only proposal rows; applies nothing and never runs on its own. Split
+  // generation is intentionally not included here.
+  app.post('/categories/proposals/generate-structural', async (req, reply) => {
+    const parsed = GenerateStructuralBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    if (!ctx.repos.accounts.findById(parsed.data.accountId)) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    try {
+      return ctx.services.structuralProposal.generate(parsed.data.accountId, embeddingModelId);
+    } catch (err) {
+      ctx.logger.error({ err }, 'structural proposal generation failed');
+      reply.code(500).send({
+        error: 'structural proposal generation failed',
         message: err instanceof Error ? err.message : String(err),
       });
     }

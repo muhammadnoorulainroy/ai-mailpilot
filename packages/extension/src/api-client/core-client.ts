@@ -56,6 +56,8 @@ import type {
   FolderPlanResponse,
   GenerateProposalsRequest,
   GenerateProposalsResponse,
+  GenerateStructuralProposalsRequest,
+  GenerateStructuralProposalsResponse,
   ProposalListResponse,
   ApplyProposalResponse,
   DismissProposalResponse,
@@ -289,6 +291,16 @@ export class CoreClient {
   /** Run discovery and persist new category proposals for review. */
   generateProposals(req: GenerateProposalsRequest): Promise<GenerateProposalsResponse> {
     return this.request('/categories/proposals/generate', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
+  }
+
+  /** Generate structural (merge/retire) proposals from category health and add them to the review queue. */
+  generateStructuralProposals(
+    req: GenerateStructuralProposalsRequest,
+  ): Promise<GenerateStructuralProposalsResponse> {
+    return this.request('/categories/proposals/generate-structural', {
       method: 'POST',
       body: JSON.stringify(req),
     });

@@ -21,6 +21,8 @@ import { ResidualDiscoveryService } from '../src/services/residual-discovery-ser
 import { DiscoveryProposalService } from '../src/services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from '../src/services/discovery-proposal-orchestrator.js';
 import { CategoryCentroidRebuildService } from '../src/services/category-centroid-rebuild-service.js';
+import { CategoryHealthService } from '../src/services/category-health-service.js';
+import { StructuralProposalService } from '../src/services/structural-proposal-service.js';
 import { registerCategoryRoutes } from '../src/routes/categories.js';
 
 const MODEL = 'bge-m3';
@@ -122,6 +124,8 @@ async function buildApp() {
     getConfig,
     silentLogger,
   );
+  const health = new CategoryHealthService(categories, embeddings);
+  const structural = new StructuralProposalService(categories, proposals, health, silentLogger);
 
   const ctx = {
     config: { llm: { embeddingModel: MODEL, generationModel: 'qwen' } },
@@ -136,13 +140,13 @@ async function buildApp() {
       categoryProposals: proposals,
       discoveryAudit: audit,
     },
-    services: { discoveryProposal: orchestrator },
+    services: { discoveryProposal: orchestrator, structuralProposal: structural },
   } as unknown as AppContext;
 
   const app = Fastify();
   await registerCategoryRoutes(app, ctx);
   await app.ready();
-  return { app, accountId: acc.id, categories };
+  return { app, accountId: acc.id, categories, emails };
 }
 
 describe('discovery proposal routes', () => {
@@ -242,6 +246,146 @@ describe('discovery proposal routes', () => {
       payload: { accountId },
     });
     expect(twice.statusCode).toBe(409);
+
+    await app.close();
+  });
+});
+
+/**
+ * Set up two overlapping active auto categories (a merge pair, the larger surviving) plus one empty
+ * active auto category (a retire candidate), so a structural generate run has one of each to make.
+ */
+function seedStructuralFixture(
+  categories: CategoryRepository,
+  emails: EmailRepository,
+  accountId: string,
+) {
+  const src = categories.create({
+    accountId,
+    label: 'Src',
+    source: 'auto',
+    status: 'active',
+    canonicalKey: 'src',
+  });
+  const dst = categories.create({
+    accountId,
+    label: 'Dst',
+    source: 'auto',
+    status: 'active',
+    canonicalKey: 'dst',
+  });
+  const empty = categories.create({
+    accountId,
+    label: 'Empty',
+    source: 'auto',
+    status: 'active',
+    canonicalKey: 'empty',
+  });
+  // Near-identical stored centroids so health reports high overlap between src and dst.
+  categories.saveCentroid(src.id, MODEL, axis(0), 1);
+  categories.saveCentroid(dst.id, MODEL, axis(0), 2);
+  // dst is the larger category (2 members vs 1), so it survives as the merge target.
+  const members: Array<[string, string]> = [
+    [src.id, 'src-a'],
+    [dst.id, 'dst-a'],
+    [dst.id, 'dst-b'],
+  ];
+  for (const [categoryId, messageId] of members) {
+    emails.upsertBatch([
+      { messageId, accountId, folder: 'INBOX', subject: 's', fromAddr: 'a@b.com' },
+    ]);
+    categories.addAutoAssignments(accountId, [
+      {
+        messageId,
+        accountId,
+        categoryId,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: Date.now(),
+        method: 'embed',
+      },
+    ]);
+  }
+  return { src, dst, empty };
+}
+
+describe('structural proposal generation route', () => {
+  it('returns 400 for an invalid body and 404 for a missing account', async () => {
+    const { app, accountId } = await buildApp();
+
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: {},
+    });
+    expect(bad.statusCode).toBe(400);
+
+    const missing = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId: 'nope' },
+    });
+    expect(missing.statusCode).toBe(404);
+
+    await app.close();
+  });
+
+  it('creates merge and retire proposals, lists them with correct kind, and does not duplicate on re-run', async () => {
+    const { app, accountId, categories, emails } = await buildApp();
+    const { src, dst, empty } = seedStructuralFixture(categories, emails, accountId);
+
+    const gen = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId },
+    });
+    expect(gen.statusCode).toBe(200);
+    const created = gen.json().created as Array<{
+      kind: string;
+      categoryId: string;
+      sourceCategoryId: string | null;
+    }>;
+    const merge = created.find((c) => c.kind === 'merge')!;
+    const retire = created.find((c) => c.kind === 'retire')!;
+    expect(merge).toMatchObject({ categoryId: dst.id, sourceCategoryId: src.id });
+    expect(retire).toMatchObject({ categoryId: empty.id, sourceCategoryId: null });
+
+    // The generated structural proposals appear in the review queue with their kind and source.
+    const list = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${accountId}`,
+    });
+    const pending = list.json().proposals as Array<{
+      kind: string;
+      categoryId: string;
+      sourceCategoryId: string | null;
+    }>;
+    expect(pending.find((p) => p.kind === 'merge')).toMatchObject({
+      categoryId: dst.id,
+      sourceCategoryId: src.id,
+    });
+    expect(pending.find((p) => p.kind === 'retire')).toMatchObject({
+      categoryId: empty.id,
+      sourceCategoryId: null,
+    });
+    const structuralCount = pending.filter((p) => p.kind !== 'new_category').length;
+    expect(structuralCount).toBe(2);
+
+    // A second run re-proposes nothing (the pending suppression keys already cover both).
+    const again = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId },
+    });
+    expect(again.json().created).toHaveLength(0);
+    expect(again.json().skippedExisting).toBeGreaterThanOrEqual(2);
+    const listAgain = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${accountId}`,
+    });
+    expect(
+      (listAgain.json().proposals as Array<{ kind: string }>).filter((p) => p.kind !== 'new_category'),
+    ).toHaveLength(2);
 
     await app.close();
   });
