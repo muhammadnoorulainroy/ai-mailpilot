@@ -2302,6 +2302,9 @@ function attachHandlers(): void {
     const sel = e.target as HTMLSelectElement;
     state.currentAccountId = sel.value;
     state.priority = null;
+    // Close the review queue so the previous account's proposals can never be shown or acted on
+    // under the new account; reopening re-fetches for the current account.
+    closeProposalsModal();
     void loadChatForAccount(sel.value);
     void refreshDashboard();
     if (!$('panel-priority').hidden) void loadPriority();
