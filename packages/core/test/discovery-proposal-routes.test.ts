@@ -149,7 +149,7 @@ async function buildApp() {
   const app = Fastify();
   await registerCategoryRoutes(app, ctx);
   await app.ready();
-  return { app, accountId: acc.id, categories, emails };
+  return { app, accountId: acc.id, accounts, categories, emails };
 }
 
 describe('discovery proposal routes', () => {
@@ -391,6 +391,40 @@ describe('structural proposal generation route', () => {
     expect(
       (listAgain.json().proposals as Array<{ kind: string }>).filter((p) => p.kind !== 'new_category'),
     ).toHaveLength(2);
+
+    await app.close();
+  });
+
+  it('skips structural generation for discovery-ineligible personal accounts', async () => {
+    const { app, accounts, categories } = await buildApp();
+    const personal = accounts.create({ address: 'personal@x.com', kind: 'personal' });
+    categories.create({
+      accountId: personal.id,
+      label: 'Empty Personal',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'empty_personal',
+    });
+
+    const gen = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId: personal.id },
+    });
+    expect(gen.statusCode).toBe(200);
+    expect(gen.json()).toMatchObject({
+      runId: '',
+      created: [],
+      mergeCandidates: 0,
+      retireCandidates: 0,
+      skippedExisting: 0,
+    });
+
+    const list = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${personal.id}`,
+    });
+    expect(list.json().proposals).toHaveLength(0);
 
     await app.close();
   });

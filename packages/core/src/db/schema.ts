@@ -644,4 +644,36 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 21,
+    name: 'category_proposals_suggested_key_backfill',
+    up: (db) => {
+      const table = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'category_proposals'",
+        )
+        .get();
+      if (!table) return;
+
+      const cols = db.prepare('PRAGMA table_info(category_proposals)').all() as Array<{
+        name: string;
+      }>;
+      const hasSuggestedKey = cols.some((c) => c.name === 'suggested_key');
+      if (!hasSuggestedKey) {
+        db.exec(
+          `ALTER TABLE category_proposals ADD COLUMN suggested_key TEXT NOT NULL DEFAULT '';`,
+        );
+      }
+
+      // Older real DBs had v19 recorded before suggested_key existed. Backfill resolved
+      // new-category proposals so re-runs still suppress already applied/dismissed suggestions.
+      db.exec(`
+        UPDATE category_proposals
+           SET suggested_key = canonical_key
+         WHERE kind = 'new_category'
+           AND suggested_key = ''
+           AND canonical_key <> ''
+      `);
+    },
+  },
 ];

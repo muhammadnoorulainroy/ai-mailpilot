@@ -132,9 +132,19 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
       return;
     }
-    if (!ctx.repos.accounts.findById(parsed.data.accountId)) {
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
       reply.code(404).send({ error: 'account not found' });
       return;
+    }
+    if (!ctx.repos.accounts.isDiscoveryEligible(account.id)) {
+      return {
+        runId: '',
+        created: [],
+        mergeCandidates: 0,
+        retireCandidates: 0,
+        skippedExisting: 0,
+      };
     }
     const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
     try {
