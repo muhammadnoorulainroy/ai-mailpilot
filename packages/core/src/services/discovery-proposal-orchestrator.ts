@@ -61,7 +61,10 @@ export interface GenerateResult {
 /** A pending proposal as shown in the review queue, without the heavy centroid or member list. */
 export interface ProposalView {
   id: string;
+  kind: ProposalKind;
   categoryId: string;
+  /** The absorbed source for a merge; null for every other kind. Lets the queue label a merge safely. */
+  sourceCategoryId: string | null;
   label: string;
   description: string;
   proposedCount: number;
@@ -278,7 +281,9 @@ export class DiscoveryProposalOrchestrator {
   listPending(accountId: string): ProposalView[] {
     return this.proposals.listPending(accountId).map((p) => ({
       id: p.id,
+      kind: p.kind,
       categoryId: p.categoryId,
+      sourceCategoryId: p.sourceCategoryId,
       label: p.label,
       description: p.description,
       proposedCount: p.proposedCount,

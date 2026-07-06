@@ -354,10 +354,16 @@ export interface CategoryEmailListResponse {
   emails: CategoryEmailDto[];
 }
 
+/** What kind of change a proposal represents. Structural kinds are split, merge, and retire. */
+export type ProposalKindDto = 'new_category' | 'split' | 'merge' | 'retire';
+
 /** A pending category proposal awaiting review, with its deterministic quality metrics. */
 export interface ProposalDto {
   id: string;
+  kind: ProposalKindDto;
   categoryId: string;
+  /** The absorbed source for a merge; null for every other kind. */
+  sourceCategoryId: string | null;
   label: string;
   description: string;
   proposedCount: number;
@@ -415,8 +421,9 @@ export interface ProposalActionRequest {
   accountId: string;
 }
 
-/** Result of applying a proposal: the promoted category and how many emails it took. */
+/** Result of applying a proposal: the affected category and how many emails moved. */
 export interface ApplyProposalResponse {
+  kind: ProposalKindDto;
   categoryId: string;
   label: string;
   assigned: number;

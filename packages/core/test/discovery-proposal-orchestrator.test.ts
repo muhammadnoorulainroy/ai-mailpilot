@@ -1016,3 +1016,30 @@ describe('DiscoveryProposalOrchestrator.dismiss (structural kinds)', () => {
     );
   });
 });
+
+describe('DiscoveryProposalOrchestrator.listPending kind-awareness', () => {
+  it('reports kind and sourceCategoryId for new_category, merge, and retire proposals', async () => {
+    const h = harness();
+    // new_category proposals from a normal generate run.
+    await h.orchestrator.generate(h.accountId, MODEL, 'qwen');
+    // A structural merge (target survives, source absorbed) and a retire, constructed directly.
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    const merge = mergeProposal(h, source.id, target.id, 'src', 'dst');
+    const empty = activeCategory(h, 'Empty', 'empty');
+    const retire = retireProposal(h, empty.id, 'empty');
+
+    const pending = h.orchestrator.listPending(h.accountId);
+    const byId = new Map(pending.map((p) => [p.id, p]));
+
+    // new_category rows carry kind='new_category' and no source.
+    const newCats = pending.filter((p) => p.kind === 'new_category');
+    expect(newCats.length).toBeGreaterThanOrEqual(2);
+    expect(newCats.every((p) => p.sourceCategoryId === null)).toBe(true);
+
+    // merge carries kind='merge' with sourceCategoryId set to the absorbed category.
+    expect(byId.get(merge.id)).toMatchObject({ kind: 'merge', sourceCategoryId: source.id });
+    // retire carries kind='retire' with a null source.
+    expect(byId.get(retire.id)).toMatchObject({ kind: 'retire', sourceCategoryId: null });
+  });
+});
