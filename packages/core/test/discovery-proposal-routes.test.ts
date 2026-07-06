@@ -11,6 +11,7 @@ import { EMBEDDING_DIM } from '../src/db/schema.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { CategoryRepository } from '../src/repositories/category-repository.js';
 import { CategoryProposalRepository } from '../src/repositories/category-proposal-repository.js';
+import { CategoryAliasRepository } from '../src/repositories/category-alias-repository.js';
 import { DiscoveryAuditRepository } from '../src/repositories/discovery-audit-repository.js';
 import { EmailRepository } from '../src/repositories/email-repository.js';
 import { EmbeddingRepository } from '../src/repositories/embedding-repository.js';
@@ -112,6 +113,7 @@ async function buildApp() {
     silentLogger,
   );
   const centroidRebuild = new CategoryCentroidRebuildService(categories, embeddings, silentLogger);
+  const aliases = new CategoryAliasRepository(db);
   const orchestrator = new DiscoveryProposalOrchestrator(
     db,
     proposals,
@@ -121,6 +123,7 @@ async function buildApp() {
     accounts,
     audit,
     centroidRebuild,
+    aliases,
     getConfig,
     silentLogger,
   );

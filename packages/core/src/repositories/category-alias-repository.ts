@@ -31,6 +31,7 @@ export class CategoryAliasRepository {
     findByAlias: Statement<unknown[]>;
     listForCategory: Statement<unknown[]>;
     remove: Statement<unknown[]>;
+    reassign: Statement<unknown[]>;
   };
 
   constructor(db: Database) {
@@ -40,6 +41,9 @@ export class CategoryAliasRepository {
          SELECT ?, ?, ?, ?, ?, ?
          WHERE EXISTS (SELECT 1 FROM categories WHERE id = ? AND account_id = ?)
          ON CONFLICT (account_id, normalized_alias) DO NOTHING`,
+      ),
+      reassign: db.prepare(
+        'UPDATE category_aliases SET category_id = ? WHERE account_id = ? AND category_id = ?',
       ),
       findByAlias: db.prepare(
         `SELECT c.id, c.account_id, c.label, c.description, c.source, c.canonical_key, c.status,
@@ -57,23 +61,38 @@ export class CategoryAliasRepository {
     };
   }
 
-  /** Record an alias for a category. A duplicate normalized alias in the account is ignored. */
+  /**
+   * Record an alias for a category. A duplicate normalized alias in the account (owned by this or any
+   * other category) is ignored. Returns whether a new alias row was inserted, so callers can tell a
+   * fresh alias from a skipped conflict/duplicate.
+   */
   addAlias(
     accountId: string,
     categoryId: string,
     alias: string,
     source: AliasSource = 'auto',
-  ): void {
-    this.stmts.insert.run(
-      accountId,
-      categoryId,
-      alias,
-      normalizeForMatch(alias),
-      source,
-      Date.now(),
-      categoryId,
-      accountId,
+  ): boolean {
+    return (
+      this.stmts.insert.run(
+        accountId,
+        categoryId,
+        alias,
+        normalizeForMatch(alias),
+        source,
+        Date.now(),
+        categoryId,
+        accountId,
+      ).changes > 0
     );
+  }
+
+  /**
+   * Move every alias of one category to another within the same account, returning the count moved.
+   * A normalized alias is unique per account, so re-pointing never collides with the target's own
+   * aliases. Used by a merge to keep the surviving target answering to the absorbed source's names.
+   */
+  reassign(accountId: string, fromCategoryId: string, toCategoryId: string): number {
+    return this.stmts.reassign.run(toCategoryId, accountId, fromCategoryId).changes;
   }
 
   /** Resolve free text to the category it is an alias of, or null. Case and accent insensitive. */

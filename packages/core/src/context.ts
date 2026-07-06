@@ -181,6 +181,7 @@ export function buildContext(): AppContext {
       repos.accounts,
       repos.discoveryAudit,
       categoryCentroidRebuild,
+      repos.categoryAliases,
       () => config.llm,
       logger,
     ),

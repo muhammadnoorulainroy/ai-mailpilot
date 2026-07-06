@@ -12,6 +12,7 @@ import { EMBEDDING_DIM } from '../src/db/schema.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { CategoryRepository } from '../src/repositories/category-repository.js';
 import { CategoryProposalRepository } from '../src/repositories/category-proposal-repository.js';
+import { CategoryAliasRepository } from '../src/repositories/category-alias-repository.js';
 import { DiscoveryAuditRepository } from '../src/repositories/discovery-audit-repository.js';
 import { EmailRepository } from '../src/repositories/email-repository.js';
 import { EmbeddingRepository } from '../src/repositories/embedding-repository.js';
@@ -116,6 +117,7 @@ function harness(answer: string = NAMING, centroidRebuildOverride?: CategoryCent
   const centroidRebuild =
     centroidRebuildOverride ??
     new CategoryCentroidRebuildService(categories, embeddings, silentLogger);
+  const aliases = new CategoryAliasRepository(db);
   const orchestrator = new DiscoveryProposalOrchestrator(
     db,
     proposals,
@@ -125,6 +127,7 @@ function harness(answer: string = NAMING, centroidRebuildOverride?: CategoryCent
     accounts,
     audit,
     centroidRebuild,
+    aliases,
     getConfig,
     silentLogger,
   );
@@ -138,6 +141,7 @@ function harness(answer: string = NAMING, centroidRebuildOverride?: CategoryCent
     emails,
     embeddings,
     centroidRebuild,
+    aliases,
     orchestrator,
     accountId: acc.id,
     setAnswer: (a: string) => {
@@ -763,6 +767,106 @@ describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
     expect(assignmentsFor(h.db, h.accountId, 'r-1')).toEqual([
       { category_id: source.id, assigned_by: 'auto', method: 'embed' },
     ]);
+  });
+
+  it('transfers the source label and canonical key to the target as aliases on merge', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Old Receipts', 'old_receipts');
+    const target = activeCategory(h, 'Receipts', 'receipts');
+    const p = mergeProposal(h, source.id, target.id, 'old_receipts', 'receipts');
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    expect(h.categories.findById(source.id)).toBeNull();
+    // The surviving target now answers to the absorbed source's label and canonical key.
+    expect(h.aliases.findByAlias(h.accountId, 'Old Receipts')!.id).toBe(target.id);
+    expect(h.aliases.findByAlias(h.accountId, 'old_receipts')!.id).toBe(target.id);
+  });
+
+  it('transfers a canonical key that normalizes differently from the label as its own alias', () => {
+    const h = harness();
+    // The key 'receipts_2' normalizes to 'receipts 2', distinct from the label 'Receipts'
+    // ('receipts'), so this pins the canonical-key half of the transfer independent of the label.
+    const source = activeCategory(h, 'Receipts', 'receipts_2');
+    const target = activeCategory(h, 'Dst', 'dst');
+    const p = mergeProposal(h, source.id, target.id, 'receipts_2', 'dst');
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    expect(h.categories.findById(source.id)).toBeNull();
+    expect(h.aliases.findByAlias(h.accountId, 'Receipts')!.id).toBe(target.id);
+    // The distinct canonical key resolves to the target on its own alias row.
+    expect(h.aliases.findByAlias(h.accountId, 'receipts_2')!.id).toBe(target.id);
+  });
+
+  it('re-points the source existing aliases to the target on merge', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    // A French alias the user gave the source before the merge.
+    h.aliases.addAlias(h.accountId, source.id, 'Factures', 'user');
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    expect(h.aliases.findByAlias(h.accountId, 'Factures')!.id).toBe(target.id);
+    expect(h.aliases.listForCategory(target.id)).toContain('Factures');
+  });
+
+  it('does not create duplicate aliases when the source label and key normalize the same', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    // 'Src' (label) and 'src' (canonical key) normalize to the same alias, so only one row is kept.
+    const srcAliases = h.aliases
+      .listForCategory(target.id)
+      .filter((a) => a.toLowerCase() === 'src');
+    expect(srcAliases).toHaveLength(1);
+    expect(h.aliases.findByAlias(h.accountId, 'src')!.id).toBe(target.id);
+  });
+
+  it('skips a conflicting alias without failing the merge', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    // A third active category already owns the source label as an alias.
+    const other = activeCategory(h, 'Other', 'other');
+    h.aliases.addAlias(h.accountId, other.id, 'Src', 'user');
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    const result = h.orchestrator.apply(h.accountId, p.id);
+
+    // The merge still applies; the conflicting alias keeps its original owner (not corrupted).
+    expect(result.kind).toBe('merge');
+    expect(h.categories.findById(source.id)).toBeNull();
+    expect(h.proposals.findById(p.id)!.status).toBe('applied');
+    expect(h.aliases.findByAlias(h.accountId, 'Src')!.id).toBe(other.id);
+  });
+
+  it('rolls back the alias transfer when the merge fails', () => {
+    const throwing = {
+      rebuild() {
+        throw new Error('rebuild boom');
+      },
+    } as unknown as CategoryCentroidRebuildService;
+    const h = harness(NAMING, throwing);
+    const source = activeCategory(h, 'Src', 'src');
+    const target = activeCategory(h, 'Dst', 'dst');
+    h.aliases.addAlias(h.accountId, source.id, 'Factures', 'user');
+    const p = mergeProposal(h, source.id, target.id, 'src', 'dst');
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow(/rebuild boom/);
+    // Everything rolled back: the source still exists, its alias still points at the source, and the
+    // target gained no transferred alias.
+    expect(h.categories.findById(source.id)).not.toBeNull();
+    expect(h.aliases.findByAlias(h.accountId, 'Factures')!.id).toBe(source.id);
+    expect(h.aliases.listForCategory(target.id)).not.toContain('Factures');
+    expect(h.aliases.listForCategory(target.id)).not.toContain('Src');
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
   });
 
   it('merge blocks when the source category is missing and writes nothing', () => {

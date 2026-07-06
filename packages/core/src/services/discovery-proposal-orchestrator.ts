@@ -20,6 +20,7 @@ import type { CategoryRepository } from '../repositories/category-repository.js'
 import type { AccountRepository } from '../repositories/account-repository.js';
 import type { EmailRepository } from '../repositories/email-repository.js';
 import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
+import type { CategoryAliasRepository } from '../repositories/category-alias-repository.js';
 import type {
   CategoryProposal,
   CategoryProposalRepository,
@@ -112,6 +113,7 @@ export class DiscoveryProposalOrchestrator {
     private accounts: AccountRepository,
     private audit: DiscoveryAuditRepository,
     private centroidRebuild: CategoryCentroidRebuildService,
+    private aliases: CategoryAliasRepository,
     private getConfig: () => LlmConfig,
     private logger: Logger,
   ) {}
@@ -466,24 +468,42 @@ export class DiscoveryProposalOrchestrator {
       throw new ProposalApplyError(`merge source is ${source.status}, not active`, 409);
     }
 
-    const run = this.db.transaction((): { reassigned: number; rebuild: RebuildResult } => {
-      const reassigned = this.categories.mergeInto(source.id, target.id).reassigned;
-      // Rebuild the target centroid from its merged members with Phase 3.1 semantics: user-confirmed
-      // members dominate, and auto members are used only when the target has zero user members. When
-      // there is too little trusted data the rebuild leaves the existing target centroid untouched
-      // (a safe fallback, not a failure), so the merge still applies.
-      const rebuild = this.centroidRebuild.rebuild(
-        accountId,
-        target.id,
-        proposal.embeddingModelId,
-        {
-          allowAutoFallback: true,
-        },
-      );
-      this.proposals.markApplied(proposal.id);
-      return { reassigned, rebuild };
-    });
-    const { reassigned, rebuild } = run();
+    const run = this.db.transaction(
+      (): {
+        reassigned: number;
+        rebuild: RebuildResult;
+        aliasesMoved: number;
+        skippedAliases: string[];
+      } => {
+        // Keep the target answering to the absorbed source's names so a re-run does not re-propose the
+        // merged-away purpose and categorization still recognizes its mail. Re-point the source's own
+        // aliases (conflict-free, a normalized alias is unique per account), then add the source label
+        // and canonical key as target aliases. An alias another category already owns is skipped and
+        // logged, never a merge failure. This runs before mergeInto deletes the source (which would
+        // otherwise cascade the source aliases away).
+        const aliasesMoved = this.aliases.reassign(accountId, source.id, target.id);
+        const skippedAliases: string[] = [];
+        for (const text of [source.label, source.canonicalKey]) {
+          if (!this.aliases.addAlias(accountId, target.id, text, 'auto')) skippedAliases.push(text);
+        }
+        const reassigned = this.categories.mergeInto(source.id, target.id).reassigned;
+        // Rebuild the target centroid from its merged members with Phase 3.1 semantics: user-confirmed
+        // members dominate, and auto members are used only when the target has zero user members. When
+        // there is too little trusted data the rebuild leaves the existing target centroid untouched
+        // (a safe fallback, not a failure), so the merge still applies.
+        const rebuild = this.centroidRebuild.rebuild(
+          accountId,
+          target.id,
+          proposal.embeddingModelId,
+          {
+            allowAutoFallback: true,
+          },
+        );
+        this.proposals.markApplied(proposal.id);
+        return { reassigned, rebuild, aliasesMoved, skippedAliases };
+      },
+    );
+    const { reassigned, rebuild, aliasesMoved, skippedAliases } = run();
 
     this.logger.info(
       {
@@ -493,6 +513,8 @@ export class DiscoveryProposalOrchestrator {
         targetId: target.id,
         reassigned,
         centroidRebuild: rebuild.status,
+        aliasesMoved,
+        skippedAliases,
       },
       'discovery proposal: merged categories',
     );
