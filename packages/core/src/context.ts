@@ -37,6 +37,9 @@ import { TopicDiscoveryService } from './services/topic-discovery-service.js';
 import { ResidualDiscoveryService } from './services/residual-discovery-service.js';
 import { DiscoveryProposalService } from './services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from './services/discovery-proposal-orchestrator.js';
+import { CategoryCentroidRebuildService } from './services/category-centroid-rebuild-service.js';
+import { CategoryHealthService } from './services/category-health-service.js';
+import { StructuralProposalService } from './services/structural-proposal-service.js';
 import { TriageOrchestrator } from './services/triage-orchestrator.js';
 import { TriageService } from './services/triage-service.js';
 import { getLogger } from './util/logger.js';
@@ -69,6 +72,9 @@ export interface Services {
   topicDiscovery: TopicDiscoveryService;
   categoryImprovement: CategoryImprovementService;
   discoveryProposal: DiscoveryProposalOrchestrator;
+  categoryCentroidRebuild: CategoryCentroidRebuildService;
+  categoryHealth: CategoryHealthService;
+  structuralProposal: StructuralProposalService;
   category: CategoryOrchestrator;
   llmCategorize: LlmCategorizeOrchestrator;
   correction: CorrectionService;
@@ -129,6 +135,12 @@ export function buildContext(): AppContext {
     () => config.llm,
     logger,
   );
+  const categoryCentroidRebuild = new CategoryCentroidRebuildService(
+    repos.categories,
+    repos.embeddings,
+    logger,
+  );
+  const categoryHealth = new CategoryHealthService(repos.categories, repos.embeddings);
 
   const services: Services = {
     embedding: new EmbeddingOrchestrator(
@@ -168,6 +180,20 @@ export function buildContext(): AppContext {
       discoveryProposalService,
       repos.accounts,
       repos.discoveryAudit,
+      categoryCentroidRebuild,
+      repos.categoryAliases,
+      () => config.llm,
+      logger,
+    ),
+    categoryCentroidRebuild,
+    categoryHealth,
+    structuralProposal: new StructuralProposalService(
+      repos.categories,
+      repos.categoryProposals,
+      categoryHealth,
+      repos.embeddings,
+      repos.emails,
+      llm,
       () => config.llm,
       logger,
     ),

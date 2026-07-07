@@ -8,6 +8,7 @@ import type {
   AccountListResponse,
   AccountResponse,
   CreateAccountRequest,
+  UpdateAccountDiscoveryRequest,
   PushEmailsRequest,
   PushEmailsResponse,
   IngestAttachmentsRequest,
@@ -56,6 +57,8 @@ import type {
   FolderPlanResponse,
   GenerateProposalsRequest,
   GenerateProposalsResponse,
+  GenerateStructuralProposalsRequest,
+  GenerateStructuralProposalsResponse,
   ProposalListResponse,
   ApplyProposalResponse,
   DismissProposalResponse,
@@ -218,6 +221,14 @@ export class CoreClient {
     return this.request(`/accounts/${id}`);
   }
 
+  /** Opt an account in or out of AI discovery and category cleanup. */
+  updateAccountDiscovery(id: string, req: UpdateAccountDiscoveryRequest): Promise<AccountResponse> {
+    return this.request(`/accounts/${id}/discovery`, {
+      method: 'PATCH',
+      body: JSON.stringify(req),
+    });
+  }
+
   /** Push a batch of emails to the server. */
   pushEmails(req: PushEmailsRequest): Promise<PushEmailsResponse> {
     return this.request('/emails/push', { method: 'POST', body: JSON.stringify(req) });
@@ -289,6 +300,16 @@ export class CoreClient {
   /** Run discovery and persist new category proposals for review. */
   generateProposals(req: GenerateProposalsRequest): Promise<GenerateProposalsResponse> {
     return this.request('/categories/proposals/generate', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
+  }
+
+  /** Generate structural (merge/retire) proposals from category health and add them to the review queue. */
+  generateStructuralProposals(
+    req: GenerateStructuralProposalsRequest,
+  ): Promise<GenerateStructuralProposalsResponse> {
+    return this.request('/categories/proposals/generate-structural', {
       method: 'POST',
       body: JSON.stringify(req),
     });

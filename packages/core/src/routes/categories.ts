@@ -8,6 +8,7 @@ import type { AppContext } from '../context.js';
 import type { CategoryRow } from '../repositories/category-repository.js';
 import type { CategoryDto } from '@ai-mailpilot/shared';
 import { discoveryProvider } from '../services/discovery-guard.js';
+import { ProposalApplyError } from '../services/discovery-proposal-orchestrator.js';
 
 const DiscoverBody = z.object({
   accountId: z.string().min(1),
@@ -21,6 +22,17 @@ const ListQuery = z.object({
 
 const ProposalActionBody = z.object({
   accountId: z.string().min(1),
+});
+
+const GenerateStructuralBody = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
+});
+
+const RebuildCentroidBody = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
+  allowAutoFallback: z.boolean().optional(),
 });
 
 const CategorizeRunBody = z.object({
@@ -111,6 +123,46 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
     }
   });
 
+  // Generate structural (merge/retire/split) proposals from category health metrics and add them to
+  // the review queue. Writes only proposal rows; applies nothing and never runs on its own.
+  app.post('/categories/proposals/generate-structural', async (req, reply) => {
+    const parsed = GenerateStructuralBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    if (!ctx.repos.accounts.isDiscoveryEligible(account.id)) {
+      return {
+        runId: '',
+        created: [],
+        mergeCandidates: 0,
+        retireCandidates: 0,
+        splitCandidates: 0,
+        skippedExisting: 0,
+      };
+    }
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    const generationModelId = ctx.config.llm.generationModel;
+    try {
+      return await ctx.services.structuralProposal.generate(
+        parsed.data.accountId,
+        embeddingModelId,
+        generationModelId,
+      );
+    } catch (err) {
+      ctx.logger.error({ err }, 'structural proposal generation failed');
+      reply.code(500).send({
+        error: 'structural proposal generation failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
   // The pending review queue for an account.
   app.get('/categories/proposals', async (req, reply) => {
     const parsed = ListQuery.safeParse(req.query);
@@ -136,6 +188,11 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
     try {
       return ctx.services.discoveryProposal.apply(parsed.data.accountId, req.params.id);
     } catch (err) {
+      // A structural block/precondition failure carries its own status (409 conflict or 404 missing).
+      if (err instanceof ProposalApplyError) {
+        reply.code(err.httpStatus).send({ error: err.message });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       if (message.includes('not found')) {
         reply.code(404).send({ error: message });
@@ -173,6 +230,33 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       ctx.logger.error({ err, proposalId: req.params.id }, 'dismiss proposal failed');
       reply.code(500).send({ error: 'failed to dismiss proposal', message });
     }
+  });
+
+  // Recompute a category's centroid from its user-confirmed member embeddings. Centroid-only: it
+  // changes no label, status, or assignment. Leaves the centroid unchanged when trusted data is thin.
+  app.post<{ Params: { id: string } }>('/categories/:id/rebuild-centroid', async (req, reply) => {
+    const parsed = RebuildCentroidBody.safeParse(req.body);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const category = ctx.repos.categories.findById(req.params.id);
+    if (!category || category.accountId !== parsed.data.accountId) {
+      reply.code(404).send({ error: 'category not found for this account' });
+      return;
+    }
+    const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    return ctx.services.categoryCentroidRebuild.rebuild(
+      parsed.data.accountId,
+      req.params.id,
+      embeddingModelId,
+      { allowAutoFallback: parsed.data.allowAutoFallback },
+    );
   });
 
   app.post('/categories/improve/suggest', async (req, reply) => {

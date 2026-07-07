@@ -449,9 +449,19 @@
         <section class="modal-body" id="proposals-body"></section>
         <footer class="modal-header">
           <div class="row-between">
-            <button class="btn btn-ghost btn-sm" id="proposals-generate" type="button">
-              Find new categories
-            </button>
+            <div class="proposal-generate-actions">
+              <button class="btn btn-ghost btn-sm" id="proposals-generate" type="button">
+                Find new categories
+              </button>
+              <button
+                class="btn btn-ghost btn-sm"
+                id="proposals-generate-structural"
+                type="button"
+                title="Look for categories that overlap or are empty, and suggest merging or retiring them. Nothing changes until you approve it."
+              >
+                Find cleanup suggestions
+              </button>
+            </div>
             <button class="btn btn-primary btn-sm" id="proposals-close" type="button">Done</button>
           </div>
         </footer>

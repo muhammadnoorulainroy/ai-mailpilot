@@ -42,3 +42,6 @@ test-profile/
 # Local scratch and debug scripts
 db-inspect.mjs
 trace_claim.mjs
+
+# Local knowledge vault (not part of the shipped codebase)
+obsidian-vault/

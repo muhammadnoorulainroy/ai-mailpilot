@@ -14,6 +14,8 @@ export interface Account {
   address: string;
   displayName: string | null;
   kind: AccountKind;
+  excludeFromDiscovery: boolean;
+  discoveryEnabled: boolean;
   createdAt: number;
 }
 
@@ -22,6 +24,7 @@ export interface CreateAccountInput {
   address: string;
   displayName?: string;
   kind: AccountKind;
+  discoveryEnabled?: boolean;
 }
 
 interface AccountDbRow {
@@ -29,6 +32,7 @@ interface AccountDbRow {
   address: string;
   display_name: string | null;
   kind: AccountKind;
+  exclude_from_discovery: number;
   created_at: number;
 }
 
@@ -49,16 +53,21 @@ export class AccountRepository {
   constructor(db: Database) {
     this.stmts = {
       insert: db.prepare(
-        'INSERT INTO accounts (id, address, display_name, kind, created_at) VALUES (?, ?, ?, ?, ?)',
+        `INSERT INTO accounts
+           (id, address, display_name, kind, exclude_from_discovery, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       ),
       findById: db.prepare(
-        'SELECT id, address, display_name, kind, created_at FROM accounts WHERE id = ?',
+        `SELECT id, address, display_name, kind, exclude_from_discovery, created_at
+           FROM accounts WHERE id = ?`,
       ),
       findByAddress: db.prepare(
-        'SELECT id, address, display_name, kind, created_at FROM accounts WHERE address = ?',
+        `SELECT id, address, display_name, kind, exclude_from_discovery, created_at
+           FROM accounts WHERE address = ?`,
       ),
       list: db.prepare(
-        'SELECT id, address, display_name, kind, created_at FROM accounts ORDER BY created_at ASC',
+        `SELECT id, address, display_name, kind, exclude_from_discovery, created_at
+           FROM accounts ORDER BY created_at ASC`,
       ),
       delete: db.prepare('DELETE FROM accounts WHERE id = ?'),
       updateMeta: db.prepare('UPDATE accounts SET display_name = ?, kind = ? WHERE id = ?'),
@@ -71,11 +80,14 @@ export class AccountRepository {
 
   /** Inserts a new account with a generated id and returns it. */
   create(input: CreateAccountInput): Account {
+    const discoveryEnabled = input.discoveryEnabled ?? input.kind !== 'personal';
     const account: Account = {
       id: randomUUID(),
       address: input.address,
       displayName: input.displayName ?? null,
       kind: input.kind,
+      excludeFromDiscovery: !discoveryEnabled,
+      discoveryEnabled,
       createdAt: Date.now(),
     };
     this.stmts.insert.run(
@@ -83,6 +95,7 @@ export class AccountRepository {
       account.address,
       account.displayName,
       account.kind,
+      account.excludeFromDiscovery ? 1 : 0,
       account.createdAt,
     );
     return account;
@@ -120,25 +133,36 @@ export class AccountRepository {
     if (!existing) return this.create(input);
 
     const displayName = input.displayName ?? existing.displayName;
+    const becamePersonal = existing.kind !== 'personal' && input.kind === 'personal';
     if (existing.displayName !== displayName || existing.kind !== input.kind) {
       this.stmts.updateMeta.run(displayName, input.kind, existing.id);
-      return { ...existing, displayName, kind: input.kind };
     }
-    return existing;
+    if (input.discoveryEnabled !== undefined) {
+      this.setExcludeFromDiscovery(existing.id, !input.discoveryEnabled);
+    } else if (becamePersonal) {
+      this.setExcludeFromDiscovery(existing.id, true);
+    }
+    return this.findById(existing.id) ?? { ...existing, displayName, kind: input.kind };
   }
 
-  /** Whether discovery may run for this account. Personal and excluded accounts are ineligible. */
+  /** Whether discovery may run for this account. Personal accounts can opt in explicitly. */
   isDiscoveryEligible(id: string): boolean {
     const row = this.stmts.selectEligibility.get(id) as
       | { kind: AccountKind; exclude_from_discovery: number }
       | undefined;
     if (!row) return false;
-    return row.kind !== 'personal' && row.exclude_from_discovery === 0;
+    return row.exclude_from_discovery === 0;
   }
 
   /** Set whether this account is excluded from discovery. */
   setExcludeFromDiscovery(id: string, excluded: boolean): void {
     this.stmts.setExclude.run(excluded ? 1 : 0, id);
+  }
+
+  /** Positive user-facing update: enable or disable AI discovery for this account. */
+  setDiscoveryEnabled(id: string, enabled: boolean): Account | null {
+    this.setExcludeFromDiscovery(id, !enabled);
+    return this.findById(id);
   }
 
   /** Maps a raw database row to an Account, converting snake_case columns. */
@@ -148,6 +172,8 @@ export class AccountRepository {
       address: row.address,
       displayName: row.display_name,
       kind: row.kind,
+      excludeFromDiscovery: row.exclude_from_discovery !== 0,
+      discoveryEnabled: row.exclude_from_discovery === 0,
       createdAt: row.created_at,
     };
   }

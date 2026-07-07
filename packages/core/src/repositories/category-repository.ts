@@ -144,11 +144,13 @@ export class CategoryRepository {
     updateCentroidIndex: Statement<unknown[]>;
     insertCentroidVec: Statement<unknown[]>;
     insertCentroidIndex: Statement<unknown[]>;
+    deleteCentroidIndex: Statement<unknown[]>;
     listCentroids: Statement<unknown[]>;
     getCentroidByCategory: Statement<unknown[]>;
     selectUserAssigned: Statement<unknown[]>;
     selectAssigned: Statement<unknown[]>;
     selectLlmProtected: Statement<unknown[]>;
+    selectCategoryMembersByAssignedBy: Statement<unknown[]>;
     listAutoWithUserFlag: Statement<unknown[]>;
     selectECByEmail: Statement<unknown[]>;
     selectECByEmailWithLabel: Statement<unknown[]>;
@@ -250,6 +252,9 @@ export class CategoryRepository {
         `INSERT INTO category_embedding_index (rowid, category_id, model_id, email_count, updated_at)
          VALUES (?, ?, ?, ?, ?)`,
       ),
+      deleteCentroidIndex: db.prepare(
+        'DELETE FROM category_embedding_index WHERE category_id = ? AND model_id = ?',
+      ),
       listCentroids: db.prepare(
         `SELECT cei.category_id, c.label, ce.embedding, cei.email_count
            FROM category_embeddings ce
@@ -268,6 +273,9 @@ export class CategoryRepository {
       ),
       selectAssigned: db.prepare(
         'SELECT DISTINCT message_id FROM email_categories WHERE account_id = ?',
+      ),
+      selectCategoryMembersByAssignedBy: db.prepare(
+        'SELECT message_id FROM email_categories WHERE account_id = ? AND category_id = ? AND assigned_by = ?',
       ),
       selectLlmProtected: db.prepare(
         "SELECT DISTINCT message_id FROM email_categories WHERE account_id = ? AND (assigned_by = 'user' OR method IN ('llm', 'gate'))",
@@ -674,6 +682,41 @@ export class CategoryRepository {
   }
 
   /**
+   * Move one email's AUTO assignment from sourceCategoryId to targetCategoryId, preserving its
+   * confidence, method, and assigned_at. Only the auto (message, account, source) row is touched, so
+   * a user assignment is never moved and the email keeps its memberships in every other category.
+   * Returns true when a row moved (false when the email had no auto assignment on the source, or a
+   * target row already existed). Used by split apply to relocate a source member into its child.
+   */
+  moveAutoAssignment(
+    messageId: string,
+    accountId: string,
+    sourceCategoryId: string,
+    targetCategoryId: string,
+  ): boolean {
+    const tx = this.db.transaction((): boolean => {
+      const inserted = this.db
+        .prepare(
+          `INSERT INTO email_categories (message_id, account_id, category_id, confidence, assigned_by, assigned_at, method)
+             SELECT message_id, account_id, ?, confidence, assigned_by, assigned_at, method
+               FROM email_categories
+              WHERE message_id = ? AND account_id = ? AND category_id = ? AND assigned_by = 'auto'
+           ON CONFLICT (message_id, account_id, category_id) DO NOTHING`,
+        )
+        .run(targetCategoryId, messageId, accountId, sourceCategoryId).changes;
+      if (inserted === 0) return false;
+      this.db
+        .prepare(
+          `DELETE FROM email_categories
+            WHERE message_id = ? AND account_id = ? AND category_id = ? AND assigned_by = 'auto'`,
+        )
+        .run(messageId, accountId, sourceCategoryId);
+      return true;
+    });
+    return tx();
+  }
+
+  /**
    * Emails assigned to a category, newest first. Joins on the emails table so the UI can
    * render subject, from, and date without extra round-trips.
    */
@@ -778,11 +821,21 @@ export class CategoryRepository {
 
   /**
    * Move every email assigned to sourceId over to targetId, then delete the source
-   * category. If an email is already in the target, keep the higher confidence
-   * assignment. Runs in a single transaction so a half-merge can't leak.
+   * category. When an email is already in the target, USER provenance dominates: the
+   * winning row is the user one if either side is user, otherwise the higher-confidence
+   * row; the winner's method and assigned_at are kept, and confidence is the max. A user
+   * assignment is never overwritten by an auto one, even at equal or higher auto confidence.
+   * Runs in a single transaction so a half-merge can't leak.
    */
   mergeInto(sourceId: string, targetId: string): { reassigned: number } {
     if (sourceId === targetId) return { reassigned: 0 };
+
+    // The incoming (source) row wins the conflict when it is a user row over an auto row,
+    // or when both share provenance and it has strictly higher confidence. Otherwise the
+    // existing (target) row is kept. Reused for assigned_by, method, and assigned_at.
+    const takeExcluded =
+      `(excluded.assigned_by = 'user' AND assigned_by = 'auto') ` +
+      `OR (excluded.assigned_by = assigned_by AND excluded.confidence > confidence)`;
 
     const tx = this.db.transaction((src: string, dst: string): number => {
       const moved = this.db
@@ -792,12 +845,9 @@ export class CategoryRepository {
                FROM email_categories
               WHERE category_id = ?
            ON CONFLICT (message_id, account_id, category_id) DO UPDATE SET
-             assigned_by = CASE WHEN excluded.confidence > confidence
-                                THEN excluded.assigned_by ELSE assigned_by END,
-             method = CASE WHEN excluded.confidence > confidence
-                                THEN excluded.method ELSE method END,
-             assigned_at = CASE WHEN excluded.confidence > confidence
-                                THEN excluded.assigned_at ELSE assigned_at END,
+             assigned_by = CASE WHEN ${takeExcluded} THEN excluded.assigned_by ELSE assigned_by END,
+             method = CASE WHEN ${takeExcluded} THEN excluded.method ELSE method END,
+             assigned_at = CASE WHEN ${takeExcluded} THEN excluded.assigned_at ELSE assigned_at END,
              confidence = MAX(confidence, excluded.confidence)`,
         )
         .run(dst, src).changes;
@@ -811,7 +861,9 @@ export class CategoryRepository {
 
   /**
    * The single primary category for every categorized email in an account, used to file
-   * each email into exactly one folder. Primary is highest confidence, then a user
+   * each email into exactly one folder. Only ACTIVE categories are considered, so a retired
+   * or suggested category is never chosen as a primary (and an email whose only assignments
+   * are to non-active categories does not appear). Primary is highest confidence, then a user
    * assignment over auto, then label order as a stable tiebreak.
    */
   getPrimaryCategoryPerEmail(accountId: string): Array<{ messageId: string; categoryId: string }> {
@@ -825,7 +877,7 @@ export class CategoryRepository {
                   ) AS rn
              FROM email_categories ec
              JOIN categories c ON c.id = ec.category_id
-            WHERE ec.account_id = ?
+            WHERE ec.account_id = ? AND c.status = 'active'
          ) WHERE rn = 1`,
       )
       .all(accountId) as Array<{ message_id: string; category_id: string }>;
@@ -849,6 +901,16 @@ export class CategoryRepository {
   getUserAssignedMessageIds(accountId: string): Set<string> {
     const rows = this.stmts.selectUserAssigned.all(accountId) as Array<{ message_id: string }>;
     return new Set(rows.map((r) => r.message_id));
+  }
+
+  /** Message ids assigned to one category with the given provenance ('user' or 'auto'). */
+  listCategoryMemberIds(accountId: string, categoryId: string, assignedBy: AssignedBy): string[] {
+    const rows = this.stmts.selectCategoryMembersByAssignedBy.all(
+      accountId,
+      categoryId,
+      assignedBy,
+    ) as Array<{ message_id: string }>;
+    return rows.map((r) => r.message_id);
   }
 
   /** Message ids that already have any category. Skip set for the incremental fast pass. */
@@ -1000,6 +1062,14 @@ export class CategoryRepository {
       this.stmts.insertCentroidIndex.run(rowid, categoryId, canonical, emailCount, now);
     });
     tx();
+  }
+
+  /**
+   * Remove a category's stored centroid for a model. The companion `category_embeddings` vec row is
+   * cascaded by the v4 `trg_category_embedding_index_delete` trigger. A no-op when none is stored.
+   */
+  deleteCentroid(categoryId: string, modelId: string): void {
+    this.stmts.deleteCentroidIndex.run(categoryId, canonicalizeModelId(modelId));
   }
 
   /** All category centroids for an account and model, with their labels and email counts. */

@@ -20,12 +20,21 @@ import type { CategoryRepository } from '../repositories/category-repository.js'
 import type { AccountRepository } from '../repositories/account-repository.js';
 import type { EmailRepository } from '../repositories/email-repository.js';
 import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
-import type { CategoryProposalRepository } from '../repositories/category-proposal-repository.js';
+import type { CategoryAliasRepository } from '../repositories/category-alias-repository.js';
+import type {
+  CategoryProposal,
+  CategoryProposalRepository,
+  ProposalKind,
+} from '../repositories/category-proposal-repository.js';
 import type {
   AcceptedProposal,
   DiscoveryProposalService,
   RejectedProposal,
 } from './discovery-proposal-service.js';
+import type {
+  CategoryCentroidRebuildService,
+  RebuildResult,
+} from './category-centroid-rebuild-service.js';
 
 /** A newly persisted proposal, returned from a generate run. */
 export interface GeneratedProposal {
@@ -50,10 +59,25 @@ export interface GenerateResult {
   rejected: RejectedProposal[];
 }
 
+/** One child category of a split proposal, as shown in the review queue. */
+export interface ProposalChildView {
+  label: string;
+  description: string;
+  proposedCount: number;
+  cohesion: number;
+  separation: number;
+  confidence: number;
+  /** A few representative subjects from this child, for review only. */
+  sampleSubjects?: string[];
+}
+
 /** A pending proposal as shown in the review queue, without the heavy centroid or member list. */
 export interface ProposalView {
   id: string;
+  kind: ProposalKind;
   categoryId: string;
+  /** The absorbed source for a merge; null for every other kind. Lets the queue label a merge safely. */
+  sourceCategoryId: string | null;
   label: string;
   description: string;
   proposedCount: number;
@@ -61,15 +85,39 @@ export interface ProposalView {
   separation: number;
   confidence: number;
   evidence: string[];
+  /** For a split proposal, the child categories it would create; absent for every other kind. */
+  children?: ProposalChildView[];
+  /** Live assigned-email count on the primary affected category (retire target, merge/split source). */
+  affectedCount?: number;
+  /** How many user-confirmed assignments the change would affect, so the reviewer sees the impact. */
+  userImpactCount?: number;
   createdAt: number;
 }
 
-/** Result of applying a proposal. */
+/** Result of applying a proposal. `assigned` is the members assigned (new_category) or reassigned (merge), 0 for retire. */
 export interface ApplyResult {
+  kind: ProposalKind;
   categoryId: string;
   label: string;
   assigned: number;
 }
+
+/**
+ * A precondition or block failure during apply, carrying the HTTP status the route should return.
+ * A block is a client-actionable conflict (409) or a missing referent (404), never a 500.
+ */
+export class ProposalApplyError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: number,
+  ) {
+    super(message);
+    this.name = 'ProposalApplyError';
+  }
+}
+
+const CHILD_SAMPLE_SUBJECT_LIMIT = 3;
+const CHILD_SAMPLE_LOOKUP_LIMIT = 30;
 
 function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
@@ -85,6 +133,8 @@ export class DiscoveryProposalOrchestrator {
     private proposalService: DiscoveryProposalService,
     private accounts: AccountRepository,
     private audit: DiscoveryAuditRepository,
+    private centroidRebuild: CategoryCentroidRebuildService,
+    private aliases: CategoryAliasRepository,
     private getConfig: () => LlmConfig,
     private logger: Logger,
   ) {}
@@ -250,26 +300,70 @@ export class DiscoveryProposalOrchestrator {
     };
   }
 
-  /** Pending proposals for the review queue, strongest first. */
+  /** Representative non-empty subjects for a split child, preserving child member order. */
+  private childSampleSubjects(accountId: string, memberIds: string[]): string[] {
+    if (memberIds.length === 0) return [];
+    const ids = memberIds.slice(0, CHILD_SAMPLE_LOOKUP_LIMIT);
+    const byId = new Map(this.emails.summariesByIds(accountId, ids).map((s) => [s.messageId, s]));
+    const samples: string[] = [];
+    for (const id of ids) {
+      const subject = byId.get(id)?.subject?.trim();
+      if (!subject) continue;
+      samples.push(subject);
+      if (samples.length >= CHILD_SAMPLE_SUBJECT_LIMIT) break;
+    }
+    return samples;
+  }
+
+  /** Pending proposals for the review queue, strongest first, enriched with per-kind review detail. */
   listPending(accountId: string): ProposalView[] {
-    return this.proposals.listPending(accountId).map((p) => ({
-      id: p.id,
-      categoryId: p.categoryId,
-      label: p.label,
-      description: p.description,
-      proposedCount: p.proposedCount,
-      cohesion: p.cohesion,
-      separation: p.separation,
-      confidence: p.confidence,
-      evidence: p.evidence,
-      createdAt: p.createdAt,
-    }));
+    return this.proposals.listPending(accountId).map((p) => {
+      // The primary category the change affects: the deleted source for a merge, otherwise the target
+      // (retire) or the source being split. Its live counts tell the reviewer the real impact.
+      const affectedId = p.kind === 'merge' ? p.sourceCategoryId : p.categoryId;
+      const affectedCount =
+        affectedId !== null ? this.categories.countEmails(affectedId) : undefined;
+      const userImpactCount =
+        p.kind === 'new_category' || affectedId === null
+          ? undefined
+          : this.categories.listCategoryMemberIds(accountId, affectedId, 'user').length;
+      const children =
+        p.kind === 'split'
+          ? this.proposals.listChildren(p.id).map((c) => ({
+              label: c.label,
+              description: c.description,
+              proposedCount: c.proposedCount,
+              cohesion: c.cohesion,
+              separation: c.separation,
+              confidence: c.confidence,
+              sampleSubjects: this.childSampleSubjects(accountId, c.memberIds),
+            }))
+          : undefined;
+      return {
+        id: p.id,
+        kind: p.kind,
+        categoryId: p.categoryId,
+        sourceCategoryId: p.sourceCategoryId,
+        label: p.label,
+        description: p.description,
+        proposedCount: p.proposedCount,
+        cohesion: p.cohesion,
+        separation: p.separation,
+        confidence: p.confidence,
+        evidence: p.evidence,
+        children,
+        affectedCount,
+        userImpactCount,
+        createdAt: p.createdAt,
+      };
+    });
   }
 
   /**
-   * Approve a proposal: promote its suggested category to active, seed the centroid from the accepted
-   * cluster, and assign the members that are still uncategorized. User-assigned mail and members that
-   * already carry any assignment are left untouched, so no existing label is removed.
+   * Approve a pending proposal, branching on its kind. `new_category` promotes and assigns (2c);
+   * `retire` and `merge` apply the structural change (3.3); `split` is blocked until its safe write
+   * semantics ship. Every kind marks the proposal applied only after its change commits, and every
+   * block check throws before any write so a blocked apply leaves the proposal pending and retry-safe.
    */
   apply(accountId: string, proposalId: string): ApplyResult {
     const proposal = this.proposals.findById(proposalId);
@@ -279,6 +373,28 @@ export class DiscoveryProposalOrchestrator {
     if (proposal.status !== 'pending') {
       throw new Error(`proposal is ${proposal.status}, not pending`);
     }
+    switch (proposal.kind) {
+      case 'new_category':
+        return this.applyNewCategory(accountId, proposal);
+      case 'retire':
+        return this.applyRetire(accountId, proposal);
+      case 'merge':
+        return this.applyMerge(accountId, proposal);
+      case 'split':
+        return this.applySplit(accountId, proposal);
+      default: {
+        const exhaustive: never = proposal.kind;
+        throw new Error(`unsupported proposal kind: ${String(exhaustive)}`);
+      }
+    }
+  }
+
+  /**
+   * new_category (2c): promote the suggested category to active, seed the centroid from the accepted
+   * cluster, and assign the members that are still uncategorized. User-assigned mail and members that
+   * already carry any assignment are left untouched, so no existing label is removed.
+   */
+  private applyNewCategory(accountId: string, proposal: CategoryProposal): ApplyResult {
     const category = this.categories.findById(proposal.categoryId);
     if (!category) {
       throw new Error('proposal category no longer exists');
@@ -317,21 +433,309 @@ export class DiscoveryProposalOrchestrator {
           })),
         );
       }
-      this.proposals.markApplied(proposalId);
+      this.proposals.markApplied(proposal.id);
     });
     run();
 
     this.logger.info(
-      { accountId, proposalId, categoryId: proposal.categoryId, assigned: toAssign.length },
+      {
+        accountId,
+        proposalId: proposal.id,
+        categoryId: proposal.categoryId,
+        assigned: toAssign.length,
+      },
       'discovery proposal: applied',
     );
-    return { categoryId: proposal.categoryId, label: proposal.label, assigned: toAssign.length };
+    return {
+      kind: 'new_category',
+      categoryId: proposal.categoryId,
+      label: proposal.label,
+      assigned: toAssign.length,
+    };
   }
 
   /**
-   * Dismiss a proposal (soft): retire its suggested category and mark the proposal dismissed. The
-   * proposal row and the retired category keep the canonical key, so a re-run suppresses the same
-   * purpose. No active category, assignment, or user correction is touched.
+   * retire (3.3): hide the target category, keeping its rows and history. Blocks (zero writes) when
+   * the target is missing or not active, or when it has any user-confirmed member. This commit has no
+   * confirmation path, so a category the user has filed mail into is never silently retired; the user
+   * must resolve those assignments first.
+   */
+  private applyRetire(accountId: string, proposal: CategoryProposal): ApplyResult {
+    const category = this.categories.findById(proposal.categoryId);
+    if (!category || category.accountId !== accountId) {
+      throw new ProposalApplyError('retire target category not found', 404);
+    }
+    if (category.status !== 'active') {
+      throw new ProposalApplyError(`retire target is ${category.status}, not active`, 409);
+    }
+    const userMembers = this.categories.listCategoryMemberIds(accountId, category.id, 'user');
+    if (userMembers.length > 0) {
+      throw new ProposalApplyError(
+        `cannot retire "${category.label}": it has ${userMembers.length} user-confirmed assignment(s); confirmation is required`,
+        409,
+      );
+    }
+    // The proposal was generated for an empty category, but a categorize/refine run may have
+    // auto-assigned mail into it since. Re-check total emptiness against live state so retiring never
+    // hides mail the category has gained; the user should refresh the queue and re-run cleanup.
+    const totalMembers = this.categories.countEmails(category.id);
+    if (totalMembers !== 0) {
+      throw new ProposalApplyError(
+        `cannot retire "${category.label}": it is no longer empty (${totalMembers} assigned email(s)); refresh the queue and re-run cleanup`,
+        409,
+      );
+    }
+
+    const run = this.db.transaction(() => {
+      this.categories.retire(category.id);
+      this.proposals.markApplied(proposal.id);
+    });
+    run();
+
+    this.logger.info(
+      { accountId, proposalId: proposal.id, categoryId: category.id },
+      'discovery proposal: retired category',
+    );
+    return { kind: 'retire', categoryId: category.id, label: category.label, assigned: 0 };
+  }
+
+  /**
+   * merge (3.3): absorb the source category into the target with the hardened, user-dominant
+   * mergeInto (rows move preserving provenance, then the source is deleted), then rebuild the target
+   * centroid from its now-merged members so future categorization learns from the combined category.
+   * Blocks (zero writes) when either category is missing or not active, when the proposal carries no
+   * source, or when source and target are the same. The move, the centroid rebuild, and markApplied
+   * run in ONE transaction, so if the rebuild throws the whole merge rolls back and the proposal stays
+   * pending; the proposal is marked applied only after all three succeed.
+   */
+  private applyMerge(accountId: string, proposal: CategoryProposal): ApplyResult {
+    const target = this.categories.findById(proposal.categoryId);
+    if (!target || target.accountId !== accountId) {
+      throw new ProposalApplyError('merge target category not found', 404);
+    }
+    if (proposal.sourceCategoryId === null) {
+      throw new ProposalApplyError('merge proposal has no source category', 409);
+    }
+    const source = this.categories.findById(proposal.sourceCategoryId);
+    if (!source || source.accountId !== accountId) {
+      throw new ProposalApplyError('merge source category not found', 404);
+    }
+    if (source.id === target.id) {
+      throw new ProposalApplyError('merge source and target must differ', 409);
+    }
+    if (target.status !== 'active') {
+      throw new ProposalApplyError(`merge target is ${target.status}, not active`, 409);
+    }
+    if (source.status !== 'active') {
+      throw new ProposalApplyError(`merge source is ${source.status}, not active`, 409);
+    }
+
+    const run = this.db.transaction(
+      (): {
+        reassigned: number;
+        rebuild: RebuildResult;
+        aliasesMoved: number;
+        skippedAliases: string[];
+        dismissedSiblings: number;
+      } => {
+        // Keep the target answering to the absorbed source's names so a re-run does not re-propose the
+        // merged-away purpose and categorization still recognizes its mail. Re-point the source's own
+        // aliases (conflict-free, a normalized alias is unique per account), then add the source label
+        // and canonical key as target aliases. An alias another category already owns is skipped and
+        // logged, never a merge failure. This runs before mergeInto deletes the source (which would
+        // otherwise cascade the source aliases away).
+        const aliasesMoved = this.aliases.reassign(accountId, source.id, target.id);
+        const skippedAliases: string[] = [];
+        for (const text of [source.label, source.canonicalKey]) {
+          if (!this.aliases.addAlias(accountId, target.id, text, 'auto')) skippedAliases.push(text);
+        }
+        const reassigned = this.categories.mergeInto(source.id, target.id).reassigned;
+        // Rebuild the target centroid from its merged members with Phase 3.1 semantics: user-confirmed
+        // members dominate, and auto members are used only when the target has zero user members. When
+        // there is too little trusted data the rebuild leaves the existing target centroid untouched
+        // (a safe fallback, not a failure), so the merge still applies.
+        const rebuild = this.centroidRebuild.rebuild(
+          accountId,
+          target.id,
+          proposal.embeddingModelId,
+          {
+            allowAutoFallback: true,
+          },
+        );
+        // Other pending merge proposals that named this now-deleted source can never apply
+        // (source_category_id is non-cascading, so their source is gone) and would linger in the queue
+        // as failing cards; dismiss them in this same transaction so the queue self-heals atomically.
+        const dismissedSiblings = this.proposals.dismissPendingMergesForSource(
+          accountId,
+          source.id,
+          proposal.id,
+        );
+        this.proposals.markApplied(proposal.id);
+        return { reassigned, rebuild, aliasesMoved, skippedAliases, dismissedSiblings };
+      },
+    );
+    const { reassigned, rebuild, aliasesMoved, skippedAliases, dismissedSiblings } = run();
+
+    this.logger.info(
+      {
+        accountId,
+        proposalId: proposal.id,
+        sourceId: source.id,
+        targetId: target.id,
+        reassigned,
+        centroidRebuild: rebuild.status,
+        aliasesMoved,
+        skippedAliases,
+        dismissedSiblings,
+      },
+      'discovery proposal: merged categories',
+    );
+    return { kind: 'merge', categoryId: target.id, label: target.label, assigned: reassigned };
+  }
+
+  /**
+   * split (3.3): turn the source category into its proposed child categories, relocating only the
+   * source's AUTO members into the child that lists them. Conservative and user-safe:
+   *  - Blocks (zero writes) when the source is missing/not active, fewer than two children are
+   *    proposed, or any child label/key collides with an existing or sibling category.
+   *  - Moves an auto member only when exactly one child lists it and its email still exists; a member
+   *    listed by two children is ambiguous and stays on the source. User assignments are never moved
+   *    (moveAutoAssignment only touches auto rows), so no user-confirmed label is destroyed or hidden.
+   *  - Retires the source only when nothing remains on it after the moves; otherwise it stays active
+   *    (a leftover auto member or any user member keeps it visible) and its stale mixed centroid is
+   *    rebuilt from the remaining members, or dropped when there is too little data to rebuild.
+   * Child creation, centroid saves, moves, the optional retire or source-centroid refresh, and
+   * markApplied run in ONE transaction: any failure rolls the whole split back and the proposal stays
+   * pending.
+   */
+  private applySplit(accountId: string, proposal: CategoryProposal): ApplyResult {
+    const source = this.categories.findById(proposal.categoryId);
+    if (!source || source.accountId !== accountId) {
+      throw new ProposalApplyError('split source category not found', 404);
+    }
+    if (source.status !== 'active') {
+      throw new ProposalApplyError(`split source is ${source.status}, not active`, 409);
+    }
+    const children = this.proposals.listChildren(proposal.id);
+    if (children.length < 2) {
+      throw new ProposalApplyError('split needs at least two child categories', 409);
+    }
+
+    // Collision check BEFORE any write: a child label or canonical key must not already exist as a
+    // category, and the children must not collide with each other. A collision blocks the whole split
+    // (zero writes); the user must resolve it and re-propose rather than have it partially apply.
+    const seenKeys = new Set<string>();
+    const seenLabels = new Set<string>();
+    for (const child of children) {
+      if (
+        this.categories.findByCanonicalKey(accountId, child.canonicalKey) ||
+        this.categories.findByLabel(accountId, child.label) ||
+        seenKeys.has(child.canonicalKey) ||
+        seenLabels.has(child.label)
+      ) {
+        throw new ProposalApplyError(
+          `split child "${child.label}" collides with an existing or duplicate category; resolve it and re-propose`,
+          409,
+        );
+      }
+      seenKeys.add(child.canonicalKey);
+      seenLabels.add(child.label);
+    }
+
+    // Eligible move set per child: an auto member of the source whose email still exists, listed by
+    // exactly one child. A message listed by two children is ambiguous and is left on the source.
+    const autoOnSource = new Set(
+      this.categories.listCategoryMemberIds(accountId, source.id, 'auto'),
+    );
+    const allChildMemberIds = children.flatMap((c) => c.memberIds);
+    const existing = this.emails.existingIds(accountId, allChildMemberIds);
+    const childCount = new Map<string, number>();
+    for (const id of allChildMemberIds) {
+      childCount.set(id, (childCount.get(id) ?? 0) + 1);
+    }
+    const moveSets = children.map((child) =>
+      child.memberIds.filter(
+        (id) => autoOnSource.has(id) && existing.has(id) && childCount.get(id) === 1,
+      ),
+    );
+
+    const run = this.db.transaction(() => {
+      const createdIds: string[] = [];
+      let moved = 0;
+      children.forEach((child, i) => {
+        const created = this.categories.create({
+          accountId,
+          label: child.label,
+          description: child.description,
+          source: 'auto',
+          status: 'active',
+          canonicalKey: child.canonicalKey,
+        });
+        createdIds.push(created.id);
+        this.categories.saveCentroid(
+          created.id,
+          child.embeddingModelId,
+          child.centroid,
+          child.proposedCount,
+        );
+        for (const messageId of moveSets[i]!) {
+          if (this.categories.moveAutoAssignment(messageId, accountId, source.id, created.id)) {
+            moved += 1;
+          }
+        }
+      });
+      // The source keeps whatever did not move: user-confirmed members and any ambiguous auto members.
+      // If nothing remains, retire it. Otherwise its stored centroid is now a stale mix of the
+      // split-out groups, so refresh it from the remaining members (Phase 3.1: user members dominate,
+      // auto only as a fallback when there are none); when there is too little data to rebuild, drop
+      // the stale centroid so the source stops attracting mail to the old broad bucket. This runs in
+      // the same transaction, so a failure here rolls the whole split back and the proposal stays pending.
+      let sourceRetired = false;
+      let sourceCentroid: 'retired' | 'rebuilt' | 'removed' = 'rebuilt';
+      if (this.categories.countEmails(source.id) === 0) {
+        this.categories.retire(source.id);
+        sourceRetired = true;
+        sourceCentroid = 'retired';
+      } else {
+        const rebuild = this.centroidRebuild.rebuild(
+          accountId,
+          source.id,
+          proposal.embeddingModelId,
+          {
+            allowAutoFallback: true,
+          },
+        );
+        if (rebuild.status !== 'rebuilt') {
+          this.categories.deleteCentroid(source.id, proposal.embeddingModelId);
+          sourceCentroid = 'removed';
+        }
+      }
+      this.proposals.markApplied(proposal.id);
+      return { createdIds, moved, sourceRetired, sourceCentroid };
+    });
+    const { createdIds, moved, sourceRetired, sourceCentroid } = run();
+
+    this.logger.info(
+      {
+        accountId,
+        proposalId: proposal.id,
+        sourceId: source.id,
+        childIds: createdIds,
+        moved,
+        sourceRetired,
+        sourceCentroid,
+      },
+      'discovery proposal: split applied',
+    );
+    return { kind: 'split', categoryId: source.id, label: source.label, assigned: moved };
+  }
+
+  /**
+   * Dismiss a pending proposal (soft), branching on kind. For `new_category` the linked SUGGESTED
+   * category is retired (it exists only for this proposal). For a structural proposal (split / merge /
+   * retire) the target is a LIVE active category the user still uses, so dismiss touches no category or
+   * assignment at all; it only records the dismissal. Every kind keeps the proposal row and its
+   * suppression key so a re-run does not re-propose the same purpose.
    */
   dismiss(accountId: string, proposalId: string): { dismissed: true; categoryId: string } {
     const proposal = this.proposals.findById(proposalId);
@@ -341,18 +745,20 @@ export class DiscoveryProposalOrchestrator {
     if (proposal.status !== 'pending') {
       throw new Error(`proposal is ${proposal.status}, not pending`);
     }
-    const category = this.categories.findById(proposal.categoryId);
 
     const run = this.db.transaction(() => {
-      if (category && category.status === 'suggested') {
-        this.categories.retire(proposal.categoryId);
+      if (proposal.kind === 'new_category') {
+        const category = this.categories.findById(proposal.categoryId);
+        if (category && category.status === 'suggested') {
+          this.categories.retire(proposal.categoryId);
+        }
       }
       this.proposals.markDismissed(proposalId);
     });
     run();
 
     this.logger.info(
-      { accountId, proposalId, categoryId: proposal.categoryId },
+      { accountId, proposalId, kind: proposal.kind, categoryId: proposal.categoryId },
       'discovery proposal: dismissed',
     );
     return { dismissed: true, categoryId: proposal.categoryId };

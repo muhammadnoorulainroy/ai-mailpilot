@@ -24,6 +24,8 @@ export interface AccountDto {
   address: string;
   displayName: string | null;
   kind: AccountKind;
+  /** Whether topic discovery, category proposals, and cleanup suggestions may inspect this account. */
+  discoveryEnabled: boolean;
   createdAt: number;
 }
 
@@ -32,6 +34,8 @@ export interface CreateAccountRequest {
   address: string;
   displayName?: string;
   kind: AccountKind;
+  /** Defaults to false for personal accounts and true for work/institutional accounts. */
+  discoveryEnabled?: boolean;
 }
 
 /** Response listing all accounts. */
@@ -42,6 +46,11 @@ export interface AccountListResponse {
 /** Response wrapping a single account. */
 export interface AccountResponse {
   account: AccountDto;
+}
+
+/** Request to opt an account in or out of AI discovery and category cleanup. */
+export interface UpdateAccountDiscoveryRequest {
+  discoveryEnabled: boolean;
 }
 
 /** Metadata for a mailbox folder. */
@@ -354,10 +363,28 @@ export interface CategoryEmailListResponse {
   emails: CategoryEmailDto[];
 }
 
+/** What kind of change a proposal represents. Structural kinds are split, merge, and retire. */
+export type ProposalKindDto = 'new_category' | 'split' | 'merge' | 'retire';
+
+/** One child category a split proposal would create, with its deterministic metrics. */
+export interface ProposalChildDto {
+  label: string;
+  description: string;
+  proposedCount: number;
+  cohesion: number;
+  separation: number;
+  confidence: number;
+  /** A few representative subjects from this child, for review only. */
+  sampleSubjects?: string[];
+}
+
 /** A pending category proposal awaiting review, with its deterministic quality metrics. */
 export interface ProposalDto {
   id: string;
+  kind: ProposalKindDto;
   categoryId: string;
+  /** The absorbed source for a merge; null for every other kind. */
+  sourceCategoryId: string | null;
   label: string;
   description: string;
   proposedCount: number;
@@ -365,6 +392,12 @@ export interface ProposalDto {
   separation: number;
   confidence: number;
   evidence: string[];
+  /** For a split proposal, the child categories it would create; absent for other kinds. */
+  children?: ProposalChildDto[];
+  /** Live assigned-email count on the primary affected category (retire target, merge/split source). */
+  affectedCount?: number;
+  /** Count of user-confirmed assignments the change would affect, so the reviewer sees the impact. */
+  userImpactCount?: number;
   createdAt: number;
 }
 
@@ -410,13 +443,40 @@ export interface GenerateProposalsResponse {
   rejected: RejectedProposalDto[];
 }
 
+/** Request to generate structural (merge/retire) proposals from category health metrics. */
+export interface GenerateStructuralProposalsRequest {
+  accountId: string;
+  embeddingModelId?: string;
+}
+
+/** One structural proposal produced by a generate-structural run. */
+export interface GeneratedStructuralProposalDto {
+  id: string;
+  kind: 'merge' | 'retire' | 'split';
+  categoryId: string;
+  sourceCategoryId: string | null;
+  suppressionKey: string;
+  label: string;
+}
+
+/** Result of a structural generate run: what was created and why others were skipped. */
+export interface GenerateStructuralProposalsResponse {
+  runId: string;
+  created: GeneratedStructuralProposalDto[];
+  mergeCandidates: number;
+  retireCandidates: number;
+  splitCandidates: number;
+  skippedExisting: number;
+}
+
 /** Request to apply or dismiss a proposal: the account that owns it. */
 export interface ProposalActionRequest {
   accountId: string;
 }
 
-/** Result of applying a proposal: the promoted category and how many emails it took. */
+/** Result of applying a proposal: the affected category and how many emails moved. */
 export interface ApplyProposalResponse {
+  kind: ProposalKindDto;
   categoryId: string;
   label: string;
   assigned: number;

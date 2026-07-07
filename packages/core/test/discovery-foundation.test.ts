@@ -97,6 +97,137 @@ describe('v18 backfill and canonical_key', () => {
   });
 });
 
+describe('v21 category proposal suggested_key backfill', () => {
+  it('repairs DBs that applied v19 before suggested_key existed', () => {
+    const db = new BetterSqlite3(':memory:');
+    db.exec(`
+      CREATE TABLE migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      CREATE TABLE category_proposals (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        category_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        cluster_index INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        description TEXT NOT NULL,
+        canonical_key TEXT NOT NULL,
+        embedding_model_id TEXT NOT NULL,
+        centroid BLOB NOT NULL,
+        member_ids TEXT NOT NULL,
+        proposed_count INTEGER NOT NULL,
+        cohesion REAL NOT NULL,
+        separation REAL NOT NULL,
+        confidence REAL NOT NULL,
+        evidence TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        applied_at INTEGER,
+        dismissed_at INTEGER,
+        kind TEXT NOT NULL DEFAULT 'new_category',
+        source_category_id TEXT,
+        suppression_key TEXT NOT NULL DEFAULT ''
+      );
+    `);
+    const migrationInsert = db.prepare(
+      'INSERT INTO migrations (version, name, applied_at) VALUES (?, ?, ?)',
+    );
+    for (const m of migrations.filter((migration) => migration.version <= 20)) {
+      migrationInsert.run(m.version, m.name, 1000 + m.version);
+    }
+
+    const proposalInsert = db.prepare(`
+      INSERT INTO category_proposals (
+        id, account_id, category_id, run_id, cluster_index, label, description, canonical_key,
+        embedding_model_id, centroid, member_ids, proposed_count, cohesion, separation,
+        confidence, evidence, status, created_at, kind, source_category_id, suppression_key
+      ) VALUES (?, 'acc', ?, 'run', 0, ?, 'desc', ?, 'bge-m3', X'0000', '[]', 0, 0, 0, 0, '[]', ?, 1, ?, ?, ?)
+    `);
+    proposalInsert.run(
+      'new-proposal',
+      'suggested-cat',
+      'Invoices',
+      'finance_invoices',
+      'dismissed',
+      'new_category',
+      null,
+      '',
+    );
+    proposalInsert.run(
+      'merge-proposal',
+      'target-cat',
+      'Merge',
+      'developer',
+      'dismissed',
+      'merge',
+      'source-cat',
+      'merge:source-cat:target-cat',
+    );
+
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 21))).toEqual([21]);
+
+    const cols = db.prepare('PRAGMA table_info(category_proposals)').all() as Array<{
+      name: string;
+    }>;
+    expect(cols.map((c) => c.name)).toContain('suggested_key');
+    const rows = db
+      .prepare('SELECT id, suggested_key FROM category_proposals ORDER BY id')
+      .all() as Array<{ id: string; suggested_key: string }>;
+    expect(rows).toEqual([
+      { id: 'merge-proposal', suggested_key: '' },
+      { id: 'new-proposal', suggested_key: 'finance_invoices' },
+    ]);
+    db.close();
+  });
+});
+
+describe('v22 personal discovery opt-in default', () => {
+  it('excludes already-synced personal accounts without changing work accounts', () => {
+    const db = new BetterSqlite3(':memory:');
+    db.exec(`
+      CREATE TABLE migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      CREATE TABLE accounts (
+        id TEXT PRIMARY KEY,
+        address TEXT NOT NULL,
+        display_name TEXT,
+        kind TEXT NOT NULL,
+        exclude_from_discovery INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO accounts
+        (id, address, kind, exclude_from_discovery, created_at)
+      VALUES
+        ('personal', 'p@example.com', 'personal', 0, 1),
+        ('work', 'w@example.com', 'work', 0, 1),
+        ('already-off', 'off@example.com', 'personal', 1, 1);
+    `);
+    const migrationInsert = db.prepare(
+      'INSERT INTO migrations (version, name, applied_at) VALUES (?, ?, ?)',
+    );
+    for (const m of migrations.filter((migration) => migration.version <= 21)) {
+      migrationInsert.run(m.version, m.name, 1000 + m.version);
+    }
+
+    expect(runMigrations(db, migrations)).toEqual([22]);
+
+    const rows = db.prepare('SELECT id, exclude_from_discovery FROM accounts ORDER BY id').all() as
+      Array<{ id: string; exclude_from_discovery: number }>;
+    expect(rows).toEqual([
+      { id: 'already-off', exclude_from_discovery: 1 },
+      { id: 'personal', exclude_from_discovery: 1 },
+      { id: 'work', exclude_from_discovery: 0 },
+    ]);
+    db.close();
+  });
+});
+
 describe('stable identity and no silent edits', () => {
   let db: Database;
   let accounts: AccountRepository;

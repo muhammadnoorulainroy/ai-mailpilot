@@ -11,6 +11,7 @@ import { EMBEDDING_DIM } from '../src/db/schema.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { CategoryRepository } from '../src/repositories/category-repository.js';
 import { CategoryProposalRepository } from '../src/repositories/category-proposal-repository.js';
+import { CategoryAliasRepository } from '../src/repositories/category-alias-repository.js';
 import { DiscoveryAuditRepository } from '../src/repositories/discovery-audit-repository.js';
 import { EmailRepository } from '../src/repositories/email-repository.js';
 import { EmbeddingRepository } from '../src/repositories/embedding-repository.js';
@@ -20,6 +21,9 @@ import type { AppContext } from '../src/context.js';
 import { ResidualDiscoveryService } from '../src/services/residual-discovery-service.js';
 import { DiscoveryProposalService } from '../src/services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from '../src/services/discovery-proposal-orchestrator.js';
+import { CategoryCentroidRebuildService } from '../src/services/category-centroid-rebuild-service.js';
+import { CategoryHealthService } from '../src/services/category-health-service.js';
+import { StructuralProposalService } from '../src/services/structural-proposal-service.js';
 import { registerCategoryRoutes } from '../src/routes/categories.js';
 
 const MODEL = 'bge-m3';
@@ -108,6 +112,8 @@ async function buildApp() {
     getConfig,
     silentLogger,
   );
+  const centroidRebuild = new CategoryCentroidRebuildService(categories, embeddings, silentLogger);
+  const aliases = new CategoryAliasRepository(db);
   const orchestrator = new DiscoveryProposalOrchestrator(
     db,
     proposals,
@@ -116,6 +122,19 @@ async function buildApp() {
     proposalService,
     accounts,
     audit,
+    centroidRebuild,
+    aliases,
+    getConfig,
+    silentLogger,
+  );
+  const health = new CategoryHealthService(categories, embeddings);
+  const structural = new StructuralProposalService(
+    categories,
+    proposals,
+    health,
+    embeddings,
+    emails,
+    llm,
     getConfig,
     silentLogger,
   );
@@ -133,13 +152,13 @@ async function buildApp() {
       categoryProposals: proposals,
       discoveryAudit: audit,
     },
-    services: { discoveryProposal: orchestrator },
+    services: { discoveryProposal: orchestrator, structuralProposal: structural },
   } as unknown as AppContext;
 
   const app = Fastify();
   await registerCategoryRoutes(app, ctx);
   await app.ready();
-  return { app, accountId: acc.id, categories };
+  return { app, accountId: acc.id, accounts, categories, emails, embeddings, proposals };
 }
 
 describe('discovery proposal routes', () => {
@@ -236,6 +255,298 @@ describe('discovery proposal routes', () => {
     const twice = await app.inject({
       method: 'POST',
       url: `/categories/proposals/${pending[0]!.id}/apply`,
+      payload: { accountId },
+    });
+    expect(twice.statusCode).toBe(409);
+
+    await app.close();
+  });
+});
+
+/**
+ * Set up two overlapping active auto categories (a merge pair, the larger surviving) plus one empty
+ * active auto category (a retire candidate), so a structural generate run has one of each to make.
+ */
+function seedStructuralFixture(
+  categories: CategoryRepository,
+  emails: EmailRepository,
+  accountId: string,
+) {
+  // Same-purpose labels (both map to the invoices/receipts purpose group) so the F1 merge-quality
+  // gate accepts the pair; the variable names are kept generic.
+  const src = categories.create({
+    accountId,
+    label: 'Invoices',
+    source: 'auto',
+    status: 'active',
+    canonicalKey: 'invoices',
+  });
+  const dst = categories.create({
+    accountId,
+    label: 'Receipts',
+    source: 'auto',
+    status: 'active',
+    canonicalKey: 'receipts',
+  });
+  const empty = categories.create({
+    accountId,
+    label: 'Empty',
+    source: 'auto',
+    status: 'active',
+    canonicalKey: 'empty',
+  });
+  // Near-identical stored centroids so health reports high overlap between src and dst.
+  categories.saveCentroid(src.id, MODEL, axis(0), 1);
+  categories.saveCentroid(dst.id, MODEL, axis(0), 2);
+  // dst is the larger category (2 members vs 1), so it survives as the merge target.
+  const members: Array<[string, string]> = [
+    [src.id, 'src-a'],
+    [dst.id, 'dst-a'],
+    [dst.id, 'dst-b'],
+  ];
+  for (const [categoryId, messageId] of members) {
+    emails.upsertBatch([
+      { messageId, accountId, folder: 'INBOX', subject: 's', fromAddr: 'a@b.com' },
+    ]);
+    categories.addAutoAssignments(accountId, [
+      {
+        messageId,
+        accountId,
+        categoryId,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: Date.now(),
+        method: 'embed',
+      },
+    ]);
+  }
+  return { src, dst, empty };
+}
+
+describe('structural proposal generation route', () => {
+  it('returns 400 for an invalid body and 404 for a missing account', async () => {
+    const { app, accountId } = await buildApp();
+
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: {},
+    });
+    expect(bad.statusCode).toBe(400);
+
+    const missing = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId: 'nope' },
+    });
+    expect(missing.statusCode).toBe(404);
+
+    await app.close();
+  });
+
+  it('creates merge and retire proposals, lists them with correct kind, and does not duplicate on re-run', async () => {
+    const { app, accountId, categories, emails } = await buildApp();
+    const { src, dst, empty } = seedStructuralFixture(categories, emails, accountId);
+
+    const gen = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId },
+    });
+    expect(gen.statusCode).toBe(200);
+    const created = gen.json().created as Array<{
+      kind: string;
+      categoryId: string;
+      sourceCategoryId: string | null;
+    }>;
+    const merge = created.find((c) => c.kind === 'merge')!;
+    const retire = created.find((c) => c.kind === 'retire')!;
+    expect(merge).toMatchObject({ categoryId: dst.id, sourceCategoryId: src.id });
+    expect(retire).toMatchObject({ categoryId: empty.id, sourceCategoryId: null });
+
+    // The generated structural proposals appear in the review queue with their kind and source.
+    const list = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${accountId}`,
+    });
+    const pending = list.json().proposals as Array<{
+      kind: string;
+      categoryId: string;
+      sourceCategoryId: string | null;
+    }>;
+    expect(pending.find((p) => p.kind === 'merge')).toMatchObject({
+      categoryId: dst.id,
+      sourceCategoryId: src.id,
+    });
+    expect(pending.find((p) => p.kind === 'retire')).toMatchObject({
+      categoryId: empty.id,
+      sourceCategoryId: null,
+    });
+    const structuralCount = pending.filter((p) => p.kind !== 'new_category').length;
+    expect(structuralCount).toBe(2);
+
+    // A second run re-proposes nothing (the pending suppression keys already cover both).
+    const again = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId },
+    });
+    expect(again.json().created).toHaveLength(0);
+    expect(again.json().skippedExisting).toBeGreaterThanOrEqual(2);
+    const listAgain = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${accountId}`,
+    });
+    expect(
+      (listAgain.json().proposals as Array<{ kind: string }>).filter((p) => p.kind !== 'new_category'),
+    ).toHaveLength(2);
+
+    await app.close();
+  });
+
+  it('skips structural generation for discovery-ineligible personal accounts', async () => {
+    const { app, accounts, categories } = await buildApp();
+    const personal = accounts.create({ address: 'personal@x.com', kind: 'personal' });
+    categories.create({
+      accountId: personal.id,
+      label: 'Empty Personal',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'empty_personal',
+    });
+
+    const gen = await app.inject({
+      method: 'POST',
+      url: '/categories/proposals/generate-structural',
+      payload: { accountId: personal.id },
+    });
+    expect(gen.statusCode).toBe(200);
+    expect(gen.json()).toMatchObject({
+      runId: '',
+      created: [],
+      mergeCandidates: 0,
+      retireCandidates: 0,
+      skippedExisting: 0,
+    });
+
+    const list = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${personal.id}`,
+    });
+    expect(list.json().proposals).toHaveLength(0);
+
+    await app.close();
+  });
+});
+
+describe('split proposal routes', () => {
+  it('lists a split with its children and affected count, then applies it over HTTP', async () => {
+    const { app, accountId, categories, emails, embeddings, proposals } = await buildApp();
+    const source = categories.create({
+      accountId,
+      label: 'Big Bucket',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'big',
+    });
+    for (const [messageId, dim] of [
+      ['s-a', 4],
+      ['s-b', 5],
+    ] as Array<[string, number]>) {
+      emails.upsertBatch([
+        { messageId, accountId, folder: 'INBOX', subject: 's', fromAddr: 'a@b.com' },
+      ]);
+      embeddings.saveEmbedding({ messageId, accountId, modelId: MODEL }, axis(dim));
+      categories.addAutoAssignments(accountId, [
+        {
+          messageId,
+          accountId,
+          categoryId: source.id,
+          confidence: 0.5,
+          assignedBy: 'auto',
+          assignedAt: Date.now(),
+          method: 'embed',
+        },
+      ]);
+    }
+    const split = proposals.createSplit(
+      {
+        accountId,
+        kind: 'split',
+        categoryId: source.id,
+        sourceCategoryId: null,
+        runId: 'r',
+        label: 'Split Big Bucket',
+        description: 'two groups',
+        canonicalKey: 'big',
+        suppressionKey: 'split:big',
+        embeddingModelId: MODEL,
+        confidence: 0.8,
+        evidence: ['two groups'],
+      },
+      [
+        {
+          label: 'Alpha',
+          description: '',
+          canonicalKey: 'alpha',
+          embeddingModelId: MODEL,
+          centroid: axis(4),
+          memberIds: ['s-a'],
+          proposedCount: 1,
+          cohesion: 0.9,
+          separation: 0.9,
+          confidence: 0.9,
+        },
+        {
+          label: 'Beta',
+          description: '',
+          canonicalKey: 'beta',
+          embeddingModelId: MODEL,
+          centroid: axis(5),
+          memberIds: ['s-b'],
+          proposedCount: 1,
+          cohesion: 0.9,
+          separation: 0.9,
+          confidence: 0.9,
+        },
+      ],
+    );
+
+    // The list endpoint serializes the split with its children and the live affected-source count.
+    const list = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${accountId}`,
+    });
+    const view = (
+      list.json().proposals as Array<{
+        id: string;
+        kind: string;
+        children?: Array<{ label: string; proposedCount: number; sampleSubjects?: string[] }>;
+        affectedCount?: number;
+      }>
+    ).find((p) => p.id === split.id)!;
+    expect(view.kind).toBe('split');
+    expect(view.children).toHaveLength(2);
+    expect(view.children!.map((c) => c.label).sort()).toEqual(['Alpha', 'Beta']);
+    expect(view.children!.find((c) => c.label === 'Alpha')!.sampleSubjects).toEqual(['s']);
+    expect(view.children!.find((c) => c.label === 'Beta')!.sampleSubjects).toEqual(['s']);
+    expect(view.affectedCount).toBe(2);
+
+    // Applying over HTTP creates the child categories and reports the split kind.
+    const applied = await app.inject({
+      method: 'POST',
+      url: `/categories/proposals/${split.id}/apply`,
+      payload: { accountId },
+    });
+    expect(applied.statusCode).toBe(200);
+    expect(applied.json().kind).toBe('split');
+    expect(categories.findByLabel(accountId, 'Alpha')).not.toBeNull();
+    expect(categories.findByLabel(accountId, 'Beta')).not.toBeNull();
+
+    // Re-applying the now-applied split is a lifecycle conflict, caught before any write.
+    const twice = await app.inject({
+      method: 'POST',
+      url: `/categories/proposals/${split.id}/apply`,
       payload: { accountId },
     });
     expect(twice.statusCode).toBe(409);
