@@ -519,13 +519,15 @@ describe('split proposal routes', () => {
       list.json().proposals as Array<{
         id: string;
         kind: string;
-        children?: Array<{ label: string; proposedCount: number }>;
+        children?: Array<{ label: string; proposedCount: number; sampleSubjects?: string[] }>;
         affectedCount?: number;
       }>
     ).find((p) => p.id === split.id)!;
     expect(view.kind).toBe('split');
     expect(view.children).toHaveLength(2);
     expect(view.children!.map((c) => c.label).sort()).toEqual(['Alpha', 'Beta']);
+    expect(view.children!.find((c) => c.label === 'Alpha')!.sampleSubjects).toEqual(['s']);
+    expect(view.children!.find((c) => c.label === 'Beta')!.sampleSubjects).toEqual(['s']);
     expect(view.affectedCount).toBe(2);
 
     // Applying over HTTP creates the child categories and reports the split kind.

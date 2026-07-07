@@ -1374,5 +1374,11 @@ describe('DiscoveryProposalOrchestrator.listPending kind-awareness', () => {
     expect(splitView.userImpactCount).toBe(0);
     expect(splitView.children).toHaveLength(2);
     expect(splitView.children!.map((c) => c.label).sort()).toEqual(['Child A', 'Child B']);
+    expect(splitView.children!.find((c) => c.label === 'Child A')!.sampleSubjects).toEqual([
+      's s-a',
+    ]);
+    expect(splitView.children!.find((c) => c.label === 'Child B')!.sampleSubjects).toEqual([
+      's s-b',
+    ]);
   });
 });

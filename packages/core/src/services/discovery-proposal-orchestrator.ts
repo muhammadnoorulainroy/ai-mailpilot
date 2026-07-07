@@ -67,6 +67,8 @@ export interface ProposalChildView {
   cohesion: number;
   separation: number;
   confidence: number;
+  /** A few representative subjects from this child, for review only. */
+  sampleSubjects?: string[];
 }
 
 /** A pending proposal as shown in the review queue, without the heavy centroid or member list. */
@@ -113,6 +115,9 @@ export class ProposalApplyError extends Error {
     this.name = 'ProposalApplyError';
   }
 }
+
+const CHILD_SAMPLE_SUBJECT_LIMIT = 3;
+const CHILD_SAMPLE_LOOKUP_LIMIT = 30;
 
 function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
@@ -295,6 +300,21 @@ export class DiscoveryProposalOrchestrator {
     };
   }
 
+  /** Representative non-empty subjects for a split child, preserving child member order. */
+  private childSampleSubjects(accountId: string, memberIds: string[]): string[] {
+    if (memberIds.length === 0) return [];
+    const ids = memberIds.slice(0, CHILD_SAMPLE_LOOKUP_LIMIT);
+    const byId = new Map(this.emails.summariesByIds(accountId, ids).map((s) => [s.messageId, s]));
+    const samples: string[] = [];
+    for (const id of ids) {
+      const subject = byId.get(id)?.subject?.trim();
+      if (!subject) continue;
+      samples.push(subject);
+      if (samples.length >= CHILD_SAMPLE_SUBJECT_LIMIT) break;
+    }
+    return samples;
+  }
+
   /** Pending proposals for the review queue, strongest first, enriched with per-kind review detail. */
   listPending(accountId: string): ProposalView[] {
     return this.proposals.listPending(accountId).map((p) => {
@@ -316,6 +336,7 @@ export class DiscoveryProposalOrchestrator {
               cohesion: c.cohesion,
               separation: c.separation,
               confidence: c.confidence,
+              sampleSubjects: this.childSampleSubjects(accountId, c.memberIds),
             }))
           : undefined;
       return {

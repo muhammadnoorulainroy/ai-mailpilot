@@ -374,6 +374,8 @@ export interface ProposalChildDto {
   cohesion: number;
   separation: number;
   confidence: number;
+  /** A few representative subjects from this child, for review only. */
+  sampleSubjects?: string[];
 }
 
 /** A pending category proposal awaiting review, with its deterministic quality metrics. */

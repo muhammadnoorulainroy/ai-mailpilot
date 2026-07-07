@@ -1836,6 +1836,17 @@ function proposalCard(p: ProposalDto): HTMLElement {
       size.className = 'proposal-child-count';
       size.textContent = proposalCountLabel(child.proposedCount);
       row.append(name, size);
+      const samples = child.sampleSubjects?.filter((s) => s.trim().length > 0).slice(0, 3) ?? [];
+      if (samples.length > 0) {
+        const sampleList = document.createElement('ul');
+        sampleList.className = 'proposal-child-samples';
+        for (const sample of samples) {
+          const item = document.createElement('li');
+          item.textContent = sample;
+          sampleList.appendChild(item);
+        }
+        row.appendChild(sampleList);
+      }
       list.appendChild(row);
     }
     card.appendChild(list);
