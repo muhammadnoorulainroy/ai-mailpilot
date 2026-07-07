@@ -147,7 +147,11 @@ describe('CategoryImprovementService.apply existing-category expansions', () => 
     seedEmail(acct.id, 'free', 0.6);
     seedEmail(acct.id, 'already-filed', 0.8);
 
-    const target = categories.create({ accountId: acct.id, label: 'Job Opportunities', source: 'auto' });
+    const target = categories.create({
+      accountId: acct.id,
+      label: 'Job Opportunities',
+      source: 'auto',
+    });
     const other = categories.create({ accountId: acct.id, label: 'Other', source: 'auto' });
     categories.saveCentroid(target.id, MODEL, vec(0), 1);
     categories.replaceEmailAssignments('already-filed', acct.id, [
@@ -232,12 +236,70 @@ describe('CategoryImprovementService.apply existing-category expansions', () => 
     });
 
     expect(out.expanded).toBe(2);
-    expect(categories.getEmailCategoriesWithLabels('multi', acct.id).map((c) => c.label).sort()).toEqual([
-      'Banking',
-      'Security',
-    ]);
+    expect(
+      categories
+        .getEmailCategoriesWithLabels('multi', acct.id)
+        .map((c) => c.label)
+        .sort(),
+    ).toEqual(['Banking', 'Security']);
     expect(categories.getEmailCategoriesWithLabels('locked', acct.id).map((c) => c.label)).toEqual([
       'Manual',
     ]);
+  });
+});
+
+describe('CorrectionService multi-prototype (Phase 4)', () => {
+  /** A pure axis-1 vector, distinct from vec(0) = [1, 0, ...]. */
+  function axis1(): Float32Array {
+    const a = new Float32Array(EMBEDDING_DIM);
+    a[1] = 1;
+    return a;
+  }
+
+  /** Seed a category with an aggregate at vec(0) and two sub-prototypes: axis-0 and axis-1. */
+  function seedTwoPrototypes(accountId: string): string {
+    const cat = categories.create({ accountId, label: 'Broad', source: 'auto' });
+    categories.savePrototypeSet(cat.id, MODEL, vec(0), 10, [
+      { vector: vec(0), emailCount: 5 }, // sub 1, near axis 0
+      { vector: axis1(), emailCount: 5 }, // sub 2, near axis 1
+    ]);
+    return cat.id;
+  }
+
+  it('flag on: a correction nudges the aggregate and only the NEAREST sub-prototype, siblings unchanged', () => {
+    const acct = accounts.create({ address: 'u@x.y', kind: 'work' });
+    const catId = seedTwoPrototypes(acct.id);
+    seedEmail(acct.id, 'msg', 10); // email = vec(10) = [1, 10, ...], nearest to the axis-1 sub-prototype
+    const before = categories.getPrototypes(catId, MODEL);
+    const beforeSub1 = before.find((p) => p.prototypeIndex === 1)!;
+
+    const multi = new CorrectionService(db, categories, embeddings, () => true);
+    multi.setUserCategories(acct.id, 'msg', [catId], MODEL);
+
+    const after = categories.getPrototypes(catId, MODEL);
+    // Aggregate nudged (count bumped).
+    expect(after.find((p) => p.prototypeIndex === 0)!.emailCount).toBe(11);
+    // Nearest sub-prototype (index 2, axis 1) nudged.
+    expect(after.find((p) => p.prototypeIndex === 2)!.emailCount).toBe(6);
+    // Sibling sub-prototype (index 1, axis 0) untouched in count AND vector.
+    const sub1After = after.find((p) => p.prototypeIndex === 1)!;
+    expect(sub1After.emailCount).toBe(5);
+    expect(Array.from(sub1After.vector.slice(0, 4))).toEqual(
+      Array.from(beforeSub1.vector.slice(0, 4)),
+    );
+  });
+
+  it('flag off: a correction touches only the aggregate, never a sub-prototype', () => {
+    const acct = accounts.create({ address: 'u@x.y', kind: 'work' });
+    const catId = seedTwoPrototypes(acct.id);
+    seedEmail(acct.id, 'msg', 10);
+
+    // The module-level `correction` service has the flag off.
+    correction.setUserCategories(acct.id, 'msg', [catId], MODEL);
+
+    const after = categories.getPrototypes(catId, MODEL);
+    expect(after.find((p) => p.prototypeIndex === 0)!.emailCount).toBe(11); // aggregate nudged
+    expect(after.find((p) => p.prototypeIndex === 1)!.emailCount).toBe(5); // subs untouched
+    expect(after.find((p) => p.prototypeIndex === 2)!.emailCount).toBe(5);
   });
 });

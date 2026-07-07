@@ -5,7 +5,7 @@
  */
 import type { Database } from 'better-sqlite3';
 import { EMBEDDING_DIM } from '../db/schema.js';
-import { runningMeanUpdate } from '../util/vector.js';
+import { runningMeanUpdate, cosineSimilarity } from '../util/vector.js';
 import type { CategoryRepository } from '../repositories/category-repository.js';
 import type { EmbeddingRepository } from '../repositories/embedding-repository.js';
 
@@ -22,6 +22,7 @@ export class CorrectionService {
     private db: Database,
     private categories: CategoryRepository,
     private embeddings: EmbeddingRepository,
+    private multiPrototypeEnabled: () => boolean = () => false,
   ) {}
 
   /**
@@ -70,14 +71,44 @@ export class CorrectionService {
         return { applied: unique.length, centroidsUpdated: 0 };
       }
 
+      const useMulti = this.multiPrototypeEnabled();
       let centroidsUpdated = 0;
       for (const categoryId of unique) {
         if (priorUser.has(categoryId)) continue;
+        // Always nudge the aggregate (prototype 0), exactly as before.
         const current = this.categories.getCentroid(categoryId, embeddingModelId);
         const base = current ?? { vector: new Float32Array(EMBEDDING_DIM), emailCount: 0 };
         const updated = runningMeanUpdate(base.vector, base.emailCount, emailVec);
         this.categories.saveCentroid(categoryId, embeddingModelId, updated, base.emailCount + 1);
         centroidsUpdated += 1;
+
+        // When multi-prototype is on and the category already has sub-prototypes, also nudge the
+        // NEAREST one toward this correction. We never spawn a new sub-prototype from a single
+        // correction, so K cannot grow here; siblings are left unchanged.
+        if (useMulti) {
+          const subs = this.categories
+            .getPrototypes(categoryId, embeddingModelId)
+            .filter((p) => p.prototypeIndex >= 1);
+          if (subs.length > 0) {
+            let nearest = subs[0]!;
+            let bestSim = cosineSimilarity(emailVec, nearest.vector);
+            for (let i = 1; i < subs.length; i++) {
+              const sim = cosineSimilarity(emailVec, subs[i]!.vector);
+              if (sim > bestSim) {
+                bestSim = sim;
+                nearest = subs[i]!;
+              }
+            }
+            const nudged = runningMeanUpdate(nearest.vector, nearest.emailCount, emailVec);
+            this.categories.saveCentroid(
+              categoryId,
+              embeddingModelId,
+              nudged,
+              nearest.emailCount + 1,
+              nearest.prototypeIndex,
+            );
+          }
+        }
       }
 
       return { applied: unique.length, centroidsUpdated };

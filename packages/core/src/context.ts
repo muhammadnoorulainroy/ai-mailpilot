@@ -143,6 +143,7 @@ export function buildContext(): AppContext {
     repos.categories,
     repos.embeddings,
     logger,
+    () => config.features.multiPrototypeCategories,
   );
   const categoryHealth = new CategoryHealthService(repos.categories, repos.embeddings);
 
@@ -217,7 +218,12 @@ export function buildContext(): AppContext {
       logger,
       () => config.features.multiPrototypeCategories,
     ),
-    correction: new CorrectionService(db, repos.categories, repos.embeddings),
+    correction: new CorrectionService(
+      db,
+      repos.categories,
+      repos.embeddings,
+      () => config.features.multiPrototypeCategories,
+    ),
     dashboard: new DashboardService(repos.emails, repos.triage, repos.categories),
     priority: new PriorityService(repos.triage),
     emailAssistant: new EmailAssistantService(
