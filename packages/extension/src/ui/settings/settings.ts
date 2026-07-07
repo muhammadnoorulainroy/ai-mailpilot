@@ -135,6 +135,9 @@ async function loadCoreAccounts(): Promise<void> {
   }
 }
 
+/** Account ids with an in-flight AI discovery PATCH, used to block duplicate concurrent saves. */
+const discoveryPending = new Set<string>();
+
 /** Renders one toggle row per account, persisting enabled and excluded lists on change. */
 function renderAccounts(): void {
   const list = $('accounts-list');
@@ -219,9 +222,12 @@ function renderAccounts(): void {
 
     const discovery = row.querySelector('.discovery-toggle') as HTMLInputElement;
     discovery.checked = coreAccount?.discoveryEnabled ?? false;
-    discovery.disabled = !coreAccount;
+    discovery.disabled = !coreAccount || discoveryPending.has(coreAccount.id);
     discovery.addEventListener('change', async () => {
-      if (!coreAccount) return;
+      if (!coreAccount || discoveryPending.has(coreAccount.id)) {
+        discovery.checked = coreAccount?.discoveryEnabled ?? false;
+        return;
+      }
       const next = discovery.checked;
       if (next) {
         const ok = window.confirm(
@@ -232,6 +238,7 @@ function renderAccounts(): void {
           return;
         }
       }
+      discoveryPending.add(coreAccount.id);
       discovery.disabled = true;
       try {
         const updated = await coreClient.updateAccountDiscovery(coreAccount.id, {
@@ -242,11 +249,12 @@ function renderAccounts(): void {
         );
       } catch (err) {
         setStatus(
-          'models-status',
+          'accounts-status',
           `Could not save AI discovery setting: ${err instanceof Error ? err.message : String(err)}`,
           'error',
         );
       } finally {
+        discoveryPending.delete(coreAccount.id);
         renderAccounts();
       }
     });

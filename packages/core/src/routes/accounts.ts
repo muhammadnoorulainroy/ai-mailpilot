@@ -1,5 +1,5 @@
 /**
- * Fastify route handlers for account CRUD operations (list, get, create, delete).
+ * Fastify route handlers for account operations (list, get, create, update discovery consent, delete).
  */
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -33,7 +33,7 @@ function toDto(account: Account): AccountDto {
 }
 
 /**
- * Registers the account CRUD routes (list, get, create, delete) on the Fastify instance.
+ * Registers the account routes (list, get, create, update discovery consent, delete) on the Fastify instance.
  */
 export async function registerAccountRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
   app.get('/accounts', async () => {
