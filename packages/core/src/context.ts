@@ -130,7 +130,12 @@ export function buildContext(): AppContext {
   );
   const llmCategorizer = new LlmCategorizer(llm);
 
-  const residualDiscovery = new ResidualDiscoveryService(repos.embeddings, repos.categories);
+  const multiPrototypeEnabled = (): boolean => config.features.multiPrototypeCategories;
+  const residualDiscovery = new ResidualDiscoveryService(
+    repos.embeddings,
+    repos.categories,
+    multiPrototypeEnabled,
+  );
   const discoveryProposalService = new DiscoveryProposalService(
     residualDiscovery,
     repos.emails,
@@ -138,6 +143,7 @@ export function buildContext(): AppContext {
     llm,
     () => config.llm,
     logger,
+    multiPrototypeEnabled,
   );
   const categoryCentroidRebuild = new CategoryCentroidRebuildService(
     repos.categories,
@@ -201,6 +207,7 @@ export function buildContext(): AppContext {
       llm,
       () => config.llm,
       logger,
+      multiPrototypeEnabled,
     ),
     category: new CategoryOrchestrator(
       categorizationService,

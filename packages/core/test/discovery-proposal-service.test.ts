@@ -247,3 +247,75 @@ describe('DiscoveryProposalService', () => {
     expect(result).toMatchObject({ clusterCount: 0, accepted: [], rejected: [] });
   });
 });
+
+describe('ResidualDiscoveryService multi-prototype residual selection (Phase 4)', () => {
+  it('flag on: an auto-assigned email near a SUB-prototype is not residual; flag off it is', () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const categories = new CategoryRepository(db);
+    const emails = new EmailRepository(db);
+    const embeddings = new EmbeddingRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const cat = categories.create({
+      accountId: acc.id,
+      label: 'Broad',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'broad',
+    });
+    // Aggregate on axis 0, plus sub-prototypes on axis 0 and axis 5.
+    categories.savePrototypeSet(cat.id, MODEL, axis(0), 10, [
+      { vector: axis(0), emailCount: 5 },
+      { vector: axis(5), emailCount: 5 },
+    ]);
+    // An auto-assigned email on axis 5: near the sub-prototype, far from the aggregate.
+    emails.upsertBatch([{ messageId: 'm1', accountId: acc.id, folder: 'INBOX' }]);
+    embeddings.saveEmbedding({ messageId: 'm1', accountId: acc.id, modelId: MODEL }, axis(5));
+    categories.addAutoAssignments(acc.id, [
+      {
+        messageId: 'm1',
+        accountId: acc.id,
+        categoryId: cat.id,
+        confidence: 0.5,
+        assignedBy: 'auto',
+        assignedAt: 1,
+        method: 'embed',
+      },
+    ]);
+
+    // Flag off: only the aggregate (axis 0) is compared; the axis-5 email scores ~0 -> residual.
+    const off = new ResidualDiscoveryService(embeddings, categories, () => false);
+    expect(off.selectResidual(acc.id, MODEL).map((p) => p.messageId)).toEqual(['m1']);
+
+    // Flag on: the axis-5 sub-prototype covers it (~1.0) -> NOT residual, so it will not re-surface.
+    const on = new ResidualDiscoveryService(embeddings, categories, () => true);
+    expect(on.selectResidual(acc.id, MODEL).map((p) => p.messageId)).toEqual([]);
+    db.close();
+  });
+
+  it('an uncategorized email is always residual, flag on or off', () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const categories = new CategoryRepository(db);
+    const emails = new EmailRepository(db);
+    const embeddings = new EmbeddingRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const cat = categories.create({
+      accountId: acc.id,
+      label: 'Broad',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'broad',
+    });
+    categories.savePrototypeSet(cat.id, MODEL, axis(0), 5, [{ vector: axis(5), emailCount: 3 }]);
+    // An email with NO assignment at all (unrelated cluster).
+    emails.upsertBatch([{ messageId: 'u1', accountId: acc.id, folder: 'INBOX' }]);
+    embeddings.saveEmbedding({ messageId: 'u1', accountId: acc.id, modelId: MODEL }, axis(9));
+
+    for (const flag of [false, true]) {
+      const svc = new ResidualDiscoveryService(embeddings, categories, () => flag);
+      expect(svc.selectResidual(acc.id, MODEL).map((p) => p.messageId)).toEqual(['u1']);
+    }
+    db.close();
+  });
+});

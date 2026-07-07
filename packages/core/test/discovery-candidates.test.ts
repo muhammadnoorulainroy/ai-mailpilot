@@ -74,7 +74,7 @@ function ctx(over: Partial<CandidateContext> = {}): CandidateContext {
 const active = (label: string, over: Partial<ActiveCategoryRef> = {}): ActiveCategoryRef => ({
   label,
   description: null,
-  centroid: null,
+  prototypes: [],
   createdBy: 'auto',
   ...over,
 });
@@ -132,7 +132,21 @@ describe('validateCandidate', () => {
     expect(
       validateCandidate(
         candidate({ label: 'Totally Different Name' }),
-        ctx({ activeCategories: [active('Something', { centroid: axis(0) })] }),
+        ctx({ activeCategories: [active('Something', { prototypes: [axis(0)] })] }),
+      ).reason,
+    ).toBe('overlaps_active_content');
+  });
+
+  it('rejects a candidate overlapping ANY effective prototype of an active category (Phase 4)', () => {
+    // The category's aggregate is on axis 0, but it also carries a sub-prototype on axis 5. A candidate
+    // cluster on axis 5 overlaps the SUB-prototype (not the aggregate) and must still be rejected.
+    expect(
+      validateCandidate(
+        candidate({ label: 'Totally Different Name', description: 'unrelated to axis zero.' }),
+        ctx({
+          cluster: cluster({ centroid: axis(5) }),
+          activeCategories: [active('Broad', { prototypes: [axis(0), axis(5)] })],
+        }),
       ).reason,
     ).toBe('overlaps_active_content');
   });
@@ -256,7 +270,7 @@ describe('validateCandidate hardening (adversarial findings)', () => {
         candidate({ label: 'Billing' }),
         ctx({
           cluster: cluster({ centroid: axis(0) }),
-          activeCategories: [active('Invoices', { centroid: twinCentroid })],
+          activeCategories: [active('Invoices', { prototypes: [twinCentroid] })],
         }),
       ).reason,
     ).toBe('overlaps_active_content');
@@ -267,7 +281,7 @@ describe('validateCandidate hardening (adversarial findings)', () => {
         candidate({ label: 'Billing' }),
         ctx({
           cluster: cluster({ centroid: axis(0) }),
-          activeCategories: [active('Invoices', { centroid: distantCentroid })],
+          activeCategories: [active('Invoices', { prototypes: [distantCentroid] })],
         }),
       ).accepted,
     ).toBe(true);
@@ -356,7 +370,7 @@ describe('validateCandidate hardening (adversarial findings)', () => {
       candidate({ label: 'Totally Distinct Purpose' }),
       ctx({
         cluster: cluster({ centroid: axis(0) }),
-        activeCategories: [active('Legacy', { centroid: legacy })],
+        activeCategories: [active('Legacy', { prototypes: [legacy] })],
       }),
     );
     expect(v.accepted).toBe(true);

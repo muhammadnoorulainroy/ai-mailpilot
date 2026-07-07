@@ -71,6 +71,7 @@ export class DiscoveryProposalService {
     private llm: LlmClient,
     private getConfig: () => LlmConfig,
     private logger: Logger,
+    private multiPrototypeEnabled: () => boolean = () => false,
   ) {}
 
   /**
@@ -187,17 +188,22 @@ export class DiscoveryProposalService {
     return { cluster, subjects, senderTokens: [...brandTokens(freq)] };
   }
 
-  /** Active categories with their stored centroids, as the gate needs them for overlap checks. */
+  /** Active categories with their effective prototype vectors, as the gate needs for overlap checks. */
   private activeCategoryRefs(accountId: string, embeddingModelId: string): ActiveCategoryRef[] {
-    const centroids = new Map(
-      this.categories
-        .getCentroidEntries(accountId, embeddingModelId)
-        .map((c) => [c.categoryId, c.vector] as const),
-    );
+    const prototypesByCat = new Map<string, Float32Array[]>();
+    for (const p of this.categories.getEffectivePrototypeEntries(
+      accountId,
+      embeddingModelId,
+      this.multiPrototypeEnabled(),
+    )) {
+      const arr = prototypesByCat.get(p.categoryId);
+      if (arr) arr.push(p.vector);
+      else prototypesByCat.set(p.categoryId, [p.vector]);
+    }
     return this.categories.listActive(accountId).map((c) => ({
       label: c.label,
       description: c.description,
-      centroid: centroids.get(c.id) ?? null,
+      prototypes: prototypesByCat.get(c.id) ?? [],
       createdBy: c.source,
     }));
   }
