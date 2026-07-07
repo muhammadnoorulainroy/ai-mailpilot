@@ -2259,8 +2259,10 @@ describe('CategorizationService.categorizeBatch scored count (M3)', () => {
       arr[1] = b;
       return arr;
     };
+    const entries = [{ categoryId: 'c1', label: 'L', vector: v(1, 0), emailCount: 1 }];
     const fakeCategories = {
-      getCentroidEntries: () => [{ categoryId: 'c1', label: 'L', vector: v(1, 0), emailCount: 1 }],
+      getCentroidEntries: () => entries,
+      getEffectivePrototypeEntries: () => entries.map((e) => ({ ...e, prototypeIndex: 0 })),
     };
     const fakeEmbeddings = {
       listForAccount: () => [
@@ -2277,6 +2279,60 @@ describe('CategorizationService.categorizeBatch scored count (M3)', () => {
     expect(matches.has('m1')).toBe(true);
     expect(matches.has('m3')).toBe(true);
     expect(matches.has('m2')).toBe(false);
+  });
+});
+
+describe('CategorizationService nearest-prototype matching (Phase 4)', () => {
+  const pvec = (a: number, b: number): Float32Array => {
+    const x = new Float32Array(EMBEDDING_DIM);
+    x[0] = a;
+    x[1] = b;
+    return x;
+  };
+  // Category A: aggregate near axis 0, plus two sub-prototypes (one near axis 0, one near axis 1).
+  const aggregate = [
+    { categoryId: 'A', label: 'A', vector: pvec(1, 0), emailCount: 8, prototypeIndex: 0 },
+  ];
+  const subs = [
+    { categoryId: 'A', label: 'A', vector: pvec(1, 0), emailCount: 5, prototypeIndex: 1 },
+    { categoryId: 'A', label: 'A', vector: pvec(0, 1), emailCount: 3, prototypeIndex: 2 },
+  ];
+  const makeCategories = () => ({
+    getCentroidEntries: () => aggregate.map(({ prototypeIndex: _p, ...e }) => e),
+    getEffectivePrototypeEntries: (_a: string, _m: string, multi: boolean) =>
+      multi ? subs : aggregate,
+  });
+
+  it('flag on rescues an email near a sub-prototype that the aggregate alone would miss', () => {
+    const cats = makeCategories();
+    const emb = { getEmbedding: () => pvec(0, 1) }; // near sub-prototype 2, far from the aggregate
+
+    // Flag off: only the aggregate (axis 0) is compared; axis-1 email is beyond the hard threshold.
+    const off = new CategorizationService(cats as never, emb as never, () => false);
+    expect(off.categorize('m', 'acct', 'bge-m3')).toHaveLength(0);
+
+    // Flag on: the axis-1 sub-prototype matches; A is assigned once with the winning prototype cosine.
+    const on = new CategorizationService(cats as never, emb as never, () => true);
+    const matches = on.categorize('m', 'acct', 'bge-m3');
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.categoryId).toBe('A');
+    expect(matches[0]!.confidence).toBeGreaterThan(0.9);
+  });
+
+  it('flag on: a category with several matching prototypes appears once, ranked by its nearest', () => {
+    const cats = {
+      getEffectivePrototypeEntries: () => [
+        { categoryId: 'A', label: 'A', vector: pvec(1, 0), emailCount: 5, prototypeIndex: 1 },
+        { categoryId: 'A', label: 'A', vector: pvec(0.9, 0.1), emailCount: 3, prototypeIndex: 2 },
+        { categoryId: 'B', label: 'B', vector: pvec(0, 1), emailCount: 4, prototypeIndex: 1 },
+      ],
+    };
+    const emb = { getEmbedding: () => pvec(1, 0) };
+    const svc = new CategorizationService(cats as never, emb as never, () => true);
+    const matches = svc.categorize('m', 'acct', 'bge-m3', { maxLabels: 5, relativeMargin: 2 });
+    // A appears exactly once (deduped to its nearest prototype), and it is the top match.
+    expect(matches.filter((x) => x.categoryId === 'A')).toHaveLength(1);
+    expect(matches[0]!.categoryId).toBe('A');
   });
 });
 
@@ -2444,6 +2500,7 @@ describe('LlmCategorizeOrchestrator.start (retryUncategorized guard + messageIds
       getUserAssignedMessageIds: vi.fn(() => new Set<string>()),
       clearNoneDecisions: vi.fn(),
       getCentroidEntries: vi.fn(() => []),
+      getEffectivePrototypeEntries: vi.fn(() => []),
       getUserCorrectionExamples: vi.fn(() => []),
       bulkReplaceForCluster: vi.fn(),
       recordNoneDecisions: vi.fn(),

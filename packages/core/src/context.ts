@@ -123,7 +123,11 @@ export function buildContext(): AppContext {
   };
 
   const triageService = new TriageService(llm, logger);
-  const categorizationService = new CategorizationService(repos.categories, repos.embeddings);
+  const categorizationService = new CategorizationService(
+    repos.categories,
+    repos.embeddings,
+    () => config.features.multiPrototypeCategories,
+  );
   const llmCategorizer = new LlmCategorizer(llm);
 
   const residualDiscovery = new ResidualDiscoveryService(repos.embeddings, repos.categories);
@@ -211,6 +215,7 @@ export function buildContext(): AppContext {
       repos.categories,
       repos.categorizeJobs,
       logger,
+      () => config.features.multiPrototypeCategories,
     ),
     correction: new CorrectionService(db, repos.categories, repos.embeddings),
     dashboard: new DashboardService(repos.emails, repos.triage, repos.categories),

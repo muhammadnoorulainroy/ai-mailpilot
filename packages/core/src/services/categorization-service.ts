@@ -32,10 +32,15 @@ const DEFAULT_MAX_LABELS = 3;
 const DEFAULT_RELATIVE_MARGIN = 0.1;
 
 export class CategorizationService {
-  /** Creates the service over the category and embedding repositories. */
+  /**
+   * Creates the service over the category and embedding repositories. `multiPrototypeEnabled` reads
+   * the Phase 4 feature flag on each call; when false (the default), matching uses only the aggregate
+   * centroid per category, identical to the pre-Phase-4 behavior.
+   */
   constructor(
     private categories: CategoryRepository,
     private embeddings: EmbeddingRepository,
+    private multiPrototypeEnabled: () => boolean = () => false,
   ) {}
 
   /**
@@ -55,7 +60,11 @@ export class CategorizationService {
     });
     if (!emailVec) return [];
 
-    const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
+    const centroids = this.categories.getEffectivePrototypeEntries(
+      accountId,
+      embeddingModelId,
+      this.multiPrototypeEnabled(),
+    );
     if (centroids.length === 0) return [];
 
     return matchAgainstCentroids(emailVec, centroids, options);
@@ -74,7 +83,11 @@ export class CategorizationService {
   ): { matches: Map<string, CategoryMatch[]>; scored: number } {
     const matches = new Map<string, CategoryMatch[]>();
 
-    const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
+    const centroids = this.categories.getEffectivePrototypeEntries(
+      accountId,
+      embeddingModelId,
+      this.multiPrototypeEnabled(),
+    );
     if (centroids.length === 0) return { matches, scored: 0 };
 
     const entries = this.embeddings.listForAccount(accountId, embeddingModelId);
@@ -118,17 +131,24 @@ export function rankCategories(
   emailVec: Float32Array,
   centroids: CentroidEntry[],
 ): CategoryMatch[] {
-  const scored: CategoryMatch[] = new Array(centroids.length);
-  for (let i = 0; i < centroids.length; i++) {
-    const c = centroids[i]!;
+  // A category may be represented by several prototype vectors (Phase 4). Keep only its NEAREST
+  // prototype so each category is ranked once, by its best (minimum) distance, and its confidence is
+  // the winning prototype's cosine. With exactly one centroid per category this is a no-op and
+  // reproduces the single-centroid ranking exactly.
+  const bestByCategory = new Map<string, CategoryMatch>();
+  for (const c of centroids) {
     const d = l2Distance(emailVec, c.vector);
-    scored[i] = {
-      categoryId: c.categoryId,
-      label: c.label,
-      distance: d,
-      confidence: cosineFromL2Distance(d),
-    };
+    const existing = bestByCategory.get(c.categoryId);
+    if (!existing || d < existing.distance) {
+      bestByCategory.set(c.categoryId, {
+        categoryId: c.categoryId,
+        label: c.label,
+        distance: d,
+        confidence: cosineFromL2Distance(d),
+      });
+    }
   }
+  const scored = Array.from(bestByCategory.values());
   scored.sort((a, b) => a.distance - b.distance);
   return scored;
 }
