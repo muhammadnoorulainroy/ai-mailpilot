@@ -1936,7 +1936,8 @@ async function findCleanupSuggestions(): Promise<void> {
   if (!accountId) return;
   const btn = $<HTMLButtonElement>('proposals-generate-structural');
   btn.disabled = true;
-  $('proposals-summary').textContent = 'Looking for categories to merge or retire...';
+  $('proposals-summary').textContent =
+    'Looking for categories to merge, retire, or split (this can take a moment)...';
   try {
     const res = await coreClient.generateStructuralProposals({ accountId });
     if (accountId !== state.currentAccountId) return;

@@ -134,6 +134,8 @@ async function buildApp() {
     health,
     embeddings,
     emails,
+    llm,
+    getConfig,
     silentLogger,
   );
 

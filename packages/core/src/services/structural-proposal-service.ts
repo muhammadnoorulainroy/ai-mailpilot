@@ -3,16 +3,24 @@
  * health metrics (Phase 3.3 detection). It only proposes obvious, safe cases and never applies
  * anything: a merge when two active auto categories are near-duplicate (high overlap / low
  * separation), a retire when an active auto category is empty, and a split when a loose active auto
- * category separates into two or more tight, well-separated subclusters.
+ * category separates into two or more tight, well-separated subclusters that the local model can name
+ * as distinct, non-overlapping purposes.
+ *
+ * Split child labels are produced by the SAME local naming + deterministic validation gate that
+ * discovery uses (never raw keyphrases), so a child is only kept when the model names a real purpose
+ * and that name survives the gate (not vague, not a sender/brand, not overlapping the parent or an
+ * existing category). A split with fewer than two survivable children is abandoned. Naming is
+ * local-only unless cloud discovery is explicitly enabled.
  *
  * Everything is user-approved on apply. This service writes only category_proposals rows (via the
  * existing createStructural / createSplit paths) and never touches a category, assignment, or
- * centroid. It skips user-created categories entirely (their structural changes are applicable, so
- * they must not be auto-suggested), and it deduplicates on the deterministic suppressionKey so a
- * purpose that is already pending, applied, or dismissed is never re-proposed.
+ * centroid. It skips user-created categories entirely and deduplicates on the deterministic
+ * suppressionKey so a purpose that is already pending, applied, or dismissed is never re-proposed.
  */
 import { randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
+import type { LlmClient } from '../llm/client.js';
+import type { LlmConfig } from '../config/schema.js';
 import {
   canonicalKeyBase,
   type CategoryRepository,
@@ -20,14 +28,29 @@ import {
 } from '../repositories/category-repository.js';
 import type { CategoryProposalRepository } from '../repositories/category-proposal-repository.js';
 import type { EmbeddingRepository } from '../repositories/embedding-repository.js';
-import type { EmailRepository } from '../repositories/email-repository.js';
+import type { EmailRepository, EmailSummary } from '../repositories/email-repository.js';
 import type { CategoryHealthService } from './category-health-service.js';
 import { purposeSignature } from './categorize-strategy.js';
-import { isNearDuplicateLabel } from './topic-discovery-service.js';
-import { clusterResidual, type ClusterPoint } from './discovery-clustering.js';
-import { clusterKeyphrases } from './discovery-candidates.js';
+import { isNearDuplicateLabel, domainFrequency, brandTokens } from './topic-discovery-service.js';
+import {
+  clusterResidual,
+  type ClusterPoint,
+  type DiscoveredCluster,
+} from './discovery-clustering.js';
+import {
+  clusterKeyphrases,
+  validateBatch,
+  type NamedCandidate,
+  type ActiveCategoryRef,
+} from './discovery-candidates.js';
+import {
+  buildNamingMessages,
+  parseNamedCandidates,
+  NAMING_SAMPLE_PER_CLUSTER,
+  type ClusterNamingInput,
+} from './discovery-naming.js';
+import { assertDiscoveryLocal, discoveryProvider } from './discovery-guard.js';
 import { cosineSimilarity } from '../util/vector.js';
-import { normalizeForMatch } from '../util/text.js';
 
 /** Lowest overlap (cosine of stored centroids) at which two auto categories are proposed for merge. */
 export const MERGE_MIN_OVERLAP = 0.9;
@@ -48,6 +71,10 @@ export const SPLIT_MIN_COHESION_GAIN = 0.08;
 export const SPLIT_MAX_CHILDREN = 4;
 /** Fixed seed so subclustering a given category is deterministic across runs. */
 export const SPLIT_CLUSTER_SEED = 1337;
+/** Most split candidates named per run, to bound how many local-model naming calls a run makes. */
+export const SPLIT_MAX_NAMED_CANDIDATES = 6;
+/** Output-token budget for one split's child-naming call (a split names at most SPLIT_MAX_CHILDREN). */
+const SPLIT_NAMING_OUTPUT_TOKENS = 1200;
 
 /** One structural proposal produced by a generate run. */
 export interface GeneratedStructural {
@@ -69,26 +96,17 @@ export interface StructuralGenerateResult {
   skippedExisting: number;
 }
 
-/** A proposed split child worked out by the deterministic analyzer, ready to persist. */
-interface SplitChild {
+/** A named, validated split child ready to persist. */
+interface NamedSplitChild {
   label: string;
-  canonicalKey: string;
   description: string;
+  canonicalKey: string;
   centroid: Float32Array;
   memberIds: string[];
   proposedCount: number;
   cohesion: number;
   separation: number;
   confidence: number;
-}
-
-function clamp01(x: number): number {
-  return x < 0 ? 0 : x > 1 ? 1 : x;
-}
-
-/** Capitalizes the first letter of a single keyphrase token for use as a category label. */
-function titleCase(token: string): string {
-  return token.length === 0 ? token : token[0]!.toUpperCase() + token.slice(1);
 }
 
 /** Deterministic survivor of a merge pair: the larger category, breaking ties by canonical key. */
@@ -119,32 +137,29 @@ function sameMergePurpose(a: CategoryWithCount, b: CategoryWithCount): boolean {
 }
 
 /**
- * Decide whether a loose category's auto members separate into distinct child categories, and if so
- * describe those children. Pure and deterministic given the seeded clustering: it subclusters the
- * members, keeps only tight, viable subclusters, and requires them to be meaningfully tighter than
- * the parent and well separated from each other. Child labels come from deterministic class-TF-IDF
- * keyphrases of each subcluster's subjects; if any child cannot be given a distinct, meaningful
- * label, the whole split is abandoned (returns null) rather than proposing an unclear change.
+ * Detect whether a loose category's auto members separate into distinct subclusters worth naming.
+ * Pure and deterministic given the seeded clustering: it subclusters the members and keeps only the
+ * viable ones (enough members, internally coherent, meaningfully tighter than the parent) that are
+ * also well separated from each other. Returns the kept subclusters (unlabelled), or null when there
+ * are not at least two. Naming and the quality gate happen afterwards, on these subclusters.
  */
-function analyzeSplit(
-  parentLabel: string,
+function detectSplitSubclusters(
   points: ClusterPoint[],
-  subjectById: Map<string, string>,
   parentCohesion: number,
-): SplitChild[] | null {
+): DiscoveredCluster[] | null {
   if (points.length < SPLIT_MIN_SIZE) return null;
 
   const minId = (ids: string[]): string => ids.reduce((m, x) => (x < m ? x : m), ids[0]!);
   const clusters = clusterResidual(points, SPLIT_CLUSTER_SEED)
-    .filter((c) => c.size >= SPLIT_MIN_CHILD_SIZE && c.cohesion >= SPLIT_MIN_CHILD_COHESION)
+    .filter(
+      (c) =>
+        c.size >= SPLIT_MIN_CHILD_SIZE &&
+        c.cohesion >= Math.max(SPLIT_MIN_CHILD_COHESION, parentCohesion + SPLIT_MIN_COHESION_GAIN),
+    )
     .sort((a, b) => b.size - a.size || minId(a.memberIds).localeCompare(minId(b.memberIds)))
     .slice(0, SPLIT_MAX_CHILDREN);
   if (clusters.length < 2) return null;
 
-  // Every kept child must be clearly tighter than the loose parent, or the split buys nothing.
-  if (clusters.some((c) => c.cohesion < parentCohesion + SPLIT_MIN_COHESION_GAIN)) return null;
-
-  // The children must be well separated from each other (smallest pairwise centroid gap).
   let minPairSeparation = 1;
   for (let i = 0; i < clusters.length; i++) {
     for (let j = i + 1; j < clusters.length; j++) {
@@ -154,36 +169,7 @@ function analyzeSplit(
   }
   if (minPairSeparation < SPLIT_MIN_CHILD_SEPARATION) return null;
 
-  // Deterministic, distinct labels from class-TF-IDF keyphrases of each subcluster's subjects.
-  const subjectsPerChild = clusters.map((c) =>
-    c.memberIds.map((id) => subjectById.get(id) ?? '').filter((s) => s.trim() !== ''),
-  );
-  const keyphrasesPerChild = clusterKeyphrases(subjectsPerChild);
-  const usedLabels = new Set<string>();
-  const usedKeys = new Set<string>();
-  const children: SplitChild[] = [];
-  for (let i = 0; i < clusters.length; i++) {
-    const phrase = keyphrasesPerChild[i]!.find((p) => !usedLabels.has(normalizeForMatch(p)));
-    if (!phrase) return null;
-    const label = titleCase(phrase);
-    const canonicalKey = canonicalKeyBase(label);
-    if (canonicalKey === '' || usedKeys.has(canonicalKey)) return null;
-    usedLabels.add(normalizeForMatch(phrase));
-    usedKeys.add(canonicalKey);
-    const c = clusters[i]!;
-    children.push({
-      label,
-      canonicalKey,
-      description: `"${label}" mail separated out of ${parentLabel}.`,
-      centroid: c.centroid,
-      memberIds: c.memberIds,
-      proposedCount: c.size,
-      cohesion: c.cohesion,
-      separation: c.separation,
-      confidence: clamp01(0.6 * c.cohesion + 0.4 * minPairSeparation),
-    });
-  }
-  return children;
+  return clusters;
 }
 
 /** Detects safe merge, retire, and split proposals from health metrics. Never applies a change. */
@@ -194,15 +180,22 @@ export class StructuralProposalService {
     private health: CategoryHealthService,
     private embeddings: EmbeddingRepository,
     private emails: EmailRepository,
+    private llm: LlmClient,
+    private getConfig: () => LlmConfig,
     private logger: Logger,
   ) {}
 
   /**
    * Scan the account's active auto categories and enqueue merge/retire/split proposals for the obvious
-   * cases. Reads health metrics, embeddings, and existing proposals; writes only proposal rows.
-   * Idempotent: a signature already pending, applied, or dismissed is skipped.
+   * cases. Reads health metrics, embeddings, and existing proposals, and (for split naming) calls the
+   * local model; writes only proposal rows. Idempotent: a signature already pending, applied, or
+   * dismissed is skipped.
    */
-  generate(accountId: string, embeddingModelId: string): StructuralGenerateResult {
+  async generate(
+    accountId: string,
+    embeddingModelId: string,
+    generationModelId: string,
+  ): Promise<StructuralGenerateResult> {
     const runId = randomUUID();
     const active = this.categories.listActive(accountId);
     const byId = new Map(active.map((c) => [c.id, c] as const));
@@ -323,16 +316,20 @@ export class StructuralProposalService {
       });
     }
 
-    // SPLIT: a loose active auto category whose auto members separate into distinct subclusters. Only
-    // categories that are large enough and not already tight are analyzed, and embeddings are loaded
-    // once, lazily, only when at least one category clears that cheap pre-filter.
-    const splitPre = active.filter(
-      (cat) =>
-        cat.source === 'auto' &&
-        cat.emailCount >= SPLIT_MIN_SIZE &&
-        (cohesionById.get(cat.id) ?? 1) < SPLIT_MAX_PARENT_COHESION &&
-        !existingKeys.has(`split:${cat.canonicalKey}`),
-    );
+    // SPLIT: a loose active auto category whose auto members separate into distinct subclusters that
+    // the local model can name as real, non-overlapping purposes. Only categories that are large
+    // enough and not already tight are analyzed; embeddings are loaded once, lazily, and the number of
+    // naming calls per run is bounded by SPLIT_MAX_NAMED_CANDIDATES.
+    const splitPre = active
+      .filter(
+        (cat) =>
+          cat.source === 'auto' &&
+          cat.emailCount >= SPLIT_MIN_SIZE &&
+          (cohesionById.get(cat.id) ?? 1) < SPLIT_MAX_PARENT_COHESION &&
+          !existingKeys.has(`split:${cat.canonicalKey}`),
+      )
+      .sort((a, b) => b.emailCount - a.emailCount)
+      .slice(0, SPLIT_MAX_NAMED_CANDIDATES);
     if (splitPre.length > 0) {
       const vecByMessage = new Map(
         this.embeddings
@@ -351,21 +348,15 @@ export class StructuralProposalService {
           const vec = vecByMessage.get(id);
           if (vec) points.push({ messageId: id, vector: vec });
         }
-        const subjectById = new Map(
-          this.emails
-            .summariesByIds(accountId, autoIds)
-            .map((s) => [s.messageId, s.subject ?? ''] as const),
+        const subclusters = detectSplitSubclusters(points, parentCohesion);
+        if (!subclusters) continue;
+        const children = await this.nameSplitChildren(
+          accountId,
+          embeddingModelId,
+          generationModelId,
+          subclusters,
         );
-        const children = analyzeSplit(cat.label, points, subjectById, parentCohesion);
         if (!children) continue;
-        // Never propose a split whose child would collide with an existing or sibling category; that
-        // split could not be applied anyway. applySplit re-checks this before any write.
-        const collides = children.some(
-          (c) =>
-            this.categories.findByCanonicalKey(accountId, c.canonicalKey) !== null ||
-            this.categories.findByLabel(accountId, c.label) !== null,
-        );
-        if (collides) continue;
         const key = `split:${cat.canonicalKey}`;
         const proposal = this.proposals.createSplit(
           {
@@ -424,5 +415,140 @@ export class StructuralProposalService {
       'structural proposal generation',
     );
     return { runId, created, mergeCandidates, retireCandidates, splitCandidates, skippedExisting };
+  }
+
+  /**
+   * Name a split's subclusters with the local model and keep only those whose names survive the
+   * deterministic validation gate (not vague, not a sender/brand, not overlapping the parent or an
+   * existing category, distinct from each other). Returns the kept children, or null when fewer than
+   * two survive or the naming call fails (in which case no split is proposed). Naming is local-only
+   * unless cloud discovery is explicitly enabled; a naming failure never aborts the whole run.
+   */
+  private async nameSplitChildren(
+    accountId: string,
+    embeddingModelId: string,
+    generationModelId: string,
+    subclusters: DiscoveredCluster[],
+  ): Promise<NamedSplitChild[] | null> {
+    const samples = subclusters.map((c) => this.sampleSubcluster(accountId, c));
+    const keyphrases = clusterKeyphrases(samples.map((s) => s.subjects));
+    const namingInputs: ClusterNamingInput[] = samples.map((s, i) => ({
+      index: i,
+      size: s.cluster.size,
+      keyphrases: keyphrases[i] ?? [],
+      sampleSubjects: s.subjects,
+      senderHints: s.senderTokens,
+    }));
+
+    const cfg = this.getConfig();
+    const provider = discoveryProvider(cfg);
+    assertDiscoveryLocal(cfg, provider);
+    const local = provider === 'main';
+    const model = local ? generationModelId : cfg.chatModel || generationModelId;
+    let raw: string;
+    try {
+      raw = await this.llm.chat({
+        model,
+        provider,
+        messages: buildNamingMessages(namingInputs, { noThink: local }),
+        responseFormat: 'json_object',
+        temperature: 0.2,
+        maxTokens: SPLIT_NAMING_OUTPUT_TOKENS,
+        think: local ? false : undefined,
+      });
+    } catch (err) {
+      this.logger.warn(
+        { accountId, err: String(err) },
+        'structural: split child naming failed, skipping split',
+      );
+      return null;
+    }
+
+    const parsed = parseNamedCandidates(raw, subclusters.length);
+    const candidates: NamedCandidate[] = parsed.map((p) => ({
+      clusterIndex: p.clusterIndex,
+      action: p.action,
+      label: p.label,
+      description: p.description,
+      suggestedKey: p.suggestedKey,
+      evidence: keyphrases[p.clusterIndex] ?? [],
+    }));
+
+    const activeCategories = this.activeCategoryRefs(accountId, embeddingModelId);
+    const totalResidual = subclusters.reduce((n, c) => n + c.size, 0);
+    const results = validateBatch(candidates, (c) => ({
+      cluster: subclusters[c.clusterIndex]!,
+      senderTokens: samples[c.clusterIndex]?.senderTokens ?? [],
+      totalResidual,
+      activeCategories,
+      existingSuggestedLabels: [],
+      existingSuggestedKeys: [],
+    }));
+
+    const children: NamedSplitChild[] = [];
+    const usedKeys = new Set<string>();
+    for (const r of results) {
+      if (!r.verdict.accepted) continue;
+      const cluster = subclusters[r.candidate.clusterIndex]!;
+      const label = r.candidate.label.trim();
+      const canonicalKey = canonicalKeyBase(label);
+      // A child must have a distinct key and must not collide with an existing category (which would
+      // block apply anyway, and usually means those emails should merge into it, not form a split).
+      if (canonicalKey === '' || usedKeys.has(canonicalKey)) continue;
+      if (
+        this.categories.findByCanonicalKey(accountId, canonicalKey) !== null ||
+        this.categories.findByLabel(accountId, label) !== null
+      ) {
+        continue;
+      }
+      usedKeys.add(canonicalKey);
+      children.push({
+        label,
+        description: r.candidate.description || `${label} mail.`,
+        canonicalKey,
+        centroid: cluster.centroid,
+        memberIds: cluster.memberIds,
+        proposedCount: cluster.size,
+        cohesion: cluster.cohesion,
+        separation: cluster.separation,
+        confidence: r.verdict.confidence,
+      });
+    }
+    return children.length >= 2 ? children : null;
+  }
+
+  /**
+   * A bounded, deterministic sample of one subcluster: the first NAMING_SAMPLE_PER_CLUSTER member
+   * subjects (member order is deterministic) and the brand tokens of their dominant sender domains.
+   */
+  private sampleSubcluster(
+    accountId: string,
+    cluster: DiscoveredCluster,
+  ): { cluster: DiscoveredCluster; subjects: string[]; senderTokens: string[] } {
+    const sampleIds = cluster.memberIds.slice(0, NAMING_SAMPLE_PER_CLUSTER);
+    const byId = new Map(
+      this.emails.summariesByIds(accountId, sampleIds).map((s) => [s.messageId, s] as const),
+    );
+    const ordered = sampleIds
+      .map((id) => byId.get(id))
+      .filter((s): s is EmailSummary => s !== undefined);
+    const subjects = ordered.map((s) => s.subject?.trim() ?? '').filter((s) => s.length > 0);
+    const freq = domainFrequency(ordered.map((s) => ({ fromAddr: s.fromAddr })));
+    return { cluster, subjects, senderTokens: [...brandTokens(freq)] };
+  }
+
+  /** Active categories with their stored centroids, as the gate needs them for overlap checks. */
+  private activeCategoryRefs(accountId: string, embeddingModelId: string): ActiveCategoryRef[] {
+    const centroids = new Map(
+      this.categories
+        .getCentroidEntries(accountId, embeddingModelId)
+        .map((c) => [c.categoryId, c.vector] as const),
+    );
+    return this.categories.listActive(accountId).map((c) => ({
+      label: c.label,
+      description: c.description,
+      centroid: centroids.get(c.id) ?? null,
+      createdBy: c.source,
+    }));
   }
 }

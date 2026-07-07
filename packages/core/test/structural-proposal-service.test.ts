@@ -1,14 +1,18 @@
 /**
  * Phase 3.3 detection tests: StructuralProposalService turns read-only health metrics into safe
- * merge/retire review-queue proposals. It proposes a merge only for near-duplicate active auto
- * categories, a retire only for empty active auto categories, never touches user-created categories,
- * dedups on suppressionKey (pending, applied, or dismissed), and writes only proposal rows.
+ * merge/retire/split review-queue proposals. It proposes a merge only for near-duplicate active auto
+ * categories, a retire only for empty active auto categories, and a split only when a loose category's
+ * subclusters can be named by the local model as distinct, non-overlapping purposes that survive the
+ * deterministic validation gate. It never touches user-created categories, dedups on suppressionKey,
+ * and writes only proposal rows.
  */
 import { describe, it, expect } from 'vitest';
 import type { Logger } from 'pino';
 import type { Database } from 'better-sqlite3';
 import { openDatabase } from '../src/db/database.js';
 import { EMBEDDING_DIM } from '../src/db/schema.js';
+import type { LlmClient } from '../src/llm/client.js';
+import type { LlmConfig } from '../src/config/schema.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { CategoryRepository } from '../src/repositories/category-repository.js';
 import { CategoryProposalRepository } from '../src/repositories/category-proposal-repository.js';
@@ -18,7 +22,52 @@ import { CategoryHealthService } from '../src/services/category-health-service.j
 import { StructuralProposalService } from '../src/services/structural-proposal-service.js';
 
 const MODEL = 'bge-m3';
+const GEN_MODEL = 'qwen';
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
+
+/** A local-model naming answer that names cluster 0 "Invoices Received" and cluster 1 "Flight Bookings". */
+const DEFAULT_NAMING = JSON.stringify({
+  clusters: [
+    {
+      clusterIndex: 0,
+      action: 'new_category',
+      label: 'Invoices Received',
+      description: 'Payment invoices.',
+      suggestedKey: 'finance.invoices',
+    },
+    {
+      clusterIndex: 1,
+      action: 'new_category',
+      label: 'Flight Bookings',
+      description: 'Flight reservations.',
+      suggestedKey: 'travel.flights',
+    },
+  ],
+});
+
+/**
+ * A naming answer that leaves both clusters uncategorized. The labels are otherwise VALID (they would
+ * pass the gate under `new_category`), so the only reason these children are rejected is the
+ * `leave_uncategorized` action itself; this keeps the test honest about the action gate.
+ */
+const UNCATEGORIZED_NAMING = JSON.stringify({
+  clusters: [
+    {
+      clusterIndex: 0,
+      action: 'leave_uncategorized',
+      label: 'Invoices Received',
+      description: 'Payment invoices.',
+      suggestedKey: 'finance.invoices',
+    },
+    {
+      clusterIndex: 1,
+      action: 'leave_uncategorized',
+      label: 'Flight Bookings',
+      description: 'Flight reservations.',
+      suggestedKey: 'travel.flights',
+    },
+  ],
+});
 
 function axis(dim: number): Float32Array {
   const v = new Float32Array(EMBEDDING_DIM);
@@ -34,7 +83,8 @@ function tiltedFromAxis0(v0: number, v1: number): Float32Array {
   return v;
 }
 
-function harness() {
+/** Builds the harness. `chat` is the local model's naming response (or a throw), only used for splits. */
+function harness(chat: () => Promise<string> = async () => DEFAULT_NAMING) {
   const db = openDatabase(':memory:');
   const accounts = new AccountRepository(db);
   const categories = new CategoryRepository(db);
@@ -42,12 +92,30 @@ function harness() {
   const embeddings = new EmbeddingRepository(db);
   const emails = new EmailRepository(db);
   const health = new CategoryHealthService(categories, embeddings);
+  const llm = {
+    chat,
+    async embed() {
+      return [];
+    },
+    async embedBatch() {
+      return [];
+    },
+    async health() {
+      return { ok: true, models: [] };
+    },
+    chatStream() {
+      return (async function* () {})();
+    },
+  } as unknown as LlmClient;
+  const getConfig = () => ({ allowCloudDiscovery: false }) as unknown as LlmConfig;
   const service = new StructuralProposalService(
     categories,
     proposals,
     health,
     embeddings,
     emails,
+    llm,
+    getConfig,
     silentLogger,
   );
   const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
@@ -106,7 +174,7 @@ function makeCategory(
  * Create an active auto category whose auto members fall into the given (dim, subject, count) groups,
  * so a test can shape a category that is coherent, multi-modal, or too thin to split. Each group's
  * members share one embedding axis and one subject, so the groups form distinct, well-separated
- * subclusters with deterministic class-TF-IDF keyphrases.
+ * subclusters.
  */
 function makeGroupedCategory(
   h: Harness,
@@ -154,6 +222,14 @@ function makeGroupedCategory(
   return cat;
 }
 
+/** A Big Bucket category: 8 invoice members on axis 0 and 8 travel members on axis 5 (a clean split). */
+function makeSplittable(h: Harness) {
+  return makeGroupedCategory(h, 'Big Bucket', 'big', [
+    { dim: 0, subject: 'invoices', count: 8 },
+    { dim: 5, subject: 'travel', count: 8 },
+  ]);
+}
+
 function tableCounts(db: Database) {
   const n = (t: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n;
   return {
@@ -166,13 +242,13 @@ function tableCounts(db: Database) {
 }
 
 describe('StructuralProposalService merge detection', () => {
-  it('creates one merge proposal for two clearly overlapping same-purpose active auto categories', () => {
+  it('creates one merge proposal for two clearly overlapping same-purpose active auto categories', async () => {
     const h = harness();
     // Invoices and Receipts both map to the same known purpose group, so a high-overlap merge is safe.
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
     makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     const merges = result.created.filter((c) => c.kind === 'merge');
     expect(merges).toHaveLength(1);
@@ -189,18 +265,18 @@ describe('StructuralProposalService merge detection', () => {
     expect(pending[0]!.sourceCategoryId).toBe(invoices.id);
   });
 
-  it('does not create a merge proposal for well-separated categories', () => {
+  it('does not create a merge proposal for well-separated categories', async () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
     makeCategory(h, 'Travel', 'travel', { centroid: axis(1), members: 3, memberDim: 1 });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
     expect(result.mergeCandidates).toBe(0);
   });
 
-  it('does not create a merge for a moderate overlap below the threshold', () => {
+  it('does not create a merge for a moderate overlap below the threshold', async () => {
     const h = harness();
     // Two auto categories with a genuine overlap of 0.8, which is below MERGE_MIN_OVERLAP (0.9).
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
@@ -210,13 +286,13 @@ describe('StructuralProposalService merge detection', () => {
       memberDim: 0,
     });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
     expect(result.mergeCandidates).toBe(0);
   });
 
-  it('creates a merge for an overlap just above the threshold', () => {
+  it('creates a merge for an overlap just above the threshold', async () => {
     const h = harness();
     // Overlap 0.95: above MERGE_MIN_OVERLAP (0.9) but well short of the identical-centroid case.
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
@@ -226,12 +302,12 @@ describe('StructuralProposalService merge detection', () => {
       memberDim: 0,
     });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(1);
   });
 
-  it('does not merge two distinct-purpose categories even at very high overlap', () => {
+  it('does not merge two distinct-purpose categories even at very high overlap', async () => {
     const h = harness();
     // Two transactional categories that collapse in embedding space (identical centroid axis) but map
     // to DIFFERENT known purposes: invoices vs shipping. A raw-overlap merge here would be wrong.
@@ -242,7 +318,7 @@ describe('StructuralProposalService merge detection', () => {
       memberDim: 0,
     });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
     // The pair was overlap-eligible (counted as a candidate) but rejected on purpose, not filtered
@@ -250,7 +326,7 @@ describe('StructuralProposalService merge detection', () => {
     expect(result.mergeCandidates).toBeGreaterThanOrEqual(1);
   });
 
-  it('merges near-duplicate-labelled categories that match no known purpose', () => {
+  it('merges near-duplicate-labelled categories that match no known purpose', async () => {
     const h = harness();
     // Neither label maps to a known purpose group, but the labels are near-duplicate, so a merge is
     // still a safe suggestion.
@@ -265,12 +341,12 @@ describe('StructuralProposalService merge detection', () => {
       memberDim: 0,
     });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(1);
   });
 
-  it('does not create a merge when the nearest category is user-created', () => {
+  it('does not create a merge when the nearest category is user-created', async () => {
     const h = harness();
     // An active AUTO category whose nearest stored centroid is an active USER category: no merge,
     // because a user-created category must never be entangled in an applicable structural proposal.
@@ -282,20 +358,20 @@ describe('StructuralProposalService merge detection', () => {
       memberDim: 0,
     });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
     expect(result.mergeCandidates).toBe(0);
   });
 
-  it('never merges an empty category that carries a stale overlapping centroid; only retires it', () => {
+  it('never merges an empty category that carries a stale overlapping centroid; only retires it', async () => {
     const h = harness();
     // Empty auto category with a saved centroid but zero assignments (a stale centroid), overlapping
     // a non-empty auto category. Without the guard the merge loop would also propose merging it.
     const empty = makeCategory(h, 'Empty', 'empty', { centroid: axis(0), members: 0 });
     makeCategory(h, 'Full', 'full', { centroid: axis(0), members: 3, memberDim: 0 });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     // Retire is the only structural proposal for the empty category.
     const retires = result.created.filter((c) => c.kind === 'retire');
@@ -306,19 +382,18 @@ describe('StructuralProposalService merge detection', () => {
     expect(result.mergeCandidates).toBe(0);
     expect(
       result.created.some(
-        (c) =>
-          c.kind === 'merge' && (c.categoryId === empty.id || c.sourceCategoryId === empty.id),
+        (c) => c.kind === 'merge' && (c.categoryId === empty.id || c.sourceCategoryId === empty.id),
       ),
     ).toBe(false);
   });
 });
 
 describe('StructuralProposalService retire detection', () => {
-  it('creates a retire proposal for an empty active auto category', () => {
+  it('creates a retire proposal for an empty active auto category', async () => {
     const h = harness();
     const empty = makeCategory(h, 'Empty', 'empty');
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     const retires = result.created.filter((c) => c.kind === 'retire');
     expect(retires).toHaveLength(1);
@@ -327,24 +402,24 @@ describe('StructuralProposalService retire detection', () => {
     expect(h.proposals.listPending(h.accountId).some((p) => p.kind === 'retire')).toBe(true);
   });
 
-  it('does not create a retire proposal for a category that still has assignments', () => {
+  it('does not create a retire proposal for a category that still has assignments', async () => {
     const h = harness();
     makeCategory(h, 'Busy', 'busy', { members: 2, memberDim: 0 });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'retire')).toHaveLength(0);
     expect(result.retireCandidates).toBe(0);
   });
 
-  it('does not recreate a retire proposal that is already pending', () => {
+  it('does not recreate a retire proposal that is already pending', async () => {
     const h = harness();
     makeCategory(h, 'Empty', 'empty');
 
-    const first = h.service.generate(h.accountId, MODEL);
+    const first = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(first.created.filter((c) => c.kind === 'retire')).toHaveLength(1);
 
-    const second = h.service.generate(h.accountId, MODEL);
+    const second = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(second.created.filter((c) => c.kind === 'retire')).toHaveLength(0);
     expect(second.skippedExisting).toBeGreaterThanOrEqual(1);
     // Still only one pending retire proposal.
@@ -353,7 +428,7 @@ describe('StructuralProposalService retire detection', () => {
 });
 
 describe('StructuralProposalService safety and dedup', () => {
-  it('does not create any proposal for user-created categories', () => {
+  it('does not create any proposal for user-created categories', async () => {
     const h = harness();
     // An empty user category (retire candidate shape) and two overlapping user categories (merge shape).
     makeCategory(h, 'User Empty', 'user_empty', { source: 'user' });
@@ -370,50 +445,50 @@ describe('StructuralProposalService safety and dedup', () => {
       memberDim: 0,
     });
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created).toHaveLength(0);
     expect(result.mergeCandidates).toBe(0);
     expect(result.retireCandidates).toBe(0);
   });
 
-  it('does not duplicate an equivalent pending structural proposal', () => {
+  it('does not duplicate an equivalent pending structural proposal', async () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
     makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
 
-    const first = h.service.generate(h.accountId, MODEL);
+    const first = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(first.created.filter((c) => c.kind === 'merge')).toHaveLength(1);
 
-    const second = h.service.generate(h.accountId, MODEL);
+    const second = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(second.created).toHaveLength(0);
     expect(second.skippedExisting).toBeGreaterThanOrEqual(1);
     // Still only one pending merge proposal.
     expect(h.proposals.listPending(h.accountId).filter((p) => p.kind === 'merge')).toHaveLength(1);
   });
 
-  it('does not recreate a dismissed proposal with the same suppression key', () => {
+  it('does not recreate a dismissed proposal with the same suppression key', async () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
     makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
 
-    const first = h.service.generate(h.accountId, MODEL);
+    const first = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     const mergeId = first.created.find((c) => c.kind === 'merge')!.id;
     h.proposals.markDismissed(mergeId);
 
-    const second = h.service.generate(h.accountId, MODEL);
+    const second = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(second.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
     expect(second.skippedExisting).toBeGreaterThanOrEqual(1);
   });
 
-  it('writes nothing but proposal rows', () => {
+  it('writes nothing but proposal rows', async () => {
     const h = harness();
     makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
     makeCategory(h, 'Receipts', 'receipts', { centroid: axis(0), members: 5, memberDim: 0 });
     makeCategory(h, 'Empty', 'empty');
 
     const before = tableCounts(h.db);
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     const after = tableCounts(h.db);
 
     // At least one proposal was created; only category_proposals grew.
@@ -429,16 +504,13 @@ describe('StructuralProposalService safety and dedup', () => {
 });
 
 describe('StructuralProposalService split detection', () => {
-  it('proposes a split for a loose category with two separable, well-labelled subclusters', () => {
+  it('proposes a split whose children carry the local-model names that survive the gate', async () => {
     const h = harness();
-    // 16 auto members: 8 "invoices" on one axis and 8 "travel" on an orthogonal axis. The category is
-    // loose overall (cohesion ~0.71) but each half is tight and clearly separated.
-    const source = makeGroupedCategory(h, 'Big Bucket', 'big', [
-      { dim: 0, subject: 'invoices', count: 8 },
-      { dim: 5, subject: 'travel', count: 8 },
-    ]);
+    // 16 auto members: 8 "invoices" on one axis and 8 "travel" on an orthogonal axis. The model names
+    // the two subclusters as distinct purposes.
+    const source = makeSplittable(h);
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     const splits = result.created.filter((c) => c.kind === 'split');
     expect(splits).toHaveLength(1);
@@ -450,23 +522,19 @@ describe('StructuralProposalService split detection', () => {
     expect(pending).toHaveLength(1);
     const children = h.proposals.listChildren(pending[0]!.id);
     expect(children).toHaveLength(2);
-    // Labels come from deterministic class-TF-IDF keyphrases of each subcluster's subjects.
-    expect(children.map((c) => c.label).sort()).toEqual(['Invoices', 'Travel']);
-    // Each child claims its 8 auto members and none is shared.
+    // Labels come from the local model (two words each), not from a raw single keyphrase.
+    expect(children.map((c) => c.label).sort()).toEqual(['Flight Bookings', 'Invoices Received']);
     expect(children.every((c) => c.proposedCount === 8)).toBe(true);
     const allChildMembers = children.flatMap((c) => c.memberIds);
     expect(new Set(allChildMembers).size).toBe(16);
   });
 
-  it('writes only proposal and child rows, mutating no category or assignment', () => {
+  it('writes only proposal and child rows, mutating no category or assignment', async () => {
     const h = harness();
-    makeGroupedCategory(h, 'Big Bucket', 'big', [
-      { dim: 0, subject: 'invoices', count: 8 },
-      { dim: 5, subject: 'travel', count: 8 },
-    ]);
+    makeSplittable(h);
 
     const before = tableCounts(h.db);
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     const after = tableCounts(h.db);
 
     expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(1);
@@ -477,35 +545,74 @@ describe('StructuralProposalService split detection', () => {
     expect(h.categories.listActive(h.accountId)).toHaveLength(1);
   });
 
-  it('does not split a coherent single-mode category', () => {
+  it('abandons the split when the model marks the subclusters uncategorized', async () => {
+    const h = harness(async () => UNCATEGORIZED_NAMING);
+    makeSplittable(h);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    // It was analyzed (structurally multi-modal) but produced no nameable children.
+    expect(result.splitCandidates).toBeGreaterThanOrEqual(1);
+  });
+
+  it('abandons the split when a child would duplicate an existing active category', async () => {
     const h = harness();
-    // 16 auto members all on one axis: tight (cohesion ~1.0), so it is excluded before analysis.
+    // An existing "Invoices" category makes the "Invoices Received" child overlap it, so only the
+    // travel child survives the gate; with fewer than two children the split is abandoned.
+    makeCategory(h, 'Invoices', 'invoices', { centroid: axis(0), members: 3, memberDim: 0 });
+    makeSplittable(h);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    expect(h.categories.findByLabel(h.accountId, 'Invoices')).not.toBeNull();
+  });
+
+  it('abandons the split but still proposes retire when the naming call fails', async () => {
+    const h = harness(async () => {
+      throw new Error('local model unavailable');
+    });
+    makeSplittable(h);
+    const empty = makeCategory(h, 'Empty', 'empty');
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    // No split (naming failed) but the retire is unaffected: naming never aborts the whole run.
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    const retires = result.created.filter((c) => c.kind === 'retire');
+    expect(retires).toHaveLength(1);
+    expect(retires[0]!.categoryId).toBe(empty.id);
+  });
+
+  it('does not split a coherent single-mode category', async () => {
+    const h = harness();
+    // 16 auto members all on one axis: tight (cohesion ~1.0), so it is excluded before naming.
     makeGroupedCategory(h, 'Tidy', 'tidy', [{ dim: 0, subject: 'invoices', count: 16 }]);
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
     expect(result.splitCandidates).toBe(0);
   });
 
-  it('does not split when the subclusters are too thin to be viable child categories', () => {
+  it('does not split when the subclusters are too thin to be viable child categories', async () => {
     const h = harness();
     // 12 members across three orthogonal axes of 4 each: loose enough to analyze, but every
-    // subcluster is below SPLIT_MIN_CHILD_SIZE, so no split is proposed.
+    // subcluster is below SPLIT_MIN_CHILD_SIZE, so no split is proposed and naming is never called.
     makeGroupedCategory(h, 'Thin Groups', 'thin', [
       { dim: 0, subject: 'invoices', count: 4 },
       { dim: 5, subject: 'travel', count: 4 },
       { dim: 9, subject: 'newsletters', count: 4 },
     ]);
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
-    // It cleared the cheap pre-filter (loose and large enough) but failed the child-size gate.
     expect(result.splitCandidates).toBeGreaterThanOrEqual(1);
   });
 
-  it('does not consider a category below the minimum split size', () => {
+  it('does not consider a category below the minimum split size', async () => {
     const h = harness();
     // Two clean, separable halves of 5 each, but only 10 members total: below SPLIT_MIN_SIZE.
     makeGroupedCategory(h, 'Small', 'small', [
@@ -513,20 +620,17 @@ describe('StructuralProposalService split detection', () => {
       { dim: 5, subject: 'travel', count: 5 },
     ]);
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
     expect(result.splitCandidates).toBe(0);
   });
 
-  it('leaves user-confirmed members off the proposed children', () => {
+  it('leaves user-confirmed members off the proposed children', async () => {
     const h = harness();
-    const source = makeGroupedCategory(h, 'Big Bucket', 'big', [
-      { dim: 0, subject: 'invoices', count: 8 },
-      { dim: 5, subject: 'travel', count: 8 },
-    ]);
-    // Add a user-confirmed member on a third axis. Split moves only auto rows, so it must not appear
-    // in any child's member list.
+    const source = makeSplittable(h);
+    // A user-confirmed member on a third axis. Split children carry only auto members, so it must not
+    // appear in any child's member list.
     h.emails.upsertBatch([
       {
         messageId: 'user-msg',
@@ -552,7 +656,7 @@ describe('StructuralProposalService split detection', () => {
       },
     ]);
 
-    const result = h.service.generate(h.accountId, MODEL);
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
 
     const pending = h.proposals.listPending(h.accountId).filter((p) => p.kind === 'split');
     expect(pending).toHaveLength(1);
@@ -560,29 +664,24 @@ describe('StructuralProposalService split detection', () => {
     expect(allChildMembers).not.toContain('user-msg');
   });
 
-  it('does not re-propose a split whose suppression key is already pending or dismissed', () => {
+  it('does not re-propose a split whose suppression key is already pending or dismissed', async () => {
     const h = harness();
-    makeGroupedCategory(h, 'Big Bucket', 'big', [
-      { dim: 0, subject: 'invoices', count: 8 },
-      { dim: 5, subject: 'travel', count: 8 },
-    ]);
+    makeSplittable(h);
 
-    const first = h.service.generate(h.accountId, MODEL);
+    const first = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     const split = first.created.find((c) => c.kind === 'split')!;
     expect(split).toBeDefined();
 
-    // A second run with the split still pending proposes nothing new for it.
-    const second = h.service.generate(h.accountId, MODEL);
+    const second = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(second.created.filter((c) => c.kind === 'split')).toHaveLength(0);
 
-    // Still true after the split is dismissed: the suppression key blocks a re-propose.
     h.proposals.markDismissed(split.id);
-    const third = h.service.generate(h.accountId, MODEL);
+    const third = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
     expect(third.created.filter((c) => c.kind === 'split')).toHaveLength(0);
     expect(h.proposals.listPending(h.accountId).filter((p) => p.kind === 'split')).toHaveLength(0);
   });
 
-  it('is deterministic: identical input yields the same child labels and keys across runs', () => {
+  it('is deterministic: identical input and naming yield the same children across runs', async () => {
     const groups = [
       { dim: 0, subject: 'invoices', count: 8 },
       { dim: 5, subject: 'travel', count: 8 },
@@ -592,8 +691,8 @@ describe('StructuralProposalService split detection', () => {
     const b = harness();
     makeGroupedCategory(b, 'Big Bucket', 'big', groups);
 
-    const ra = a.service.generate(a.accountId, MODEL);
-    const rb = b.service.generate(b.accountId, MODEL);
+    const ra = await a.service.generate(a.accountId, MODEL, GEN_MODEL);
+    const rb = await b.service.generate(b.accountId, MODEL, GEN_MODEL);
 
     const childrenA = a.proposals.listChildren(ra.created.find((c) => c.kind === 'split')!.id);
     const childrenB = b.proposals.listChildren(rb.created.find((c) => c.kind === 'split')!.id);

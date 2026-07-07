@@ -147,8 +147,13 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       };
     }
     const embeddingModelId = parsed.data.embeddingModelId ?? ctx.config.llm.embeddingModel;
+    const generationModelId = ctx.config.llm.generationModel;
     try {
-      return ctx.services.structuralProposal.generate(parsed.data.accountId, embeddingModelId);
+      return await ctx.services.structuralProposal.generate(
+        parsed.data.accountId,
+        embeddingModelId,
+        generationModelId,
+      );
     } catch (err) {
       ctx.logger.error({ err }, 'structural proposal generation failed');
       reply.code(500).send({

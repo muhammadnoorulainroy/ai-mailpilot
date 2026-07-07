@@ -193,6 +193,8 @@ export function buildContext(): AppContext {
       categoryHealth,
       repos.embeddings,
       repos.emails,
+      llm,
+      () => config.llm,
       logger,
     ),
     category: new CategoryOrchestrator(
