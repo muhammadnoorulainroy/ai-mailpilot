@@ -355,6 +355,7 @@ export class StructuralProposalService {
           embeddingModelId,
           generationModelId,
           subclusters,
+          purposeSignature(cat.label, cat.description),
         );
         if (!children) continue;
         const key = `split:${cat.canonicalKey}`;
@@ -423,12 +424,18 @@ export class StructuralProposalService {
    * existing category, distinct from each other). Returns the kept children, or null when fewer than
    * two survive or the naming call fails (in which case no split is proposed). Naming is local-only
    * unless cloud discovery is explicitly enabled; a naming failure never aborts the whole run.
+   *
+   * `parentSig` is the parent category's canonical purpose group (or null for a generic/mixed bucket).
+   * When the parent is a recognized purpose, the split is only kept if a child introduces a genuinely
+   * DIFFERENT purpose; children that are all sub-variants of the parent's own purpose (Shipping ->
+   * Package / Order / Delivered) are fragmentation, not a real split, and the split is abandoned.
    */
   private async nameSplitChildren(
     accountId: string,
     embeddingModelId: string,
     generationModelId: string,
     subclusters: DiscoveredCluster[],
+    parentSig: number | null,
   ): Promise<NamedSplitChild[] | null> {
     const samples = subclusters.map((c) => this.sampleSubcluster(accountId, c));
     const keyphrases = clusterKeyphrases(samples.map((s) => s.subjects));
@@ -514,7 +521,20 @@ export class StructuralProposalService {
         confidence: r.verdict.confidence,
       });
     }
-    return children.length >= 2 ? children : null;
+    if (children.length < 2) return null;
+
+    // Parent-purpose gate: when the parent is itself a recognized purpose (a mature category, not a
+    // generic/mixed bucket), only split it if some child introduces a genuinely DIFFERENT purpose.
+    // Children that all map to the parent's own purpose (or to no distinguishing purpose) are
+    // sub-variants, not a real split, so the split is abandoned.
+    if (parentSig !== null) {
+      const introducesNewPurpose = children.some((c) => {
+        const sig = purposeSignature(c.label, c.description);
+        return sig !== null && sig !== parentSig;
+      });
+      if (!introducesNewPurpose) return null;
+    }
+    return children;
   }
 
   /**

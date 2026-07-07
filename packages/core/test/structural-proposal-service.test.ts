@@ -69,6 +69,46 @@ const UNCATEGORIZED_NAMING = JSON.stringify({
   ],
 });
 
+/** Names both subclusters as sub-variants of the SAME shipping purpose (valid labels, no distinct purpose). */
+const SHIPPING_NAMING = JSON.stringify({
+  clusters: [
+    {
+      clusterIndex: 0,
+      action: 'new_category',
+      label: 'Package Tracking',
+      description: 'Package tracking updates.',
+      suggestedKey: 'shipping.tracking',
+    },
+    {
+      clusterIndex: 1,
+      action: 'new_category',
+      label: 'Delivery Dispatch',
+      description: 'Delivery dispatch notices.',
+      suggestedKey: 'shipping.dispatch',
+    },
+  ],
+});
+
+/** Names both subclusters as promotional fragments (rejected by the marketing/low-value gate). */
+const MARKETING_NAMING = JSON.stringify({
+  clusters: [
+    {
+      clusterIndex: 0,
+      action: 'new_category',
+      label: 'Sale',
+      description: '',
+      suggestedKey: 'sale',
+    },
+    {
+      clusterIndex: 1,
+      action: 'new_category',
+      label: 'Deals',
+      description: '',
+      suggestedKey: 'deals',
+    },
+  ],
+});
+
 function axis(dim: number): Float32Array {
   const v = new Float32Array(EMBEDDING_DIM);
   v[dim] = 1;
@@ -699,5 +739,91 @@ describe('StructuralProposalService split detection', () => {
     expect(childrenA.map((c) => `${c.label}:${c.canonicalKey}:${c.proposedCount}`)).toEqual(
       childrenB.map((c) => `${c.label}:${c.canonicalKey}:${c.proposedCount}`),
     );
+  });
+});
+
+describe('StructuralProposalService split parent-purpose gate', () => {
+  it('rejects splitting a mature purpose category into same-purpose sub-variants', async () => {
+    // Shipping -> Package Tracking / Delivery Dispatch: both children are valid labels that PASS the
+    // validation gate, but both map to the parent's own shipping purpose, so the parent-purpose gate
+    // is the sole reason the split is abandoned.
+    const h = harness(async () => SHIPPING_NAMING);
+    makeGroupedCategory(h, 'Shipping and Deliveries', 'shipping_and_deliveries', [
+      { dim: 0, subject: 'package tracking', count: 8 },
+      { dim: 5, subject: 'delivery dispatch', count: 8 },
+    ]);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    // It was analyzed as structurally multi-modal, but rejected as same-purpose fragmentation.
+    expect(result.splitCandidates).toBeGreaterThanOrEqual(1);
+  });
+
+  it('rejects splitting a marketing category into promotional fragments', async () => {
+    // Marketing -> Sale / Deals: promotional labels are rejected by the marketing/low-value gate, so
+    // fewer than two children survive and the split is abandoned.
+    const h = harness(async () => MARKETING_NAMING);
+    makeGroupedCategory(h, 'Marketing Promotions', 'marketing_promotions', [
+      { dim: 0, subject: 'sale offer', count: 8 },
+      { dim: 5, subject: 'deals discount', count: 8 },
+    ]);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+  });
+
+  it('allows splitting a generic/mixed category into genuinely distinct purposes', async () => {
+    // "Mixed" has no purpose signature, so the parent-purpose gate does not fire; its two children map
+    // to distinct purposes (invoices, travel) and the split is proposed.
+    const h = harness();
+    makeGroupedCategory(h, 'Mixed', 'mixed', [
+      { dim: 0, subject: 'invoices', count: 8 },
+      { dim: 5, subject: 'travel', count: 8 },
+    ]);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    const splits = result.created.filter((c) => c.kind === 'split');
+    expect(splits).toHaveLength(1);
+    const children = h.proposals.listChildren(splits[0]!.id);
+    expect(children.map((c) => c.label).sort()).toEqual(['Flight Bookings', 'Invoices Received']);
+  });
+
+  it('allows splitting a mature purpose category when a child introduces a different purpose', async () => {
+    // A "Banking Transactions" bucket that also hides travel mail: one child stays in the bank purpose,
+    // the other (Flight Bookings) is a distinct purpose, so the split is allowed.
+    const h = harness(async () =>
+      JSON.stringify({
+        clusters: [
+          {
+            clusterIndex: 0,
+            action: 'new_category',
+            label: 'Card Statements',
+            description: 'Bank card statements.',
+            suggestedKey: 'bank.statements',
+          },
+          {
+            clusterIndex: 1,
+            action: 'new_category',
+            label: 'Flight Bookings',
+            description: 'Flight reservations.',
+            suggestedKey: 'travel.flights',
+          },
+        ],
+      }),
+    );
+    makeGroupedCategory(h, 'Banking Transactions', 'banking_transactions', [
+      { dim: 0, subject: 'card statement', count: 8 },
+      { dim: 5, subject: 'flight booking', count: 8 },
+    ]);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    const splits = result.created.filter((c) => c.kind === 'split');
+    expect(splits).toHaveLength(1);
+    const children = h.proposals.listChildren(splits[0]!.id);
+    expect(children.map((c) => c.label).sort()).toEqual(['Card Statements', 'Flight Bookings']);
   });
 });
