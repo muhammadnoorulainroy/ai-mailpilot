@@ -42,7 +42,14 @@ function harness() {
   const embeddings = new EmbeddingRepository(db);
   const emails = new EmailRepository(db);
   const health = new CategoryHealthService(categories, embeddings);
-  const service = new StructuralProposalService(categories, proposals, health, silentLogger);
+  const service = new StructuralProposalService(
+    categories,
+    proposals,
+    health,
+    embeddings,
+    emails,
+    silentLogger,
+  );
   const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
   return { db, categories, proposals, embeddings, emails, service, accountId: acc.id };
 }
@@ -91,6 +98,58 @@ function makeCategory(
         method: 'embed',
       },
     ]);
+  }
+  return cat;
+}
+
+/**
+ * Create an active auto category whose auto members fall into the given (dim, subject, count) groups,
+ * so a test can shape a category that is coherent, multi-modal, or too thin to split. Each group's
+ * members share one embedding axis and one subject, so the groups form distinct, well-separated
+ * subclusters with deterministic class-TF-IDF keyphrases.
+ */
+function makeGroupedCategory(
+  h: Harness,
+  label: string,
+  key: string,
+  groups: Array<{ dim: number; subject: string; count: number }>,
+) {
+  const cat = h.categories.create({
+    accountId: h.accountId,
+    label,
+    source: 'auto',
+    status: 'active',
+    canonicalKey: key,
+  });
+  let idx = 0;
+  for (const g of groups) {
+    for (let i = 0; i < g.count; i++) {
+      const messageId = `${key}-m${idx++}`;
+      h.emails.upsertBatch([
+        {
+          messageId,
+          accountId: h.accountId,
+          folder: 'INBOX',
+          subject: g.subject,
+          fromAddr: 'a@b.com',
+        },
+      ]);
+      h.embeddings.saveEmbedding(
+        { messageId, accountId: h.accountId, modelId: MODEL },
+        axis(g.dim),
+      );
+      h.categories.addAutoAssignments(h.accountId, [
+        {
+          messageId,
+          accountId: h.accountId,
+          categoryId: cat.id,
+          confidence: 0.5,
+          assignedBy: 'auto',
+          assignedAt: Date.now(),
+          method: 'embed',
+        },
+      ]);
+    }
   }
   return cat;
 }
@@ -366,5 +425,180 @@ describe('StructuralProposalService safety and dedup', () => {
     expect(after.audit).toBe(before.audit);
     // No category was retired or otherwise mutated: all three are still active.
     expect(h.categories.listActive(h.accountId)).toHaveLength(3);
+  });
+});
+
+describe('StructuralProposalService split detection', () => {
+  it('proposes a split for a loose category with two separable, well-labelled subclusters', () => {
+    const h = harness();
+    // 16 auto members: 8 "invoices" on one axis and 8 "travel" on an orthogonal axis. The category is
+    // loose overall (cohesion ~0.71) but each half is tight and clearly separated.
+    const source = makeGroupedCategory(h, 'Big Bucket', 'big', [
+      { dim: 0, subject: 'invoices', count: 8 },
+      { dim: 5, subject: 'travel', count: 8 },
+    ]);
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    const splits = result.created.filter((c) => c.kind === 'split');
+    expect(splits).toHaveLength(1);
+    expect(splits[0]!.categoryId).toBe(source.id);
+    expect(splits[0]!.sourceCategoryId).toBeNull();
+    expect(splits[0]!.suppressionKey).toBe('split:big');
+
+    const pending = h.proposals.listPending(h.accountId).filter((p) => p.kind === 'split');
+    expect(pending).toHaveLength(1);
+    const children = h.proposals.listChildren(pending[0]!.id);
+    expect(children).toHaveLength(2);
+    // Labels come from deterministic class-TF-IDF keyphrases of each subcluster's subjects.
+    expect(children.map((c) => c.label).sort()).toEqual(['Invoices', 'Travel']);
+    // Each child claims its 8 auto members and none is shared.
+    expect(children.every((c) => c.proposedCount === 8)).toBe(true);
+    const allChildMembers = children.flatMap((c) => c.memberIds);
+    expect(new Set(allChildMembers).size).toBe(16);
+  });
+
+  it('writes only proposal and child rows, mutating no category or assignment', () => {
+    const h = harness();
+    makeGroupedCategory(h, 'Big Bucket', 'big', [
+      { dim: 0, subject: 'invoices', count: 8 },
+      { dim: 5, subject: 'travel', count: 8 },
+    ]);
+
+    const before = tableCounts(h.db);
+    const result = h.service.generate(h.accountId, MODEL);
+    const after = tableCounts(h.db);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(1);
+    expect(after.categories).toBe(before.categories);
+    expect(after.emailCategories).toBe(before.emailCategories);
+    expect(after.centroids).toBe(before.centroids);
+    // The source category is untouched: still active with all 16 members.
+    expect(h.categories.listActive(h.accountId)).toHaveLength(1);
+  });
+
+  it('does not split a coherent single-mode category', () => {
+    const h = harness();
+    // 16 auto members all on one axis: tight (cohesion ~1.0), so it is excluded before analysis.
+    makeGroupedCategory(h, 'Tidy', 'tidy', [{ dim: 0, subject: 'invoices', count: 16 }]);
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    expect(result.splitCandidates).toBe(0);
+  });
+
+  it('does not split when the subclusters are too thin to be viable child categories', () => {
+    const h = harness();
+    // 12 members across three orthogonal axes of 4 each: loose enough to analyze, but every
+    // subcluster is below SPLIT_MIN_CHILD_SIZE, so no split is proposed.
+    makeGroupedCategory(h, 'Thin Groups', 'thin', [
+      { dim: 0, subject: 'invoices', count: 4 },
+      { dim: 5, subject: 'travel', count: 4 },
+      { dim: 9, subject: 'newsletters', count: 4 },
+    ]);
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    // It cleared the cheap pre-filter (loose and large enough) but failed the child-size gate.
+    expect(result.splitCandidates).toBeGreaterThanOrEqual(1);
+  });
+
+  it('does not consider a category below the minimum split size', () => {
+    const h = harness();
+    // Two clean, separable halves of 5 each, but only 10 members total: below SPLIT_MIN_SIZE.
+    makeGroupedCategory(h, 'Small', 'small', [
+      { dim: 0, subject: 'invoices', count: 5 },
+      { dim: 5, subject: 'travel', count: 5 },
+    ]);
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    expect(result.splitCandidates).toBe(0);
+  });
+
+  it('leaves user-confirmed members off the proposed children', () => {
+    const h = harness();
+    const source = makeGroupedCategory(h, 'Big Bucket', 'big', [
+      { dim: 0, subject: 'invoices', count: 8 },
+      { dim: 5, subject: 'travel', count: 8 },
+    ]);
+    // Add a user-confirmed member on a third axis. Split moves only auto rows, so it must not appear
+    // in any child's member list.
+    h.emails.upsertBatch([
+      {
+        messageId: 'user-msg',
+        accountId: h.accountId,
+        folder: 'INBOX',
+        subject: 'personal note',
+        fromAddr: 'me@x.com',
+      },
+    ]);
+    h.embeddings.saveEmbedding(
+      { messageId: 'user-msg', accountId: h.accountId, modelId: MODEL },
+      axis(9),
+    );
+    h.categories.addAutoAssignments(h.accountId, [
+      {
+        messageId: 'user-msg',
+        accountId: h.accountId,
+        categoryId: source.id,
+        confidence: 1,
+        assignedBy: 'user',
+        assignedAt: Date.now(),
+        method: 'llm',
+      },
+    ]);
+
+    const result = h.service.generate(h.accountId, MODEL);
+
+    const pending = h.proposals.listPending(h.accountId).filter((p) => p.kind === 'split');
+    expect(pending).toHaveLength(1);
+    const allChildMembers = h.proposals.listChildren(pending[0]!.id).flatMap((c) => c.memberIds);
+    expect(allChildMembers).not.toContain('user-msg');
+  });
+
+  it('does not re-propose a split whose suppression key is already pending or dismissed', () => {
+    const h = harness();
+    makeGroupedCategory(h, 'Big Bucket', 'big', [
+      { dim: 0, subject: 'invoices', count: 8 },
+      { dim: 5, subject: 'travel', count: 8 },
+    ]);
+
+    const first = h.service.generate(h.accountId, MODEL);
+    const split = first.created.find((c) => c.kind === 'split')!;
+    expect(split).toBeDefined();
+
+    // A second run with the split still pending proposes nothing new for it.
+    const second = h.service.generate(h.accountId, MODEL);
+    expect(second.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+
+    // Still true after the split is dismissed: the suppression key blocks a re-propose.
+    h.proposals.markDismissed(split.id);
+    const third = h.service.generate(h.accountId, MODEL);
+    expect(third.created.filter((c) => c.kind === 'split')).toHaveLength(0);
+    expect(h.proposals.listPending(h.accountId).filter((p) => p.kind === 'split')).toHaveLength(0);
+  });
+
+  it('is deterministic: identical input yields the same child labels and keys across runs', () => {
+    const groups = [
+      { dim: 0, subject: 'invoices', count: 8 },
+      { dim: 5, subject: 'travel', count: 8 },
+    ];
+    const a = harness();
+    makeGroupedCategory(a, 'Big Bucket', 'big', groups);
+    const b = harness();
+    makeGroupedCategory(b, 'Big Bucket', 'big', groups);
+
+    const ra = a.service.generate(a.accountId, MODEL);
+    const rb = b.service.generate(b.accountId, MODEL);
+
+    const childrenA = a.proposals.listChildren(ra.created.find((c) => c.kind === 'split')!.id);
+    const childrenB = b.proposals.listChildren(rb.created.find((c) => c.kind === 'split')!.id);
+    expect(childrenA.map((c) => `${c.label}:${c.canonicalKey}:${c.proposedCount}`)).toEqual(
+      childrenB.map((c) => `${c.label}:${c.canonicalKey}:${c.proposedCount}`),
+    );
   });
 });

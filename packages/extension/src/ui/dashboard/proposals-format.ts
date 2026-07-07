@@ -33,11 +33,42 @@ export function proposalActionLabel(kind: ProposalKindDto): string {
 }
 
 /**
- * Whether the primary action is safe to offer from this queue. A split hides which child categories
- * it would create (that detail is not exposed to the review view), so it is never applyable here.
+ * Whether the primary action is safe to offer from this queue. Every kind is applyable except a
+ * split that carries fewer than two reviewable child categories: the backend blocks such a split, so
+ * the queue disables it rather than offering an action that would only fail.
  */
-export function proposalIsApplyable(kind: ProposalKindDto): boolean {
-  return kind !== 'split';
+export function proposalIsApplyable(kind: ProposalKindDto, childCount = 0): boolean {
+  if (kind === 'split') return childCount >= 2;
+  return true;
+}
+
+/** The reason a proposal's primary action is disabled, or null when it is applyable. */
+export function proposalDisabledReason(kind: ProposalKindDto, childCount = 0): string | null {
+  if (kind === 'split' && childCount < 2) {
+    return 'This split has no reviewable child categories, so it cannot be applied. You can ignore it.';
+  }
+  return null;
+}
+
+/** A short line describing how much mail a structural proposal touches, or null for new_category. */
+export function proposalAffectedLine(kind: ProposalKindDto, affectedCount: number): string | null {
+  const emails = `${affectedCount} email${affectedCount === 1 ? '' : 's'}`;
+  switch (kind) {
+    case 'retire':
+      return `${emails} currently assigned`;
+    case 'merge':
+      return `moves up to ${emails} from the source category`;
+    case 'split':
+      return `${emails} to reassign into the child categories`;
+    default:
+      return null;
+  }
+}
+
+/** A warning line naming how many user-confirmed assignments a change affects, or null when none. */
+export function proposalUserImpactNote(count: number): string | null {
+  if (count <= 0) return null;
+  return `${count} user-confirmed assignment${count === 1 ? '' : 's'} affected`;
 }
 
 /** The status line after applying a proposal, phrased for its kind (never "Added" for merge/retire/split). */

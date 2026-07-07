@@ -1225,4 +1225,39 @@ describe('DiscoveryProposalOrchestrator.listPending kind-awareness', () => {
     // retire carries kind='retire' with a null source.
     expect(byId.get(retire.id)).toMatchObject({ kind: 'retire', sourceCategoryId: null });
   });
+
+  it('enriches structural proposals with live affected counts, user impact, and split children', () => {
+    const h = harness();
+
+    // A merge whose source holds one auto member and one user member.
+    const mSrc = activeCategory(h, 'Merge Src', 'msrc');
+    const mDst = activeCategory(h, 'Merge Dst', 'mdst');
+    seedAutoOnSource(h, 'm-auto', mSrc.id);
+    seedEmailWithEmbedding(h, 'm-user', 3);
+    assignUser(h, 'm-user', mSrc.id);
+    const merge = mergeProposal(h, mSrc.id, mDst.id, 'msrc', 'mdst');
+
+    // A split whose source holds two auto members, each destined for one child.
+    const sSrc = activeCategory(h, 'Split Src', 'ssrc');
+    seedAutoOnSource(h, 's-a', sSrc.id);
+    seedAutoOnSource(h, 's-b', sSrc.id);
+    const split = splitProposal(h, sSrc.id, 'ssrc');
+    addChild(h, split.id, 'Child A', 'child_a', ['s-a'], axis(4));
+    addChild(h, split.id, 'Child B', 'child_b', ['s-b'], axis(5));
+
+    const byId = new Map(h.orchestrator.listPending(h.accountId).map((p) => [p.id, p]));
+
+    // The merge reports the source's live counts (2 assigned, 1 of them user-confirmed).
+    const mergeView = byId.get(merge.id)!;
+    expect(mergeView.affectedCount).toBe(2);
+    expect(mergeView.userImpactCount).toBe(1);
+    expect(mergeView.children).toBeUndefined();
+
+    // The split reports its source's live count and its child categories.
+    const splitView = byId.get(split.id)!;
+    expect(splitView.affectedCount).toBe(2);
+    expect(splitView.userImpactCount).toBe(0);
+    expect(splitView.children).toHaveLength(2);
+    expect(splitView.children!.map((c) => c.label).sort()).toEqual(['Child A', 'Child B']);
+  });
 });

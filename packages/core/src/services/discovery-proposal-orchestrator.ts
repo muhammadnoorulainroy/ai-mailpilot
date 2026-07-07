@@ -59,6 +59,16 @@ export interface GenerateResult {
   rejected: RejectedProposal[];
 }
 
+/** One child category of a split proposal, as shown in the review queue. */
+export interface ProposalChildView {
+  label: string;
+  description: string;
+  proposedCount: number;
+  cohesion: number;
+  separation: number;
+  confidence: number;
+}
+
 /** A pending proposal as shown in the review queue, without the heavy centroid or member list. */
 export interface ProposalView {
   id: string;
@@ -73,6 +83,12 @@ export interface ProposalView {
   separation: number;
   confidence: number;
   evidence: string[];
+  /** For a split proposal, the child categories it would create; absent for every other kind. */
+  children?: ProposalChildView[];
+  /** Live assigned-email count on the primary affected category (retire target, merge/split source). */
+  affectedCount?: number;
+  /** How many user-confirmed assignments the change would affect, so the reviewer sees the impact. */
+  userImpactCount?: number;
   createdAt: number;
 }
 
@@ -279,22 +295,47 @@ export class DiscoveryProposalOrchestrator {
     };
   }
 
-  /** Pending proposals for the review queue, strongest first. */
+  /** Pending proposals for the review queue, strongest first, enriched with per-kind review detail. */
   listPending(accountId: string): ProposalView[] {
-    return this.proposals.listPending(accountId).map((p) => ({
-      id: p.id,
-      kind: p.kind,
-      categoryId: p.categoryId,
-      sourceCategoryId: p.sourceCategoryId,
-      label: p.label,
-      description: p.description,
-      proposedCount: p.proposedCount,
-      cohesion: p.cohesion,
-      separation: p.separation,
-      confidence: p.confidence,
-      evidence: p.evidence,
-      createdAt: p.createdAt,
-    }));
+    return this.proposals.listPending(accountId).map((p) => {
+      // The primary category the change affects: the deleted source for a merge, otherwise the target
+      // (retire) or the source being split. Its live counts tell the reviewer the real impact.
+      const affectedId = p.kind === 'merge' ? p.sourceCategoryId : p.categoryId;
+      const affectedCount =
+        affectedId !== null ? this.categories.countEmails(affectedId) : undefined;
+      const userImpactCount =
+        p.kind === 'new_category' || affectedId === null
+          ? undefined
+          : this.categories.listCategoryMemberIds(accountId, affectedId, 'user').length;
+      const children =
+        p.kind === 'split'
+          ? this.proposals.listChildren(p.id).map((c) => ({
+              label: c.label,
+              description: c.description,
+              proposedCount: c.proposedCount,
+              cohesion: c.cohesion,
+              separation: c.separation,
+              confidence: c.confidence,
+            }))
+          : undefined;
+      return {
+        id: p.id,
+        kind: p.kind,
+        categoryId: p.categoryId,
+        sourceCategoryId: p.sourceCategoryId,
+        label: p.label,
+        description: p.description,
+        proposedCount: p.proposedCount,
+        cohesion: p.cohesion,
+        separation: p.separation,
+        confidence: p.confidence,
+        evidence: p.evidence,
+        children,
+        affectedCount,
+        userImpactCount,
+        createdAt: p.createdAt,
+      };
+    });
   }
 
   /**

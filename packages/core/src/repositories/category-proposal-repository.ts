@@ -187,7 +187,7 @@ export class CategoryProposalRepository {
     listChildren: Statement<unknown[]>;
   };
 
-  constructor(db: Database) {
+  constructor(private readonly db: Database) {
     this.stmts = {
       insert: db.prepare(
         `INSERT INTO category_proposals
@@ -228,7 +228,10 @@ export class CategoryProposalRepository {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       listChildren: db.prepare(
-        `SELECT ${CHILD_COLS} FROM category_proposal_children WHERE proposal_id = ? ORDER BY created_at, id`,
+        // Deterministic, meaningful order (largest child first); created_at collides within a split's
+        // transaction, so ordering on it would fall back to the random id and shuffle the children.
+        `SELECT ${CHILD_COLS} FROM category_proposal_children WHERE proposal_id = ?
+         ORDER BY proposed_count DESC, canonical_key ASC`,
       ),
     };
   }
@@ -385,6 +388,31 @@ export class CategoryProposalRepository {
       now,
     );
     return { id, ...input, createdAt: now };
+  }
+
+  /**
+   * Record a split proposal and its children atomically. The parent row and every child row are
+   * written in one transaction, so a split proposal never persists with a missing or partial child
+   * set. Returns the created parent proposal.
+   */
+  createSplit(
+    input: CreateStructuralProposalInput,
+    children: Array<Omit<CreateProposalChildInput, 'proposalId'>>,
+  ): CategoryProposal {
+    if (input.kind !== 'split') {
+      throw new Error('createSplit requires a split proposal');
+    }
+    if (children.length < 2) {
+      throw new Error('a split proposal requires at least two children');
+    }
+    const tx = this.db.transaction(() => {
+      const proposal = this.createStructural(input);
+      for (const child of children) {
+        this.createChild({ ...child, proposalId: proposal.id });
+      }
+      return proposal;
+    });
+    return tx();
   }
 
   /** The split children of a proposal, in insertion order. */

@@ -123,9 +123,8 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
     }
   });
 
-  // Generate structural (merge/retire) proposals from category health metrics and add them to the
-  // review queue. Writes only proposal rows; applies nothing and never runs on its own. Split
-  // generation is intentionally not included here.
+  // Generate structural (merge/retire/split) proposals from category health metrics and add them to
+  // the review queue. Writes only proposal rows; applies nothing and never runs on its own.
   app.post('/categories/proposals/generate-structural', async (req, reply) => {
     const parsed = GenerateStructuralBody.safeParse(req.body);
     if (!parsed.success) {
@@ -143,6 +142,7 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
         created: [],
         mergeCandidates: 0,
         retireCandidates: 0,
+        splitCandidates: 0,
         skippedExisting: 0,
       };
     }

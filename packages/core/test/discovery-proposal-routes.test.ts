@@ -128,7 +128,14 @@ async function buildApp() {
     silentLogger,
   );
   const health = new CategoryHealthService(categories, embeddings);
-  const structural = new StructuralProposalService(categories, proposals, health, silentLogger);
+  const structural = new StructuralProposalService(
+    categories,
+    proposals,
+    health,
+    embeddings,
+    emails,
+    silentLogger,
+  );
 
   const ctx = {
     config: { llm: { embeddingModel: MODEL, generationModel: 'qwen' } },
@@ -149,7 +156,7 @@ async function buildApp() {
   const app = Fastify();
   await registerCategoryRoutes(app, ctx);
   await app.ready();
-  return { app, accountId: acc.id, accounts, categories, emails };
+  return { app, accountId: acc.id, accounts, categories, emails, embeddings, proposals };
 }
 
 describe('discovery proposal routes', () => {
@@ -425,6 +432,120 @@ describe('structural proposal generation route', () => {
       url: `/categories/proposals?accountId=${personal.id}`,
     });
     expect(list.json().proposals).toHaveLength(0);
+
+    await app.close();
+  });
+});
+
+describe('split proposal routes', () => {
+  it('lists a split with its children and affected count, then applies it over HTTP', async () => {
+    const { app, accountId, categories, emails, embeddings, proposals } = await buildApp();
+    const source = categories.create({
+      accountId,
+      label: 'Big Bucket',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'big',
+    });
+    for (const [messageId, dim] of [
+      ['s-a', 4],
+      ['s-b', 5],
+    ] as Array<[string, number]>) {
+      emails.upsertBatch([
+        { messageId, accountId, folder: 'INBOX', subject: 's', fromAddr: 'a@b.com' },
+      ]);
+      embeddings.saveEmbedding({ messageId, accountId, modelId: MODEL }, axis(dim));
+      categories.addAutoAssignments(accountId, [
+        {
+          messageId,
+          accountId,
+          categoryId: source.id,
+          confidence: 0.5,
+          assignedBy: 'auto',
+          assignedAt: Date.now(),
+          method: 'embed',
+        },
+      ]);
+    }
+    const split = proposals.createSplit(
+      {
+        accountId,
+        kind: 'split',
+        categoryId: source.id,
+        sourceCategoryId: null,
+        runId: 'r',
+        label: 'Split Big Bucket',
+        description: 'two groups',
+        canonicalKey: 'big',
+        suppressionKey: 'split:big',
+        embeddingModelId: MODEL,
+        confidence: 0.8,
+        evidence: ['two groups'],
+      },
+      [
+        {
+          label: 'Alpha',
+          description: '',
+          canonicalKey: 'alpha',
+          embeddingModelId: MODEL,
+          centroid: axis(4),
+          memberIds: ['s-a'],
+          proposedCount: 1,
+          cohesion: 0.9,
+          separation: 0.9,
+          confidence: 0.9,
+        },
+        {
+          label: 'Beta',
+          description: '',
+          canonicalKey: 'beta',
+          embeddingModelId: MODEL,
+          centroid: axis(5),
+          memberIds: ['s-b'],
+          proposedCount: 1,
+          cohesion: 0.9,
+          separation: 0.9,
+          confidence: 0.9,
+        },
+      ],
+    );
+
+    // The list endpoint serializes the split with its children and the live affected-source count.
+    const list = await app.inject({
+      method: 'GET',
+      url: `/categories/proposals?accountId=${accountId}`,
+    });
+    const view = (
+      list.json().proposals as Array<{
+        id: string;
+        kind: string;
+        children?: Array<{ label: string; proposedCount: number }>;
+        affectedCount?: number;
+      }>
+    ).find((p) => p.id === split.id)!;
+    expect(view.kind).toBe('split');
+    expect(view.children).toHaveLength(2);
+    expect(view.children!.map((c) => c.label).sort()).toEqual(['Alpha', 'Beta']);
+    expect(view.affectedCount).toBe(2);
+
+    // Applying over HTTP creates the child categories and reports the split kind.
+    const applied = await app.inject({
+      method: 'POST',
+      url: `/categories/proposals/${split.id}/apply`,
+      payload: { accountId },
+    });
+    expect(applied.statusCode).toBe(200);
+    expect(applied.json().kind).toBe('split');
+    expect(categories.findByLabel(accountId, 'Alpha')).not.toBeNull();
+    expect(categories.findByLabel(accountId, 'Beta')).not.toBeNull();
+
+    // Re-applying the now-applied split is a lifecycle conflict, caught before any write.
+    const twice = await app.inject({
+      method: 'POST',
+      url: `/categories/proposals/${split.id}/apply`,
+      payload: { accountId },
+    });
+    expect(twice.statusCode).toBe(409);
 
     await app.close();
   });

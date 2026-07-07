@@ -366,6 +366,16 @@ export interface CategoryEmailListResponse {
 /** What kind of change a proposal represents. Structural kinds are split, merge, and retire. */
 export type ProposalKindDto = 'new_category' | 'split' | 'merge' | 'retire';
 
+/** One child category a split proposal would create, with its deterministic metrics. */
+export interface ProposalChildDto {
+  label: string;
+  description: string;
+  proposedCount: number;
+  cohesion: number;
+  separation: number;
+  confidence: number;
+}
+
 /** A pending category proposal awaiting review, with its deterministic quality metrics. */
 export interface ProposalDto {
   id: string;
@@ -380,6 +390,12 @@ export interface ProposalDto {
   separation: number;
   confidence: number;
   evidence: string[];
+  /** For a split proposal, the child categories it would create; absent for other kinds. */
+  children?: ProposalChildDto[];
+  /** Live assigned-email count on the primary affected category (retire target, merge/split source). */
+  affectedCount?: number;
+  /** Count of user-confirmed assignments the change would affect, so the reviewer sees the impact. */
+  userImpactCount?: number;
   createdAt: number;
 }
 
@@ -434,7 +450,7 @@ export interface GenerateStructuralProposalsRequest {
 /** One structural proposal produced by a generate-structural run. */
 export interface GeneratedStructuralProposalDto {
   id: string;
-  kind: 'merge' | 'retire';
+  kind: 'merge' | 'retire' | 'split';
   categoryId: string;
   sourceCategoryId: string | null;
   suppressionKey: string;
@@ -447,6 +463,7 @@ export interface GenerateStructuralProposalsResponse {
   created: GeneratedStructuralProposalDto[];
   mergeCandidates: number;
   retireCandidates: number;
+  splitCandidates: number;
   skippedExisting: number;
 }
 

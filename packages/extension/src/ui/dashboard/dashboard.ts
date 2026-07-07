@@ -12,6 +12,9 @@ import {
   proposalKindTag,
   proposalActionLabel,
   proposalIsApplyable,
+  proposalDisabledReason,
+  proposalAffectedLine,
+  proposalUserImpactNote,
   proposalApplySuccessCopy,
 } from './proposals-format.js';
 import type {
@@ -1762,9 +1765,11 @@ function renderProposals(list: ProposalDto[]): void {
 
 /**
  * Builds one proposal card. A kind tag plus a kind-specific action label keep a merge/retire/split
- * visually distinct from an add-category suggestion. The estimated size is shown only for a
- * new-category cluster (structural proposals carry none). A split cannot be approved from here
- * because its child detail is not exposed, so its primary action is disabled with a clear note.
+ * visually distinct from an add-category suggestion. The card shows why the change is suggested: the
+ * estimated size for a new-category cluster, the mail it affects for a structural change, a warning
+ * when user-confirmed assignments are involved, and the child categories a split would create. The
+ * primary action is disabled only when the backend cannot safely apply the proposal (a split with no
+ * reviewable children), with a clear reason.
  */
 function proposalCard(p: ProposalDto): HTMLElement {
   const card = document.createElement('div');
@@ -1797,6 +1802,45 @@ function proposalCard(p: ProposalDto): HTMLElement {
     card.appendChild(desc);
   }
 
+  // How much mail the structural change touches, drawn from the live affected-category count.
+  const affectedLine =
+    p.affectedCount !== undefined ? proposalAffectedLine(p.kind, p.affectedCount) : null;
+  if (affectedLine) {
+    const meta = document.createElement('div');
+    meta.className = 'proposal-meta';
+    meta.textContent = affectedLine;
+    card.appendChild(meta);
+  }
+
+  // A visible warning when user-confirmed assignments are involved, so the reviewer knows the change
+  // is not purely automatic. The backend still preserves user provenance on apply.
+  const userNote = proposalUserImpactNote(p.userImpactCount ?? 0);
+  if (userNote) {
+    const warn = document.createElement('div');
+    warn.className = 'proposal-user-impact';
+    warn.textContent = userNote;
+    card.appendChild(warn);
+  }
+
+  // The child categories a split would create, each with its estimated size.
+  if (p.kind === 'split' && p.children && p.children.length > 0) {
+    const list = document.createElement('div');
+    list.className = 'proposal-children';
+    for (const child of p.children) {
+      const row = document.createElement('div');
+      row.className = 'proposal-child';
+      const name = document.createElement('span');
+      name.className = 'proposal-child-label';
+      name.textContent = child.label;
+      const size = document.createElement('span');
+      size.className = 'proposal-child-count';
+      size.textContent = proposalCountLabel(child.proposedCount);
+      row.append(name, size);
+      list.appendChild(row);
+    }
+    card.appendChild(list);
+  }
+
   if (p.evidence.length > 0) {
     const chips = document.createElement('div');
     chips.className = 'proposal-evidence';
@@ -1809,12 +1853,13 @@ function proposalCard(p: ProposalDto): HTMLElement {
     card.appendChild(chips);
   }
 
-  const applyable = proposalIsApplyable(p.kind);
-  if (!applyable) {
+  const childCount = p.children?.length ?? 0;
+  const applyable = proposalIsApplyable(p.kind, childCount);
+  const disabledReason = proposalDisabledReason(p.kind, childCount);
+  if (!applyable && disabledReason) {
     const note = document.createElement('div');
     note.className = 'proposal-description';
-    note.textContent =
-      'Split details are not available in this view yet. You can ignore it for now.';
+    note.textContent = disabledReason;
     card.appendChild(note);
   }
 
@@ -1830,8 +1875,8 @@ function proposalCard(p: ProposalDto): HTMLElement {
   apply.textContent = proposalActionLabel(p.kind);
   // Disable both buttons on this card while its request is in flight, so a fast double-click cannot
   // send a duplicate apply/dismiss. On success the queue refresh replaces the card; on failure the
-  // action re-enables them. A non-applyable (split) card keeps its primary action permanently
-  // disabled, even after a failed Ignore.
+  // action re-enables them. A non-applyable card keeps its primary action permanently disabled, even
+  // after a failed Ignore.
   const setBusy = (busy: boolean): void => {
     if (applyable) apply.disabled = busy;
     ignore.disabled = busy;
@@ -1841,7 +1886,7 @@ function proposalCard(p: ProposalDto): HTMLElement {
     apply.addEventListener('click', () => void applyProposal(p, setBusy));
   } else {
     apply.disabled = true;
-    apply.title = 'Split details are not available in this view yet.';
+    if (disabledReason) apply.title = disabledReason;
   }
   actions.append(ignore, apply);
   card.appendChild(actions);

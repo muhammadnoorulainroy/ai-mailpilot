@@ -191,6 +191,8 @@ export function buildContext(): AppContext {
       repos.categories,
       repos.categoryProposals,
       categoryHealth,
+      repos.embeddings,
+      repos.emails,
       logger,
     ),
     category: new CategoryOrchestrator(
