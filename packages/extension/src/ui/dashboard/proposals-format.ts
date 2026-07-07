@@ -59,15 +59,24 @@ export function proposalAffectedLine(kind: ProposalKindDto, affectedCount: numbe
     case 'merge':
       return `moves up to ${emails} from the source category`;
     case 'split':
-      return `${emails} to reassign into the child categories`;
+      // Only auto-assigned mail can move into a child; user-confirmed mail stays put (see the note).
+      return `up to ${affectedCount} auto-assigned email${affectedCount === 1 ? '' : 's'} may move into child categories`;
     default:
       return null;
   }
 }
 
-/** A warning line naming how many user-confirmed assignments a change affects, or null when none. */
-export function proposalUserImpactNote(count: number): string | null {
+/**
+ * A note about the user-confirmed mail a change touches, or null when there is none. For a split the
+ * user-confirmed mail is preserved on the source (never moved), so the note says so plainly rather
+ * than using the generic "affected" wording that fits merge/retire.
+ */
+export function proposalUserImpactNote(kind: ProposalKindDto, count: number): string | null {
   if (count <= 0) return null;
+  const emails = `${count} user-confirmed email${count === 1 ? '' : 's'}`;
+  if (kind === 'split') {
+    return `${emails} will stay on the source category`;
+  }
   return `${count} user-confirmed assignment${count === 1 ? '' : 's'} affected`;
 }
 

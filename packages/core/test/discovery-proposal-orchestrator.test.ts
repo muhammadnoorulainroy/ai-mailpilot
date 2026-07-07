@@ -1153,6 +1153,121 @@ describe('DiscoveryProposalOrchestrator.apply (structural kinds)', () => {
     expect(h.categories.findById(source.id)!.status).toBe('active');
     expect(h.proposals.findById(p.id)!.status).toBe('pending');
   });
+
+  it('rebuilds the source centroid from the remaining user members when the source stays active', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    // Old broad (mixed) centroid on axis 0 - the stale centroid the split must not leave behind.
+    h.categories.saveCentroid(source.id, MODEL, axis(0), 5);
+    // Three user-confirmed members on axis 6 remain on the source; one auto member moves to a child.
+    for (const id of ['u-1', 'u-2', 'u-3']) {
+      seedEmailWithEmbedding(h, id, 6);
+      assignUser(h, id, source.id);
+    }
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['b-unknown'], axis(5));
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    // The source stays active (3 user members) and its centroid was rebuilt from them (axis 6),
+    // no longer the old broad axis-0 centroid.
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    const centroid = h.categories.getCentroid(source.id, MODEL)!;
+    expect(centroid.vector[6]).toBeGreaterThan(0.9);
+    expect(centroid.vector[0]).toBeLessThan(0.1);
+    // The user members are untouched on the source.
+    expect(assignmentsFor(h.db, h.accountId, 'u-1')).toEqual([
+      { category_id: source.id, assigned_by: 'user', method: null },
+    ]);
+  });
+
+  it('rebuilds the source centroid from leftover ambiguous auto members', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    h.categories.saveCentroid(source.id, MODEL, axis(0), 5);
+    // Three ambiguous auto members on axis 7, listed by BOTH children so they never move.
+    for (const id of ['x-1', 'x-2', 'x-3']) {
+      seedEmailWithEmbedding(h, id, 7);
+      h.categories.addAutoAssignments(h.accountId, [
+        {
+          messageId: id,
+          accountId: h.accountId,
+          categoryId: source.id,
+          confidence: 0.5,
+          assignedBy: 'auto',
+          assignedAt: Date.now(),
+          method: 'embed',
+        },
+      ]);
+    }
+    // One unambiguous auto member that does move to Child A.
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1', 'x-1', 'x-2', 'x-3'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['x-1', 'x-2', 'x-3'], axis(5));
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    // The ambiguous members stay on the source, which stays active with a centroid rebuilt from them
+    // (axis 7), not the old mixed centroid.
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    const centroid = h.categories.getCentroid(source.id, MODEL)!;
+    expect(centroid.vector[7]).toBeGreaterThan(0.9);
+    expect(centroid.vector[0]).toBeLessThan(0.1);
+  });
+
+  it('drops the stale source centroid when too few members remain to rebuild', () => {
+    const h = harness();
+    const source = activeCategory(h, 'Big', 'big');
+    h.categories.saveCentroid(source.id, MODEL, axis(0), 5);
+    // One user member remains: below MIN_TRUSTED_REBUILD and it blocks the auto fallback.
+    seedEmailWithEmbedding(h, 'u-1', 6);
+    assignUser(h, 'u-1', source.id);
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['b-unknown'], axis(5));
+
+    h.orchestrator.apply(h.accountId, p.id);
+
+    // The source stays active but there is too little data to rebuild, so the stale centroid is removed
+    // entirely rather than left to keep attracting mail to the old broad bucket.
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.categories.getCentroid(source.id, MODEL)).toBeNull();
+  });
+
+  it('rolls back the whole split when the source centroid refresh fails', () => {
+    const boom = {
+      rebuild() {
+        throw new Error('rebuild failed');
+      },
+    } as unknown as CategoryCentroidRebuildService;
+    const h = harness(NAMING, boom);
+    const source = activeCategory(h, 'Big', 'big');
+    h.categories.saveCentroid(source.id, MODEL, axis(0), 5);
+    // A user member keeps the source active after the move, so the source-centroid refresh runs.
+    seedEmailWithEmbedding(h, 'u-1', 6);
+    assignUser(h, 'u-1', source.id);
+    seedAutoOnSource(h, 'a-1', source.id, 'embed', 0.6);
+    const p = splitProposal(h, source.id, 'big');
+    addChild(h, p.id, 'Child A', 'child_a', ['a-1'], axis(4));
+    addChild(h, p.id, 'Child B', 'child_b', ['b-unknown'], axis(5));
+
+    expect(() => h.orchestrator.apply(h.accountId, p.id)).toThrow();
+
+    // Nothing persisted: no children, the auto member stayed put, the source keeps its old centroid,
+    // and the proposal is still pending.
+    expect(h.categories.findByLabel(h.accountId, 'Child A')).toBeNull();
+    expect(h.categories.findByLabel(h.accountId, 'Child B')).toBeNull();
+    expect(assignmentsFor(h.db, h.accountId, 'a-1')).toEqual([
+      { category_id: source.id, assigned_by: 'auto', method: 'embed' },
+    ]);
+    expect(h.categories.findById(source.id)!.status).toBe('active');
+    expect(h.categories.getCentroid(source.id, MODEL)!.vector[0]).toBeGreaterThan(0.9);
+    expect(h.proposals.findById(p.id)!.status).toBe('pending');
+  });
 });
 
 describe('DiscoveryProposalOrchestrator.dismiss (structural kinds)', () => {

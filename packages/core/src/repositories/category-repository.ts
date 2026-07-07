@@ -144,6 +144,7 @@ export class CategoryRepository {
     updateCentroidIndex: Statement<unknown[]>;
     insertCentroidVec: Statement<unknown[]>;
     insertCentroidIndex: Statement<unknown[]>;
+    deleteCentroidIndex: Statement<unknown[]>;
     listCentroids: Statement<unknown[]>;
     getCentroidByCategory: Statement<unknown[]>;
     selectUserAssigned: Statement<unknown[]>;
@@ -250,6 +251,9 @@ export class CategoryRepository {
       insertCentroidIndex: db.prepare(
         `INSERT INTO category_embedding_index (rowid, category_id, model_id, email_count, updated_at)
          VALUES (?, ?, ?, ?, ?)`,
+      ),
+      deleteCentroidIndex: db.prepare(
+        'DELETE FROM category_embedding_index WHERE category_id = ? AND model_id = ?',
       ),
       listCentroids: db.prepare(
         `SELECT cei.category_id, c.label, ce.embedding, cei.email_count
@@ -1058,6 +1062,14 @@ export class CategoryRepository {
       this.stmts.insertCentroidIndex.run(rowid, categoryId, canonical, emailCount, now);
     });
     tx();
+  }
+
+  /**
+   * Remove a category's stored centroid for a model. The companion `category_embeddings` vec row is
+   * cascaded by the v4 `trg_category_embedding_index_delete` trigger. A no-op when none is stored.
+   */
+  deleteCentroid(categoryId: string, modelId: string): void {
+    this.stmts.deleteCentroidIndex.run(categoryId, canonicalizeModelId(modelId));
   }
 
   /** All category centroids for an account and model, with their labels and email counts. */

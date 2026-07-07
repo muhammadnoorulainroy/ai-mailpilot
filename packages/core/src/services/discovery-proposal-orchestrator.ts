@@ -580,10 +580,12 @@ export class DiscoveryProposalOrchestrator {
    *  - Moves an auto member only when exactly one child lists it and its email still exists; a member
    *    listed by two children is ambiguous and stays on the source. User assignments are never moved
    *    (moveAutoAssignment only touches auto rows), so no user-confirmed label is destroyed or hidden.
-   *  - Retires the source only when nothing remains on it after the moves; otherwise it stays active,
-   *    so a leftover auto member or any user member keeps the source visible.
-   * Child creation, centroid saves, moves, the optional retire, and markApplied run in ONE
-   * transaction: any failure rolls the whole split back and the proposal stays pending.
+   *  - Retires the source only when nothing remains on it after the moves; otherwise it stays active
+   *    (a leftover auto member or any user member keeps it visible) and its stale mixed centroid is
+   *    rebuilt from the remaining members, or dropped when there is too little data to rebuild.
+   * Child creation, centroid saves, moves, the optional retire or source-centroid refresh, and
+   * markApplied run in ONE transaction: any failure rolls the whole split back and the proposal stays
+   * pending.
    */
   private applySplit(accountId: string, proposal: CategoryProposal): ApplyResult {
     const source = this.categories.findById(proposal.categoryId);
@@ -661,16 +663,36 @@ export class DiscoveryProposalOrchestrator {
           }
         }
       });
-      // Retire the source only when nothing remains on it (every member moved, no user member left).
+      // The source keeps whatever did not move: user-confirmed members and any ambiguous auto members.
+      // If nothing remains, retire it. Otherwise its stored centroid is now a stale mix of the
+      // split-out groups, so refresh it from the remaining members (Phase 3.1: user members dominate,
+      // auto only as a fallback when there are none); when there is too little data to rebuild, drop
+      // the stale centroid so the source stops attracting mail to the old broad bucket. This runs in
+      // the same transaction, so a failure here rolls the whole split back and the proposal stays pending.
       let sourceRetired = false;
+      let sourceCentroid: 'retired' | 'rebuilt' | 'removed' = 'rebuilt';
       if (this.categories.countEmails(source.id) === 0) {
         this.categories.retire(source.id);
         sourceRetired = true;
+        sourceCentroid = 'retired';
+      } else {
+        const rebuild = this.centroidRebuild.rebuild(
+          accountId,
+          source.id,
+          proposal.embeddingModelId,
+          {
+            allowAutoFallback: true,
+          },
+        );
+        if (rebuild.status !== 'rebuilt') {
+          this.categories.deleteCentroid(source.id, proposal.embeddingModelId);
+          sourceCentroid = 'removed';
+        }
       }
       this.proposals.markApplied(proposal.id);
-      return { createdIds, moved, sourceRetired };
+      return { createdIds, moved, sourceRetired, sourceCentroid };
     });
-    const { createdIds, moved, sourceRetired } = run();
+    const { createdIds, moved, sourceRetired, sourceCentroid } = run();
 
     this.logger.info(
       {
@@ -680,6 +702,7 @@ export class DiscoveryProposalOrchestrator {
         childIds: createdIds,
         moved,
         sourceRetired,
+        sourceCentroid,
       },
       'discovery proposal: split applied',
     );

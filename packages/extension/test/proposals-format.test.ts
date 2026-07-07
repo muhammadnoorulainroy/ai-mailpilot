@@ -106,16 +106,37 @@ describe('proposalAffectedLine', () => {
     expect(proposalAffectedLine('retire', 4)).toBe('4 emails currently assigned');
     expect(proposalAffectedLine('retire', 1)).toBe('1 email currently assigned');
     expect(proposalAffectedLine('merge', 9)).toContain('moves up to 9 emails');
-    expect(proposalAffectedLine('split', 12)).toContain('12 emails to reassign');
     expect(proposalAffectedLine('new_category', 5)).toBeNull();
+  });
+
+  it('scopes a split to auto-assigned mail only, since user rows do not move', () => {
+    expect(proposalAffectedLine('split', 12)).toBe(
+      'up to 12 auto-assigned emails may move into child categories',
+    );
+    expect(proposalAffectedLine('split', 1)).toBe(
+      'up to 1 auto-assigned email may move into child categories',
+    );
+    // It must not claim every affected email is reassigned.
+    expect(proposalAffectedLine('split', 12)).not.toContain('to reassign');
   });
 });
 
 describe('proposalUserImpactNote', () => {
-  it('warns only when user-confirmed assignments are involved', () => {
-    expect(proposalUserImpactNote(0)).toBeNull();
-    expect(proposalUserImpactNote(1)).toBe('1 user-confirmed assignment affected');
-    expect(proposalUserImpactNote(3)).toBe('3 user-confirmed assignments affected');
+  it('warns only when user-confirmed assignments are involved (merge/retire)', () => {
+    expect(proposalUserImpactNote('merge', 0)).toBeNull();
+    expect(proposalUserImpactNote('merge', 1)).toBe('1 user-confirmed assignment affected');
+    expect(proposalUserImpactNote('retire', 3)).toBe('3 user-confirmed assignments affected');
+  });
+
+  it('tells the user their confirmed mail stays on the source for a split, never "affected"', () => {
+    expect(proposalUserImpactNote('split', 0)).toBeNull();
+    expect(proposalUserImpactNote('split', 1)).toBe(
+      '1 user-confirmed email will stay on the source category',
+    );
+    expect(proposalUserImpactNote('split', 3)).toBe(
+      '3 user-confirmed emails will stay on the source category',
+    );
+    expect(proposalUserImpactNote('split', 3)).not.toContain('affected');
   });
 });
 

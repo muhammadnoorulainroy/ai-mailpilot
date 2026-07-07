@@ -1814,7 +1814,7 @@ function proposalCard(p: ProposalDto): HTMLElement {
 
   // A visible warning when user-confirmed assignments are involved, so the reviewer knows the change
   // is not purely automatic. The backend still preserves user provenance on apply.
-  const userNote = proposalUserImpactNote(p.userImpactCount ?? 0);
+  const userNote = proposalUserImpactNote(p.kind, p.userImpactCount ?? 0);
   if (userNote) {
     const warn = document.createElement('div');
     warn.className = 'proposal-user-impact';
