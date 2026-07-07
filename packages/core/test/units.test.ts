@@ -2162,6 +2162,39 @@ describe('config PATCH llm merge', () => {
   });
 });
 
+describe('features config flag (Phase 4)', () => {
+  it('defaults features.multiPrototypeCategories to false', () => {
+    const config = AppConfigSchema.parse({});
+    expect(config.features.multiPrototypeCategories).toBe(false);
+  });
+
+  it('parses a legacy config that has no features block, defaulting the flag false', () => {
+    const legacy = {
+      version: 1,
+      locale: 'en',
+      autoIndex: true,
+      indexedFolders: [],
+      llm: {
+        baseUrl: 'http://localhost:11434/v1',
+        embeddingModel: 'bge-m3',
+        generationModel: 'qwen3:8b',
+      },
+      authToken: 'tok',
+    };
+    const config = AppConfigSchema.parse(legacy);
+    expect(config.features.multiPrototypeCategories).toBe(false);
+    // The rest of the legacy config still parses unchanged.
+    expect(config.autoIndex).toBe(true);
+    expect(config.llm.embeddingModel).toBe('bge-m3');
+  });
+
+  it('respects an explicit features.multiPrototypeCategories=true and keeps the flag out of llm', () => {
+    const config = AppConfigSchema.parse({ features: { multiPrototypeCategories: true } });
+    expect(config.features.multiPrototypeCategories).toBe(true);
+    expect('multiPrototypeCategories' in config.llm).toBe(false);
+  });
+});
+
 describe('redactConfig (M8)', () => {
   it('strips authToken, llm.apiKey, and imap while keeping public fields', () => {
     const config = AppConfigSchema.parse({

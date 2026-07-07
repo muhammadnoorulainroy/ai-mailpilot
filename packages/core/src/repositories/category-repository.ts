@@ -104,6 +104,22 @@ export interface CentroidEntry {
   emailCount: number;
 }
 
+/** A single prototype vector of a category (Phase 4). prototype_index 0 is the aggregate centroid. */
+export interface PrototypeEntry {
+  categoryId: string;
+  label: string;
+  vector: Float32Array;
+  emailCount: number;
+  prototypeIndex: number;
+}
+
+/** One raw prototype for a single category (aggregate 0 + sub-prototypes), used by the write side. */
+export interface CategoryPrototype {
+  vector: Float32Array;
+  emailCount: number;
+  prototypeIndex: number;
+}
+
 interface CategoryDbRow {
   id: string;
   account_id: string;
@@ -145,7 +161,10 @@ export class CategoryRepository {
     insertCentroidVec: Statement<unknown[]>;
     insertCentroidIndex: Statement<unknown[]>;
     deleteCentroidIndex: Statement<unknown[]>;
+    deleteSubPrototypes: Statement<unknown[]>;
     listCentroids: Statement<unknown[]>;
+    listPrototypesForCategory: Statement<unknown[]>;
+    listAllPrototypes: Statement<unknown[]>;
     getCentroidByCategory: Statement<unknown[]>;
     selectUserAssigned: Statement<unknown[]>;
     selectAssigned: Statement<unknown[]>;
@@ -241,7 +260,7 @@ export class CategoryRepository {
            method = excluded.method`,
       ),
       findCentroidRowId: db.prepare(
-        'SELECT rowid FROM category_embedding_index WHERE category_id = ? AND model_id = ?',
+        'SELECT rowid FROM category_embedding_index WHERE category_id = ? AND model_id = ? AND prototype_index = ?',
       ),
       updateCentroidVec: db.prepare('UPDATE category_embeddings SET embedding = ? WHERE rowid = ?'),
       updateCentroidIndex: db.prepare(
@@ -249,24 +268,47 @@ export class CategoryRepository {
       ),
       insertCentroidVec: db.prepare('INSERT INTO category_embeddings (embedding) VALUES (?)'),
       insertCentroidIndex: db.prepare(
-        `INSERT INTO category_embedding_index (rowid, category_id, model_id, email_count, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO category_embedding_index (rowid, category_id, model_id, prototype_index, email_count, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       ),
       deleteCentroidIndex: db.prepare(
         'DELETE FROM category_embedding_index WHERE category_id = ? AND model_id = ?',
       ),
+      deleteSubPrototypes: db.prepare(
+        'DELETE FROM category_embedding_index WHERE category_id = ? AND model_id = ? AND prototype_index >= 1',
+      ),
+      // Aggregate (prototype 0) only, one row per active category - the backward-compatible surface.
       listCentroids: db.prepare(
         `SELECT cei.category_id, c.label, ce.embedding, cei.email_count
            FROM category_embeddings ce
            JOIN category_embedding_index cei ON cei.rowid = ce.rowid
            JOIN categories c ON c.id = cei.category_id
-          WHERE c.account_id = ? AND cei.model_id = ? AND c.status = 'active'`,
+          WHERE c.account_id = ? AND cei.model_id = ? AND c.status = 'active'
+            AND cei.prototype_index = 0`,
       ),
+      // Every prototype (aggregate + sub) for one category, ordered by prototype_index.
+      listPrototypesForCategory: db.prepare(
+        `SELECT ce.embedding, cei.email_count, cei.prototype_index
+           FROM category_embeddings ce
+           JOIN category_embedding_index cei ON cei.rowid = ce.rowid
+          WHERE cei.category_id = ? AND cei.model_id = ?
+          ORDER BY cei.prototype_index`,
+      ),
+      // Every prototype of every active category (for building the effective-prototype match set).
+      listAllPrototypes: db.prepare(
+        `SELECT cei.category_id, c.label, ce.embedding, cei.email_count, cei.prototype_index
+           FROM category_embeddings ce
+           JOIN category_embedding_index cei ON cei.rowid = ce.rowid
+           JOIN categories c ON c.id = cei.category_id
+          WHERE c.account_id = ? AND cei.model_id = ? AND c.status = 'active'
+          ORDER BY cei.category_id, cei.prototype_index`,
+      ),
+      // Aggregate (prototype 0) only, deterministic.
       getCentroidByCategory: db.prepare(
         `SELECT ce.embedding, cei.email_count
            FROM category_embeddings ce
            JOIN category_embedding_index cei ON cei.rowid = ce.rowid
-          WHERE cei.category_id = ? AND cei.model_id = ?`,
+          WHERE cei.category_id = ? AND cei.model_id = ? AND cei.prototype_index = 0`,
       ),
       selectUserAssigned: db.prepare(
         "SELECT DISTINCT message_id FROM email_categories WHERE account_id = ? AND assigned_by = 'user'",
@@ -1031,12 +1073,18 @@ export class CategoryRepository {
     }));
   }
 
-  /** Store or update a category's centroid vector and its contributing-email count. */
+  /**
+   * Store or update one prototype vector for a category and its contributing-email count.
+   * `prototypeIndex` defaults to 0, the aggregate/full-category centroid (identical meaning to the old
+   * single centroid), so every existing caller keeps upserting the aggregate with no behavior change.
+   * Sub-prototypes (>= 1) are written by the multi-prototype rebuild path.
+   */
   saveCentroid(
     categoryId: string,
     modelId: string,
     vector: ArrayLike<number>,
     emailCount: number,
+    prototypeIndex = 0,
   ): void {
     if (vector.length !== EMBEDDING_DIM) {
       throw new EmbeddingDimensionError(vector.length);
@@ -1047,7 +1095,7 @@ export class CategoryRepository {
     const now = Date.now();
 
     const tx = this.db.transaction(() => {
-      const existing = this.stmts.findCentroidRowId.get(categoryId, canonical) as
+      const existing = this.stmts.findCentroidRowId.get(categoryId, canonical, prototypeIndex) as
         | { rowid: number }
         | undefined;
 
@@ -1059,7 +1107,114 @@ export class CategoryRepository {
 
       const ins = this.stmts.insertCentroidVec.run(buf);
       const rowid = Number(ins.lastInsertRowid);
-      this.stmts.insertCentroidIndex.run(rowid, categoryId, canonical, emailCount, now);
+      this.stmts.insertCentroidIndex.run(
+        rowid,
+        categoryId,
+        canonical,
+        prototypeIndex,
+        emailCount,
+        now,
+      );
+    });
+    tx();
+  }
+
+  /**
+   * All prototypes for one category and model (aggregate 0 first, then sub-prototypes), for the
+   * write side (rebuild/correction). Empty when the category has no stored centroid.
+   */
+  getPrototypes(categoryId: string, modelId: string): CategoryPrototype[] {
+    const canonical = canonicalizeModelId(modelId);
+    const rows = this.stmts.listPrototypesForCategory.all(categoryId, canonical) as Array<{
+      embedding: Buffer;
+      email_count: number;
+      prototype_index: number;
+    }>;
+    return rows.map((r) => ({
+      vector: bufferToVector(r.embedding),
+      emailCount: r.email_count,
+      prototypeIndex: r.prototype_index,
+    }));
+  }
+
+  /**
+   * The prototype set to MATCH against per active category. When `useMultiPrototype` is false, returns
+   * only the aggregate (prototype 0) per category - identical to `getCentroidEntries`. When true,
+   * returns each category's SUB-prototypes (>= 1) if it has any, otherwise its aggregate 0. So a
+   * category with no sub-prototypes matches on its aggregate exactly as today.
+   */
+  getEffectivePrototypeEntries(
+    accountId: string,
+    modelId: string,
+    useMultiPrototype: boolean,
+  ): PrototypeEntry[] {
+    const canonical = canonicalizeModelId(modelId);
+    if (!useMultiPrototype) {
+      return (
+        this.stmts.listCentroids.all(accountId, canonical) as Array<{
+          category_id: string;
+          label: string;
+          embedding: Buffer;
+          email_count: number;
+        }>
+      ).map((r) => ({
+        categoryId: r.category_id,
+        label: r.label,
+        vector: bufferToVector(r.embedding),
+        emailCount: r.email_count,
+        prototypeIndex: 0,
+      }));
+    }
+    const rows = this.stmts.listAllPrototypes.all(accountId, canonical) as Array<{
+      category_id: string;
+      label: string;
+      embedding: Buffer;
+      email_count: number;
+      prototype_index: number;
+    }>;
+    // Group by category; keep sub-prototypes (>= 1) if any exist for the category, else the aggregate.
+    const byCategory = new Map<string, typeof rows>();
+    for (const r of rows) {
+      const list = byCategory.get(r.category_id);
+      if (list) list.push(r);
+      else byCategory.set(r.category_id, [r]);
+    }
+    const out: PrototypeEntry[] = [];
+    for (const list of byCategory.values()) {
+      const subs = list.filter((r) => r.prototype_index >= 1);
+      const chosen = subs.length > 0 ? subs : list.filter((r) => r.prototype_index === 0);
+      for (const r of chosen) {
+        out.push({
+          categoryId: r.category_id,
+          label: r.label,
+          vector: bufferToVector(r.embedding),
+          emailCount: r.email_count,
+          prototypeIndex: r.prototype_index,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Atomically replace a category's prototype set for a model: always (up)write the aggregate at
+   * prototype 0, and replace any sub-prototypes (>= 1) with the given ones at 1..K. If anything throws,
+   * the whole set change rolls back, so a category is never left with a half-written prototype set.
+   */
+  savePrototypeSet(
+    categoryId: string,
+    modelId: string,
+    aggregateVector: ArrayLike<number>,
+    aggregateCount: number,
+    subPrototypes: Array<{ vector: ArrayLike<number>; emailCount: number }>,
+  ): void {
+    const canonical = canonicalizeModelId(modelId);
+    const tx = this.db.transaction(() => {
+      this.saveCentroid(categoryId, canonical, aggregateVector, aggregateCount, 0);
+      this.stmts.deleteSubPrototypes.run(categoryId, canonical);
+      subPrototypes.forEach((sub, i) => {
+        this.saveCentroid(categoryId, canonical, sub.vector, sub.emailCount, i + 1);
+      });
     });
     tx();
   }
