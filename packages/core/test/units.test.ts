@@ -2024,6 +2024,146 @@ describe('CategoryImprovementService', () => {
     expect(categories.saveCentroid).toHaveBeenCalledTimes(1);
     expect(categories.mergeInto).toHaveBeenCalledWith('c2', 'c1');
   });
+
+  /**
+   * Fakes for the multi-prototype duplicate-suggestion case (Phase 4). An existing broad category has
+   * an aggregate on axis 0 plus a SECONDARY prototype on axis 1. The model proposes a new category
+   * that embeds onto axis 1: it duplicates the secondary prototype but not the aggregate.
+   */
+  const multiPrototypeSuggestFakes = () => {
+    const llm = {
+      chat: vi.fn(async () =>
+        JSON.stringify({
+          newCategories: [{ label: 'Crypto Alerts', description: 'crypto price alerts' }],
+          merges: [],
+        }),
+      ),
+      embed: vi.fn(async () => [0, 1]),
+    };
+    const uncats = ['m1', 'm2', 'm3', 'm4', 'm5'].map((id) => uncat(id, 'a@x.com'));
+    const emails = { listUncategorizedSummaries: () => uncats };
+    const embeddings = {
+      listForAccount: () => [] as Array<{ messageId: string; vector: Float32Array }>,
+      search: () => ['m1', 'm2', 'm3', 'm4'].map((messageId) => ({ messageId, distance: 0.3 })),
+    };
+    const categories = {
+      countUncategorized: () => 50,
+      listActive() {
+        return this.listForAccount();
+      },
+      listForAccount: () => [{ id: 'c1', label: 'Broad Bucket', description: 'many kinds' }],
+      getCentroidEntries: () => [
+        { categoryId: 'c1', label: 'Broad Bucket', vector: Float32Array.from([1, 0]), emailCount: 100 },
+      ],
+      getEffectivePrototypeEntries: () => [
+        {
+          categoryId: 'c1',
+          label: 'Broad Bucket',
+          vector: Float32Array.from([1, 0]),
+          emailCount: 60,
+          prototypeIndex: 1,
+        },
+        {
+          categoryId: 'c1',
+          label: 'Broad Bucket',
+          vector: Float32Array.from([0, 1]),
+          emailCount: 40,
+          prototypeIndex: 2,
+        },
+      ],
+      create: vi.fn(),
+      saveCentroid: vi.fn(),
+    };
+    return { llm, emails, embeddings, categories };
+  };
+
+  it('flag off: a new category matching only a secondary prototype is still suggested (old behavior)', async () => {
+    const { llm, emails, embeddings, categories } = multiPrototypeSuggestFakes();
+    // Default constructor: flag off, so only the aggregate (axis 0) is compared; axis 1 is invisible.
+    const svc = new CategoryImprovementService(
+      dbMock as never,
+      llm as never,
+      emails as never,
+      embeddings as never,
+      categories as never,
+      silentLogger,
+    );
+
+    const out = await svc.suggest('a', 'bge-m3', 'gen');
+
+    expect(out.newCategories.map((c) => c.label)).toEqual(['Crypto Alerts']);
+  });
+
+  it('flag on: a category covered by a secondary prototype does not produce a duplicate suggestion', async () => {
+    const { llm, emails, embeddings, categories } = multiPrototypeSuggestFakes();
+    const svc = new CategoryImprovementService(
+      dbMock as never,
+      llm as never,
+      emails as never,
+      embeddings as never,
+      categories as never,
+      silentLogger,
+      undefined,
+      undefined,
+      undefined,
+      () => true,
+    );
+
+    const out = await svc.suggest('a', 'bge-m3', 'gen');
+
+    // The proposal duplicates the axis-1 secondary prototype of Broad Bucket, so it is dropped.
+    expect(out.newCategories).toHaveLength(0);
+  });
+
+  it('apply writes only the aggregate centroid (prototype 0) even with the multi-prototype flag on', async () => {
+    const llm = { embed: vi.fn(async () => [0.1, 0.2]) };
+    const embeddings = {
+      listForAccount: () => [
+        { messageId: 'm1', vector: Float32Array.from([1, 0]) },
+        { messageId: 'm2', vector: Float32Array.from([1, 0]) },
+      ],
+      search: () => [] as Array<{ messageId: string; distance: number }>,
+    };
+    const savePrototypeSet = vi.fn();
+    const categories = {
+      listForAccount: () => [] as Array<{ label: string }>,
+      create: vi.fn((i: { label: string }) => ({ id: `new-${i.label}`, accountId: 'a' })),
+      saveCentroid: vi.fn(),
+      savePrototypeSet,
+      getCentroid: () => null,
+      findById: (id: string) => ({ id, accountId: 'a', status: 'active' }),
+      getEmailCategories: () => [] as Array<{ assignedBy: string; categoryId: string }>,
+      addAutoAssignments: vi.fn(),
+      clearDecisionsForEmail: vi.fn(),
+      mergeInto: vi.fn(),
+    };
+    const emails = { findById: () => ({ id: 'x' }) };
+    const svc = new CategoryImprovementService(
+      dbMock as never,
+      llm as never,
+      emails as never,
+      embeddings as never,
+      categories as never,
+      silentLogger,
+      undefined,
+      undefined,
+      undefined,
+      () => true,
+    );
+
+    const out = await svc.apply('a', 'bge-m3', {
+      newCategories: [{ label: 'Receipts & Invoices', description: 'd', messageIds: ['m1', 'm2'] }],
+      merges: [],
+    });
+
+    expect(out.created).toBe(1);
+    expect(categories.saveCentroid).toHaveBeenCalled();
+    // Every centroid write is an aggregate write: the prototypeIndex arg is left at its default (0).
+    for (const call of categories.saveCentroid.mock.calls) {
+      expect(call[4] === undefined || call[4] === 0).toBe(true);
+    }
+    expect(savePrototypeSet).not.toHaveBeenCalled();
+  });
 });
 
 describe('salvageSuggestions (tolerant Improve parsing)', () => {
@@ -2229,6 +2369,8 @@ describe('redactConfig (M8)', () => {
     expect(safeLlm.priorityUseChatProvider).toBe(true);
     expect(safeLlm.chatApiKeySet).toBe(true);
     expect(safe.locale).toBe('en');
+    // Feature flags carry no secrets and are exposed so the UI can reflect them.
+    expect(safe.features).toEqual({ multiPrototypeCategories: false });
   });
 
   it('enforces chat tuning bounds and accepts null to clear back to default', () => {

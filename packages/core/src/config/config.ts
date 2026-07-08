@@ -56,6 +56,7 @@ export interface SafeConfig {
   autoIndex: boolean;
   indexedFolders: string[];
   llm: Omit<AppConfig['llm'], 'apiKey' | 'chatApiKey'> & { chatApiKeySet: boolean };
+  features: AppConfig['features'];
 }
 
 /**
@@ -82,6 +83,10 @@ export function redactConfig(config: AppConfig): SafeConfig {
       priorityUseChatProvider: config.llm.priorityUseChatProvider,
       allowCloudDiscovery: config.llm.allowCloudDiscovery,
       chatApiKeySet: !!config.llm.chatApiKey,
+    },
+    // Feature flags carry no secrets; expose them so the UI can reflect and toggle them.
+    features: {
+      multiPrototypeCategories: config.features.multiPrototypeCategories,
     },
   };
 }

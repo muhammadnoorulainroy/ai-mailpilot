@@ -182,6 +182,7 @@ export function buildContext(): AppContext {
       repos.accounts,
       repos.discoveryAudit,
       () => config.llm,
+      multiPrototypeEnabled,
     ),
     discoveryProposal: new DiscoveryProposalOrchestrator(
       db,

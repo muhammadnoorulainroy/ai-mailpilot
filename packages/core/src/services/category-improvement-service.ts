@@ -290,7 +290,20 @@ export class CategoryImprovementService {
     private accounts?: AccountRepository,
     private audit?: DiscoveryAuditRepository,
     private getConfig?: () => LlmConfig,
+    private multiPrototypeEnabled: () => boolean = () => false,
   ) {}
+
+  /**
+   * The non-destructive match set per active category. Flag off returns the aggregate centroid only,
+   * byte-identical to the old single-centroid read; flag on returns each category's effective
+   * prototypes (its sub-prototypes when it has any, else its aggregate), so overlap, coverage, and
+   * duplicate checks see the nearest prototype rather than only the collapsed mean.
+   */
+  private effectivePrototypes(accountId: string, embeddingModelId: string): CentroidEntry[] {
+    return this.multiPrototypeEnabled()
+      ? this.categories.getEffectivePrototypeEntries(accountId, embeddingModelId, true)
+      : this.categories.getCentroidEntries(accountId, embeddingModelId);
+  }
 
   /**
    * Propose taxonomy changes from the uncategorized backlog. Nothing is applied here. The suggestion
@@ -374,7 +387,7 @@ export class CategoryImprovementService {
         error,
       });
     const existing = this.categories.listActive(accountId);
-    const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
+    const centroids = this.effectivePrototypes(accountId, embeddingModelId);
 
     const existingText =
       existing.length > 0
@@ -459,12 +472,13 @@ export class CategoryImprovementService {
       existing,
       uncategorized,
       sample,
+      centroids,
     );
     const merges = this.resolveMerges(parsed.merges, existing);
 
     const diagnostics =
       existingCategoryExpansions.length === 0 && newCategories.length === 0 && merges.length === 0
-        ? this.diagnoseBacklog(accountId, embeddingModelId, uncategorized, vectorsByMsg)
+        ? this.diagnoseBacklog(uncategorized, vectorsByMsg, centroids)
         : undefined;
 
     this.logger.info(
@@ -502,12 +516,10 @@ export class CategoryImprovementService {
    * existing centroid, recommending Refine when most do and a stronger model otherwise.
    */
   private diagnoseBacklog(
-    accountId: string,
-    embeddingModelId: string,
     uncategorized: EmailSummary[],
     vectorsByMsg: Map<string, Float32Array>,
+    centroids: CentroidEntry[],
   ): ImproveSuggestionsResponse['diagnostics'] {
-    const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
     if (centroids.length === 0) return undefined;
     let withVector = 0;
     let covered = 0;
@@ -982,6 +994,7 @@ export class CategoryImprovementService {
     }>,
     uncategorized: Array<{ messageId: string; subject: string | null }>,
     sample: SampledBucket[],
+    centroids: CentroidEntry[],
   ): Promise<SuggestedCategory[]> {
     const existingLabels = existingCategories.map((c) => normalizeLabel(c.label));
     const existing = new Set(existingLabels);
@@ -995,7 +1008,6 @@ export class CategoryImprovementService {
         );
       }),
     );
-    const existingCentroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
     const uncatIds = new Set(uncategorized.map((e) => e.messageId));
     const subjectById = new Map(uncategorized.map((e) => [e.messageId, e.subject]));
 
@@ -1010,7 +1022,7 @@ export class CategoryImprovementService {
         this.logger.warn({ err, label: c.label }, 'improve: embed failed, suggestion skipped');
         continue;
       }
-      const dupOf = existingCentroids.find(
+      const dupOf = centroids.find(
         (ec) => cosineFromL2Distance(l2Distance(vec, ec.vector)) >= EXISTING_DUP_COSINE,
       );
       if (dupOf) {
