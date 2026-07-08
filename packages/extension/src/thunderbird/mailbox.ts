@@ -2,10 +2,29 @@
  * Reads accounts, folders, and messages from Thunderbird and turns them into the push items Core
  * indexes, plus helpers for fetching attachments and mapping Message-IDs back to Thunderbird ids.
  */
-import type { PushEmailItem, PushAttachmentItem, AccountKind } from '@ai-mailpilot/shared';
+import type {
+  PushEmailItem,
+  PushEmailTag,
+  PushAttachmentItem,
+  AccountKind,
+} from '@ai-mailpilot/shared';
 import { pathHasExcludedSegment } from '../settings/sync-prefs.js';
+import { KEY_PREFIX } from './tags.js';
 
 const MAX_BODY_CHARS = 24_000;
+
+/**
+ * Build a resolver that maps a message header's tag keys to the user's own tags with visible labels,
+ * dropping MailPilot-managed tags. Reads the account's tag list once per sync pass.
+ */
+export async function loadUserTagResolver(): Promise<(tagKeys: string[]) => PushEmailTag[]> {
+  const all = await browser.messages.tags.list();
+  const labelByKey = new Map(all.map((t) => [t.key, t.tag]));
+  return (tagKeys) =>
+    (tagKeys ?? [])
+      .filter((key) => !key.startsWith(KEY_PREFIX))
+      .map((key) => ({ key, label: labelByKey.get(key) ?? key }));
+}
 const BATCH_BYTE_BUDGET = 4 * 1024 * 1024;
 
 /** Truncate a body to max chars without splitting a surrogate pair at the boundary. */
@@ -170,6 +189,7 @@ export class MailboxSnapshot {
     const items: PushEmailItem[] = [];
     const attachmentMsgs: AttachmentMsg[] = [];
     const seen = new Set<number>();
+    const resolveUserTags = await loadUserTagResolver();
     for (const header of headers) {
       if (!header.headerMessageId || seen.has(header.id)) continue;
       seen.add(header.id);
@@ -184,6 +204,7 @@ export class MailboxSnapshot {
         body: capBody(body, MAX_BODY_CHARS),
         bodyFormat: format,
         bodyFetched: fetchOk,
+        tags: resolveUserTags(header.tags),
       });
       if (hasAttachments && fetchOk) {
         attachmentMsgs.push({ tbId: header.id, messageId: header.headerMessageId });
@@ -273,6 +294,7 @@ export class MailboxSnapshot {
     const attachmentMsgs: AttachmentMsg[] = [];
     let batch: PushEmailItem[] = [];
     let batchBytes = 0;
+    const resolveUserTags = await loadUserTagResolver();
     let page = await browser.messages.list(folder);
 
     while (true) {
@@ -301,6 +323,7 @@ export class MailboxSnapshot {
           body: cappedBody,
           bodyFormat: format,
           bodyFetched: fetchOk,
+          tags: resolveUserTags(header.tags),
         });
         if (hasAttachments && fetchOk) {
           attachmentMsgs.push({ tbId: header.id, messageId: header.headerMessageId });

@@ -5,6 +5,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
+import { buildUserLabels } from '../services/user-label-ingest.js';
 
 const PushEmailItem = z.object({
   messageId: z.string().min(1),
@@ -16,6 +17,10 @@ const PushEmailItem = z.object({
   bodyFormat: z.enum(['text', 'html']).optional(),
   hasAttachments: z.boolean().optional(),
   bodyFetched: z.boolean().optional(),
+  tags: z
+    .array(z.object({ key: z.string().min(1), label: z.string() }))
+    .max(200)
+    .optional(),
 });
 
 const PushEmailsBody = z.object({
@@ -66,6 +71,17 @@ export async function registerEmailRoutes(app: FastifyInstance, ctx: AppContext)
     }));
 
     const inserted = ctx.repos.emails.upsertBatch(items);
+
+    // Mirror the user's own Thunderbird tags and meaningful folder as user-owned labels, replacing
+    // each pushed message's set so a removed tag or a moved message is reflected. Only messages in
+    // this batch are touched. This never affects AI categories or emails/embeddings.
+    const syncedAt = Date.now();
+    const labelEntries = parsed.data.emails.map((e) => ({
+      messageId: e.messageId,
+      labels: buildUserLabels(e.folder, e.tags),
+    }));
+    ctx.repos.emailUserLabels.replaceForEmails(parsed.data.accountId, labelEntries, syncedAt);
+
     ctx.logger.info({ accountId: parsed.data.accountId, count: inserted }, 'emails pushed');
 
     return { inserted, total: ctx.repos.emails.count(parsed.data.accountId) };

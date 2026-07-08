@@ -17,6 +17,7 @@ import { DiscoveryAuditRepository } from './repositories/discovery-audit-reposit
 import { ConversationRepository } from './repositories/conversation-repository.js';
 import { EmailRepository } from './repositories/email-repository.js';
 import { EmailAssistantRepository } from './repositories/email-assistant-repository.js';
+import { EmailUserLabelRepository } from './repositories/email-user-label-repository.js';
 import { EmbeddingRepository } from './repositories/embedding-repository.js';
 import { FailureRepository } from './repositories/failure-repository.js';
 import { CategorizeJobRepository } from './repositories/categorize-job-repository.js';
@@ -61,6 +62,7 @@ export interface Repositories {
   failures: FailureRepository;
   categorizeJobs: CategorizeJobRepository;
   emailAssistant: EmailAssistantRepository;
+  emailUserLabels: EmailUserLabelRepository;
 }
 
 /**
@@ -120,6 +122,7 @@ export function buildContext(): AppContext {
     failures: new FailureRepository(db),
     categorizeJobs: new CategorizeJobRepository(db),
     emailAssistant: new EmailAssistantRepository(db),
+    emailUserLabels: new EmailUserLabelRepository(db),
   };
 
   const triageService = new TriageService(llm, logger);

@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { MailboxSnapshot } from '../src/thunderbird/mailbox.js';
 
 /** Builds a minimal TbMessageHeader fixture for the given id and Message-ID. */
-const header = (id: number, messageId: string): TbMessageHeader =>
+const header = (id: number, messageId: string, tags: string[] = []): TbMessageHeader =>
   ({
     id,
     headerMessageId: messageId,
@@ -18,6 +18,7 @@ const header = (id: number, messageId: string): TbMessageHeader =>
     read: false,
     flagged: false,
     folder: { accountId: 'acc1', path: 'INBOX', name: 'Inbox' },
+    tags,
   }) as TbMessageHeader;
 
 describe('MailboxSnapshot.fetchMessages (targeted new-mail indexing)', () => {
@@ -25,14 +26,24 @@ describe('MailboxSnapshot.fetchMessages (targeted new-mail indexing)', () => {
 
   beforeEach(() => {
     getFull = vi.fn(async (id: number) => ({ contentType: 'text/plain', body: `Body ${id}`, headers: {} }));
-    vi.stubGlobal('browser', { messages: { getFull } });
+    vi.stubGlobal('browser', {
+      messages: {
+        getFull,
+        tags: {
+          list: async () => [
+            { key: '$work', tag: 'Work', color: '#000', ordinal: '' },
+            { key: 'mailpilot_x', tag: 'X', color: '#000', ordinal: '' },
+          ],
+        },
+      },
+    });
   });
   afterEach(() => vi.unstubAllGlobals());
 
   it('fetches each unique message once, skipping duplicates and headers with no Message-ID', async () => {
     const snap = new MailboxSnapshot([]);
     const headers = [
-      header(1, 'm1'),
+      header(1, 'm1', ['$work', 'mailpilot_x']),
       header(1, 'm1'),
       header(2, 'm2'),
       header(3, ''),
@@ -52,6 +63,8 @@ describe('MailboxSnapshot.fetchMessages (targeted new-mail indexing)', () => {
       bodyFormat: 'text',
     });
     expect(items[0]!.body).toContain('Body 1');
+    // Captures the user's own tag, drops the MailPilot-managed one.
+    expect(items[0]!.tags).toEqual([{ key: '$work', label: 'Work' }]);
   });
 
   it('records a message whose body fetch fails as not-fetched, so a later sync retries it', async () => {

@@ -66,6 +66,12 @@ export interface FolderListResponse {
   folders: FolderInfo[];
 }
 
+/** A user-owned Thunderbird tag on a pushed email: its stable key and current visible label. */
+export interface PushEmailTag {
+  key: string;
+  label: string;
+}
+
 /** A single email pushed from the extension to Core. */
 export interface PushEmailItem {
   messageId: string;
@@ -77,6 +83,11 @@ export interface PushEmailItem {
   bodyFormat?: 'text' | 'html';
   hasAttachments?: boolean;
   bodyFetched?: boolean;
+  /**
+   * The message's current user-owned Thunderbird tags (MailPilot-managed tags excluded by the
+   * client). Send an empty array when the message has none so a removed tag is cleared on Core.
+   */
+  tags?: PushEmailTag[];
 }
 
 /** Request to push a batch of emails for an account. */

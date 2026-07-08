@@ -363,7 +363,7 @@ describe('v23 category prototype index', () => {
     const rowidA = seed(db, 'cat-a', vecA);
     const rowidB = seed(db, 'cat-b', vecB);
 
-    expect(runMigrations(db, migrations)).toEqual([23]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 23))).toEqual([23]);
 
     // Column added; existing rows are prototype_index=0 with their original rowid preserved.
     const cols = db.prepare('PRAGMA table_info(category_embedding_index)').all() as Array<{
@@ -389,7 +389,7 @@ describe('v23 category prototype index', () => {
   it('enforces UNIQUE(category_id, model_id, prototype_index): rejects a duplicate aggregate, accepts a sub-prototype', () => {
     const db = buildV22Db();
     seed(db, 'cat-a', centroidVec(1));
-    expect(runMigrations(db, migrations)).toEqual([23]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 23))).toEqual([23]);
 
     // A second prototype_index=0 for the same (category, model) is rejected.
     const dupRowid = insertVec(db, centroidVec(9));
@@ -409,7 +409,7 @@ describe('v23 category prototype index', () => {
   it('delete trigger removes the vec row for a deleted prototype but leaves siblings intact', () => {
     const db = buildV22Db();
     seed(db, 'cat-a', centroidVec(1));
-    expect(runMigrations(db, migrations)).toEqual([23]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 23))).toEqual([23]);
     const subRowid = addSubPrototype(db, 'cat-a', 1, centroidVec(3));
 
     // Delete only the sub-prototype's index row.
@@ -432,7 +432,7 @@ describe('v23 category prototype index', () => {
   it('deleting a category cascades all its prototypes and their vec rows', () => {
     const db = buildV22Db();
     seed(db, 'cat-a', centroidVec(1));
-    expect(runMigrations(db, migrations)).toEqual([23]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 23))).toEqual([23]);
     addSubPrototype(db, 'cat-a', 1, centroidVec(3));
 
     db.prepare('DELETE FROM categories WHERE id = ?').run('cat-a');
@@ -450,8 +450,8 @@ describe('v23 category prototype index', () => {
   it('is forward-only: a second run applies nothing', () => {
     const db = buildV22Db();
     seed(db, 'cat-a', centroidVec(1));
-    expect(runMigrations(db, migrations)).toEqual([23]);
-    expect(runMigrations(db, migrations)).toEqual([]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 23))).toEqual([23]);
+    expect(runMigrations(db, migrations.filter((m) => m.version <= 23))).toEqual([]);
     db.close();
   });
 });

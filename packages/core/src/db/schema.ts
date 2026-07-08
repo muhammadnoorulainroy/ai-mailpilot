@@ -749,4 +749,26 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 24,
+    name: 'email_user_labels',
+    up: (db) => {
+      // User-owned mail organization captured from Thunderbird: the user's own tags and their
+      // meaningful folder. Kept separate from MailPilot AI categories: these are signals, never
+      // AI-owned categories. Cascades with the email so it never outlives its message.
+      db.exec(`
+        CREATE TABLE email_user_labels (
+          account_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          source TEXT NOT NULL CHECK (source IN ('thunderbird_tag', 'folder')),
+          key TEXT NOT NULL,
+          label TEXT NOT NULL,
+          synced_at INTEGER NOT NULL,
+          PRIMARY KEY (account_id, message_id, source, key),
+          FOREIGN KEY (message_id, account_id) REFERENCES emails(message_id, account_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_email_user_labels_account ON email_user_labels(account_id, source, key);
+      `);
+    },
+  },
 ];

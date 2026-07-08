@@ -7,7 +7,8 @@ import { coreClient } from '../api-client/core-client.js';
 import { MailboxSnapshot } from './mailbox.js';
 import { loadSyncPrefs } from '../settings/sync-prefs.js';
 
-const KEY_PREFIX = 'mailpilot_';
+/** Namespace prefix marking a Thunderbird tag as MailPilot-managed (never a user-owned signal). */
+export const KEY_PREFIX = 'mailpilot_';
 
 /**
  * Prefix for a MailPilot tag's visible label when the user already owns a tag with the same name.
