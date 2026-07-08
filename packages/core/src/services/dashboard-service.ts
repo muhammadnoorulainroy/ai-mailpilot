@@ -4,6 +4,10 @@
  */
 import type { CategoryRepository } from '../repositories/category-repository.js';
 import type { EmailRepository } from '../repositories/email-repository.js';
+import type {
+  EmailUserLabelRepository,
+  UserLabelStat,
+} from '../repositories/email-user-label-repository.js';
 import type { TriageBucket, TriageRepository } from '../repositories/triage-repository.js';
 
 /** Minimal email projection shown in dashboard lists. */
@@ -30,6 +34,14 @@ export interface DashboardCategorySummary {
   emailCount: number;
 }
 
+/** The user's own Thunderbird organization detected during sync, surfaced read-only. */
+export interface UserOrganization {
+  tagCount: number;
+  folderCount: number;
+  topTags: UserLabelStat[];
+  topFolders: UserLabelStat[];
+}
+
 /** Aggregated snapshot of email, triage, and category state for one account. */
 export interface Dashboard {
   accountId: string;
@@ -47,6 +59,7 @@ export interface Dashboard {
   recent: DashboardEmail[];
   categoryCount: number;
   categories: DashboardCategorySummary[];
+  userOrganization: UserOrganization;
 }
 
 /** Limits controlling how many rows each dashboard section includes. */
@@ -55,6 +68,7 @@ export interface DashboardOptions {
   summarizeLimit?: number;
   recentLimit?: number;
   topCategoriesLimit?: number;
+  topLabelsLimit?: number;
 }
 
 const DEFAULTS: Required<DashboardOptions> = {
@@ -62,6 +76,7 @@ const DEFAULTS: Required<DashboardOptions> = {
   summarizeLimit: 20,
   recentLimit: 30,
   topCategoriesLimit: 24,
+  topLabelsLimit: 12,
 };
 
 /** Builds dashboard snapshots from email, triage, and category repositories. */
@@ -71,6 +86,7 @@ export class DashboardService {
     private emails: EmailRepository,
     private triage: TriageRepository,
     private categories: CategoryRepository,
+    private userLabels: EmailUserLabelRepository,
   ) {}
 
   /**
@@ -128,6 +144,12 @@ export class DashboardService {
       })),
       categoryCount: activeCategories.length,
       categories: topCategories,
+      userOrganization: {
+        tagCount: this.userLabels.countDistinct(accountId, 'thunderbird_tag'),
+        folderCount: this.userLabels.countDistinct(accountId, 'folder'),
+        topTags: this.userLabels.topLabels(accountId, 'thunderbird_tag', opts.topLabelsLimit),
+        topFolders: this.userLabels.topLabels(accountId, 'folder', opts.topLabelsLimit),
+      },
     };
   }
 }

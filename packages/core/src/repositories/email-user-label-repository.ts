@@ -40,6 +40,7 @@ export class EmailUserLabelRepository {
     stats: Statement<unknown[]>;
     countDistinct: Statement<unknown[]>;
     subjectsForLabel: Statement<unknown[]>;
+    messageIdsForLabel: Statement<unknown[]>;
   };
 
   constructor(private db: Database) {
@@ -74,6 +75,11 @@ export class EmailUserLabelRepository {
           WHERE l.account_id = ? AND l.source = ? AND l.key = ?
             AND e.subject IS NOT NULL AND e.subject != ''
           ORDER BY e.date DESC
+          LIMIT ?`,
+      ),
+      messageIdsForLabel: db.prepare(
+        `SELECT message_id AS messageId FROM email_user_labels
+          WHERE account_id = ? AND source = ? AND key = ?
           LIMIT ?`,
       ),
     };
@@ -149,5 +155,19 @@ export class EmailUserLabelRepository {
     return (
       this.stmts.subjectsForLabel.all(accountId, source, key, limit) as Array<{ subject: string }>
     ).map((r) => r.subject);
+  }
+
+  /** Message ids carrying one label, for coherence scoring. Bounded by limit. */
+  messageIdsForLabel(
+    accountId: string,
+    source: UserLabelSource,
+    key: string,
+    limit: number,
+  ): string[] {
+    return (
+      this.stmts.messageIdsForLabel.all(accountId, source, key, limit) as Array<{
+        messageId: string;
+      }>
+    ).map((r) => r.messageId);
   }
 }

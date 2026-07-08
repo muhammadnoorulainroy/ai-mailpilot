@@ -155,6 +155,7 @@ async function refreshDashboard(): Promise<void> {
     showContent();
     renderStats();
     renderCategories();
+    renderUserOrganization();
     renderRecent();
     setStatus(`Updated ${formatTime(data.generatedAt)}`);
     void loadFolderPlan(account);
@@ -496,6 +497,50 @@ function renderCategories(): void {
     card.appendChild(bar);
 
     container.appendChild(card);
+  }
+}
+
+/**
+ * Render the user's own Thunderbird tags and folders, read-only and clearly separate from AI
+ * categories. Hidden when none were detected. Labels use textContent so they are never interpreted
+ * as markup.
+ */
+function renderUserOrganization(): void {
+  const wrap = document.getElementById('existing-organization');
+  const org = state.dashboard?.userOrganization;
+  if (!wrap) return;
+  if (!org || (org.topTags.length === 0 && org.topFolders.length === 0)) {
+    wrap.hidden = true;
+    return;
+  }
+  wrap.hidden = false;
+  fillLabelChips('existing-org-tags', org.topTags);
+  fillLabelChips('existing-org-folders', org.topFolders);
+}
+
+/** Fill a chip container with user labels and their counts, escaping via textContent. */
+function fillLabelChips(id: string, items: Array<{ label: string; count: number }>): void {
+  const container = document.getElementById(id);
+  if (!container) return;
+  container.innerHTML = '';
+  if (items.length === 0) {
+    const none = document.createElement('span');
+    none.className = 'muted';
+    none.textContent = 'None detected';
+    container.appendChild(none);
+    return;
+  }
+  for (const item of items) {
+    const chip = document.createElement('span');
+    chip.className = 'existing-org-chip';
+    const label = document.createElement('span');
+    label.className = 'existing-org-chip-label';
+    label.textContent = item.label;
+    const count = document.createElement('span');
+    count.className = 'existing-org-chip-count';
+    count.textContent = String(item.count);
+    chip.append(label, count);
+    container.appendChild(chip);
   }
 }
 

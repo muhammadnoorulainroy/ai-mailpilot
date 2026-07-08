@@ -8,17 +8,29 @@ import { describe, it, expect } from 'vitest';
 import Fastify from 'fastify';
 import type { Logger } from 'pino';
 import { openDatabase } from '../src/db/database.js';
+import { EMBEDDING_DIM } from '../src/db/schema.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { EmailRepository } from '../src/repositories/email-repository.js';
 import { EmbeddingRepository } from '../src/repositories/embedding-repository.js';
 import { EmailUserLabelRepository } from '../src/repositories/email-user-label-repository.js';
+import { CategoryRepository } from '../src/repositories/category-repository.js';
+import { TriageRepository } from '../src/repositories/triage-repository.js';
+import { DashboardService } from '../src/services/dashboard-service.js';
+import { UserLabelSuggestionService } from '../src/services/user-label-suggestion-service.js';
 import { registerEmailRoutes } from '../src/routes/emails.js';
+import { registerDashboardRoutes } from '../src/routes/dashboard.js';
 import type { AppContext } from '../src/context.js';
 import {
   buildUserLabels,
   folderLabel,
   isGenericFolder,
 } from '../src/services/user-label-ingest.js';
+
+function axis(dim: number): Float32Array {
+  const v = new Float32Array(EMBEDDING_DIM);
+  v[dim] = 1;
+  return v;
+}
 
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 
@@ -232,5 +244,156 @@ describe('/emails/push user-label ingestion', () => {
     ).n;
     expect(embCount).toBe(0);
     await h.app.close();
+  });
+});
+
+describe('dashboard userOrganization summary (Part C)', () => {
+  async function seedApp() {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const emails = new EmailRepository(db);
+    const triage = new TriageRepository(db);
+    const categories = new CategoryRepository(db);
+    const labels = new EmailUserLabelRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    emails.upsertBatch(
+      ['m1', 'm2', 'm3'].map((messageId) => ({
+        messageId,
+        accountId: acc.id,
+        folder: '/Clients/Acme',
+        subject: 's',
+      })),
+    );
+    for (const m of ['m1', 'm2', 'm3']) {
+      labels.replaceForEmail(
+        acc.id,
+        m,
+        [
+          { source: 'thunderbird_tag', key: '$work', label: 'Work' },
+          { source: 'folder', key: 'clients_acme', label: 'Acme' },
+        ],
+        1,
+      );
+    }
+    labels.replaceForEmail(
+      acc.id,
+      'm1',
+      [
+        { source: 'thunderbird_tag', key: '$work', label: 'Work' },
+        { source: 'thunderbird_tag', key: '$uni', label: 'Uni' },
+        { source: 'folder', key: 'clients_acme', label: 'Acme' },
+      ],
+      1,
+    );
+    const dashboard = new DashboardService(emails, triage, categories, labels);
+    const app = Fastify();
+    await registerDashboardRoutes(app, {
+      repos: { accounts },
+      services: { dashboard },
+    } as unknown as AppContext);
+    await app.ready();
+    return { app, accountId: acc.id };
+  }
+
+  it('includes user-tag and folder counts with top labels, excluding AI categories', async () => {
+    const { app, accountId } = await seedApp();
+    const res = await app.inject({ method: 'GET', url: `/dashboard?accountId=${accountId}` });
+    expect(res.statusCode).toBe(200);
+    const org = res.json().userOrganization;
+    expect(org.tagCount).toBe(2);
+    expect(org.folderCount).toBe(1);
+    expect(org.topTags[0]).toMatchObject({ key: '$work', label: 'Work', count: 3 });
+    expect(org.topFolders[0]).toMatchObject({ key: 'clients_acme', label: 'Acme', count: 3 });
+    await app.close();
+  });
+
+  it('reports an empty user organization when no labels exist', async () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const dashboard = new DashboardService(
+      new EmailRepository(db),
+      new TriageRepository(db),
+      new CategoryRepository(db),
+      new EmailUserLabelRepository(db),
+    );
+    const app = Fastify();
+    await registerDashboardRoutes(app, {
+      repos: { accounts },
+      services: { dashboard },
+    } as unknown as AppContext);
+    await app.ready();
+    const res = await app.inject({ method: 'GET', url: `/dashboard?accountId=${acc.id}` });
+    expect(res.json().userOrganization).toEqual({
+      tagCount: 0,
+      folderCount: 0,
+      topTags: [],
+      topFolders: [],
+    });
+    await app.close();
+    db.close();
+  });
+});
+
+describe('UserLabelSuggestionService (Part E, import-prep only)', () => {
+  function seed() {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const emails = new EmailRepository(db);
+    const embeddings = new EmbeddingRepository(db);
+    const labels = new EmailUserLabelRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const ids = ['m1', 'm2', 'm3', 'm4', 'm5'];
+    emails.upsertBatch(
+      ids.map((messageId, i) => ({
+        messageId,
+        accountId: acc.id,
+        folder: '/Clients/Acme',
+        subject: `acme ${i}`,
+      })),
+    );
+    for (const m of ids) {
+      labels.replaceForEmail(
+        acc.id,
+        m,
+        [{ source: 'thunderbird_tag', key: '$clients', label: 'clients' }],
+        1,
+      );
+      embeddings.saveEmbedding({ messageId: m, accountId: acc.id, modelId: 'bge-m3' }, axis(0));
+    }
+    // A rarely-used tag below the MIN_COUNT floor must not be suggested.
+    labels.replaceForEmail(
+      acc.id,
+      'm1',
+      [
+        { source: 'thunderbird_tag', key: '$clients', label: 'clients' },
+        { source: 'thunderbird_tag', key: '$rare', label: 'rare' },
+      ],
+      1,
+    );
+    return { acc, emails, embeddings, labels };
+  }
+
+  it('suggests only sufficiently-used labels, title-cased, with no coherence when no model given', () => {
+    const h = seed();
+    const svc = new UserLabelSuggestionService(h.labels, h.embeddings);
+    const out = svc.suggest(h.acc.id);
+    const clients = out.find((s) => s.key === '$clients');
+    expect(clients).toMatchObject({
+      source: 'thunderbird_tag',
+      count: 5,
+      coherence: null,
+      suggestedCategoryLabel: 'Clients',
+    });
+    expect(clients!.representativeSubjects.length).toBeGreaterThan(0);
+    expect(out.some((s) => s.key === '$rare')).toBe(false);
+  });
+
+  it('scores coherence from embeddings when an embedding model is supplied', () => {
+    const h = seed();
+    const svc = new UserLabelSuggestionService(h.labels, h.embeddings);
+    const clients = svc.suggest(h.acc.id, 'bge-m3').find((s) => s.key === '$clients');
+    // All the label's emails share one embedding axis, so they are perfectly coherent.
+    expect(clients!.coherence).toBeCloseTo(1, 5);
   });
 });

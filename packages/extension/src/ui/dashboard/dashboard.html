@@ -158,6 +158,26 @@
                 No categories yet. Click "Organize inbox" to discover topics and assign emails.
               </div>
             </div>
+
+            <div id="existing-organization" class="existing-org" hidden>
+              <div class="existing-org-head">
+                <h3 class="existing-org-title">Existing Thunderbird labels</h3>
+                <p class="existing-org-note muted">
+                  Your own tags and folders, detected during sync. These stay yours, kept separate
+                  from AI categories. MailPilot never changes or deletes them.
+                </p>
+              </div>
+              <div class="existing-org-groups">
+                <div class="existing-org-group">
+                  <div class="existing-org-group-title muted">Your tags</div>
+                  <div id="existing-org-tags" class="existing-org-chips"></div>
+                </div>
+                <div class="existing-org-group">
+                  <div class="existing-org-group-title muted">Your folders</div>
+                  <div id="existing-org-folders" class="existing-org-chips"></div>
+                </div>
+              </div>
+            </div>
           </section>
 
           <section class="tab-panel" id="panel-folders" role="tabpanel" hidden>

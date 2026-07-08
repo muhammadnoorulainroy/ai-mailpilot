@@ -49,6 +49,7 @@ import type {
   ApplyImprovementsResponse,
   CategoryDto,
   CategoryListResponse,
+  UserLabelSuggestionsResponse,
   CategoryUpdateRequest,
   CategoryMergeRequest,
   CategoryMergeResponse,
@@ -489,6 +490,16 @@ export class CoreClient {
   listCategories(accountId: string): Promise<CategoryListResponse> {
     const qs = new URLSearchParams({ accountId });
     return this.request(`/categories?${qs.toString()}`);
+  }
+
+  /** Import-prep suggestions: user tags/folders that could seed AI categories. Applies nothing. */
+  userLabelSuggestions(
+    accountId: string,
+    embeddingModelId?: string,
+  ): Promise<UserLabelSuggestionsResponse> {
+    const qs = new URLSearchParams({ accountId });
+    if (embeddingModelId) qs.set('embeddingModelId', embeddingModelId);
+    return this.request(`/categories/user-label-suggestions?${qs.toString()}`);
   }
 
   /** Fetch the proposed folder plan for an account. */

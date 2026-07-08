@@ -235,7 +235,12 @@ export function buildContext(): AppContext {
       repos.embeddings,
       () => config.features.multiPrototypeCategories,
     ),
-    dashboard: new DashboardService(repos.emails, repos.triage, repos.categories),
+    dashboard: new DashboardService(
+      repos.emails,
+      repos.triage,
+      repos.categories,
+      repos.emailUserLabels,
+    ),
     priority: new PriorityService(repos.triage),
     emailAssistant: new EmailAssistantService(
       llm,

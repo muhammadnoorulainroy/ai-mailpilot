@@ -9,6 +9,7 @@ import type { CategoryRow } from '../repositories/category-repository.js';
 import type { CategoryDto } from '@ai-mailpilot/shared';
 import { discoveryProvider } from '../services/discovery-guard.js';
 import { ProposalApplyError } from '../services/discovery-proposal-orchestrator.js';
+import { UserLabelSuggestionService } from '../services/user-label-suggestion-service.js';
 
 const DiscoverBody = z.object({
   accountId: z.string().min(1),
@@ -18,6 +19,11 @@ const DiscoverBody = z.object({
 
 const ListQuery = z.object({
   accountId: z.string().min(1),
+});
+
+const UserLabelSuggestionsQuery = z.object({
+  accountId: z.string().min(1),
+  embeddingModelId: z.string().optional(),
 });
 
 const ProposalActionBody = z.object({
@@ -360,6 +366,26 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
     return {
       accountId: parsed.data.accountId,
       categories: rows.map(toDto),
+    };
+  });
+
+  // Import-prep only: propose which user-owned Thunderbird tags/folders could seed AI categories.
+  // Read-only, creates nothing. Coherence is scored when an embedding model is supplied.
+  app.get('/categories/user-label-suggestions', async (req, reply) => {
+    const parsed = UserLabelSuggestionsQuery.safeParse(req.query);
+    if (!parsed.success) {
+      reply.code(400).send({ error: 'invalid query', issues: parsed.error.issues });
+      return;
+    }
+    const account = ctx.repos.accounts.findById(parsed.data.accountId);
+    if (!account) {
+      reply.code(404).send({ error: 'account not found' });
+      return;
+    }
+    const service = new UserLabelSuggestionService(ctx.repos.emailUserLabels, ctx.repos.embeddings);
+    return {
+      accountId: parsed.data.accountId,
+      suggestions: service.suggest(parsed.data.accountId, parsed.data.embeddingModelId),
     };
   });
 

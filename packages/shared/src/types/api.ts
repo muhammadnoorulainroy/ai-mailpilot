@@ -719,6 +719,42 @@ export interface DashboardCategorySummaryDto {
   emailCount: number;
 }
 
+/** One aggregated user-owned label (a Thunderbird tag or a meaningful folder) and its usage. */
+export interface UserLabelStatDto {
+  source: 'thunderbird_tag' | 'folder';
+  key: string;
+  label: string;
+  count: number;
+}
+
+/**
+ * The user's own organization detected in Thunderbird, kept separate from MailPilot AI categories.
+ * These are read-only signals surfaced for context; they are never AI categories.
+ */
+export interface UserOrganizationDto {
+  tagCount: number;
+  folderCount: number;
+  topTags: UserLabelStatDto[];
+  topFolders: UserLabelStatDto[];
+}
+
+/** A user-owned label proposed as a possible AI category seed (import-prep only, never applied). */
+export interface UserLabelSuggestionDto {
+  source: 'thunderbird_tag' | 'folder';
+  key: string;
+  label: string;
+  count: number;
+  coherence: number | null;
+  representativeSubjects: string[];
+  suggestedCategoryLabel: string;
+}
+
+/** Response listing user-label category-seed suggestions for an account. */
+export interface UserLabelSuggestionsResponse {
+  accountId: string;
+  suggestions: UserLabelSuggestionDto[];
+}
+
 /** The dashboard payload with email counts, triage buckets, and categories. */
 export interface DashboardResponse {
   accountId: string;
@@ -736,6 +772,7 @@ export interface DashboardResponse {
   recent: DashboardEmailDto[];
   categoryCount: number;
   categories: DashboardCategorySummaryDto[];
+  userOrganization: UserOrganizationDto;
 }
 
 /** A single turn in a chat conversation. */

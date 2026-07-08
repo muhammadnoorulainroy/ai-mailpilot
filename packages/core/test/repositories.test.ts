@@ -19,6 +19,7 @@ import { TriageRepository, type TriageBucket } from '../src/repositories/triage-
 import { CategorizeJobRepository } from '../src/repositories/categorize-job-repository.js';
 import type { LlmCategorizeProgress } from '../src/services/llm-categorize-orchestrator.js';
 import { DashboardService } from '../src/services/dashboard-service.js';
+import { EmailUserLabelRepository } from '../src/repositories/email-user-label-repository.js';
 import { PriorityService } from '../src/services/priority-service.js';
 import { EmailAssistantService } from '../src/services/email-assistant-service.js';
 import type { TriageMetadata } from '@ai-mailpilot/shared';
@@ -867,7 +868,7 @@ describe('DashboardService coverage counts (triage vs category wiring bug)', () 
   it('reports uncategorized from category assignments, independent of triage', () => {
     const acct = accounts.create({ address: 'dash@x.y', kind: 'work' });
     const triage = new TriageRepository(db);
-    const dash = new DashboardService(emails, triage, categories);
+    const dash = new DashboardService(emails, triage, categories, new EmailUserLabelRepository(db));
     const cat = categories.create({ accountId: acct.id, label: 'C', source: 'auto' });
     const now = Date.now();
 
