@@ -16,6 +16,8 @@ import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-r
 import type { LlmConfig } from '../config/schema.js';
 import { assertDiscoveryLocal, discoveryProvider } from './discovery-guard.js';
 import { stableHash, seededShuffle } from '../util/rand.js';
+import type { EmailUserLabelRepository } from '../repositories/email-user-label-repository.js';
+import { summarizeUserLabels } from './user-label-hints.js';
 
 const TWIN_COSINE_STRONG = 0.93;
 const TWIN_COSINE_SAME_PURPOSE = 0.9;
@@ -176,6 +178,7 @@ GUIDELINES:
 - BANNED: vague catch-all topics where every word is generic, such as "Technical Support", "Service Announcements", "Account Notifications", "General Updates", "Notifications", "Miscellaneous". Each topic needs a concrete anchor word naming a real purpose (banking, invoice, job, course, security, developer, travel, insurance, shipping, etc.).
 - Topic descriptions: ONE short sentence (under 20 words) naming the concrete PURPOSE only. Do NOT name specific senders, brands, apps, or services in the description.
 - Topic labels: 2-4 words, Title Case, no quotes.
+- If a section of the user's own tags/folders is shown, treat it as WEAK HINTS ONLY: never create a topic solely because a tag or folder exists, never copy a personal or generic label as a topic, and keep every topic purpose-based. The user's own labels stay separate from your categories.
 - Output ONLY valid JSON, no extra text, no code fences, no markdown.
 
 OUTPUT FORMAT:
@@ -208,6 +211,7 @@ export class TopicDiscoveryService {
     private accounts?: AccountRepository,
     private audit?: DiscoveryAuditRepository,
     private getConfig?: () => LlmConfig,
+    private userLabelRepo?: EmailUserLabelRepository,
   ) {}
 
   /**
@@ -321,10 +325,23 @@ export class TopicDiscoveryService {
       .map(([d, c]) => `${d} (${c})`)
       .join(', ');
 
-    const userPrompt =
+    let userPrompt =
       `Inbox sample (${sample.length} emails):\n\n${sampleText}\n\n` +
       `Highest-volume senders by domain: ${topDomains}\n\n` +
       `Identify ${TARGET_TOPIC_COUNT} recurring topics. Make sure each high-volume sender above has a fitting topic.`;
+
+    // Include the user's own tags/folders as weak hints. Privacy: local always; cloud only when the
+    // user has explicitly opted into cloud discovery (which is also what lets discovery run at all on
+    // the cloud provider). Only a small, summarized top-labels view is ever sent, never the full set.
+    let labelHintsIncluded = false;
+    const mayIncludeLabels = provider === 'main' || (cfg?.allowCloudDiscovery ?? false);
+    if (this.userLabelRepo && mayIncludeLabels) {
+      const hint = summarizeUserLabels(this.userLabelRepo, accountId);
+      if (hint.labelCount > 0) {
+        userPrompt += `\n\n${hint.text}`;
+        labelHintsIncluded = true;
+      }
+    }
 
     const insufficient = (): DiscoveryResult => {
       this.audit?.log({
@@ -477,7 +494,9 @@ export class TopicDiscoveryService {
       poolSize: pool.length,
       sampleSize: sample.length,
       emailsExposed: sample.length,
-      fieldsRead: ['subject', 'from_addr'],
+      fieldsRead: labelHintsIncluded
+        ? ['subject', 'from_addr', 'user_label_hints']
+        : ['subject', 'from_addr'],
       omittedCategories: omitted,
     });
 

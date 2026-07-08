@@ -174,6 +174,7 @@ export function buildContext(): AppContext {
       repos.accounts,
       repos.discoveryAudit,
       () => config.llm,
+      repos.emailUserLabels,
     ),
     categoryImprovement: new CategoryImprovementService(
       db,

@@ -4,7 +4,7 @@
  * the migration + FK cascade, and the /emails/push ingestion path. Emails and embeddings are never
  * touched by this feature.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import Fastify from 'fastify';
 import type { Logger } from 'pino';
 import { openDatabase } from '../src/db/database.js';
@@ -17,6 +17,8 @@ import { CategoryRepository } from '../src/repositories/category-repository.js';
 import { TriageRepository } from '../src/repositories/triage-repository.js';
 import { DashboardService } from '../src/services/dashboard-service.js';
 import { UserLabelSuggestionService } from '../src/services/user-label-suggestion-service.js';
+import { TopicDiscoveryService } from '../src/services/topic-discovery-service.js';
+import { summarizeUserLabels } from '../src/services/user-label-hints.js';
 import { registerEmailRoutes } from '../src/routes/emails.js';
 import { registerDashboardRoutes } from '../src/routes/dashboard.js';
 import type { AppContext } from '../src/context.js';
@@ -395,5 +397,174 @@ describe('UserLabelSuggestionService (Part E, import-prep only)', () => {
     const clients = svc.suggest(h.acc.id, 'bge-m3').find((s) => s.key === '$clients');
     // All the label's emails share one embedding axis, so they are perfectly coherent.
     expect(clients!.coherence).toBeCloseTo(1, 5);
+  });
+});
+
+describe('summarizeUserLabels hint builder (Part D)', () => {
+  function seed() {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const emails = new EmailRepository(db);
+    const labels = new EmailUserLabelRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const ids = Array.from({ length: 6 }, (_, i) => `m${i}`);
+    emails.upsertBatch(
+      ids.map((messageId, i) => ({
+        messageId,
+        accountId: acc.id,
+        folder: '/Clients/Acme',
+        subject: `Acme invoice ${i}`,
+        date: i,
+      })),
+    );
+    for (const m of ids) {
+      labels.replaceForEmail(
+        acc.id,
+        m,
+        [{ source: 'thunderbird_tag', key: '$clients', label: 'Clients' }],
+        1,
+      );
+    }
+    labels.replaceForEmail(
+      acc.id,
+      'm0',
+      [
+        { source: 'thunderbird_tag', key: '$clients', label: 'Clients' },
+        { source: 'thunderbird_tag', key: '$rare', label: 'rare' },
+      ],
+      1,
+    );
+    return { acc, labels };
+  }
+
+  it('summarizes well-used labels with subjects and drops below-floor ones', () => {
+    const h = seed();
+    const hint = summarizeUserLabels(h.labels, h.acc.id);
+    expect(hint.labelCount).toBe(1);
+    expect(hint.text).toContain('Clients (6 emails)');
+    expect(hint.text).toContain('weak hints');
+    expect(hint.text).not.toContain('rare');
+  });
+
+  it('returns an empty hint when there are no meaningful labels', () => {
+    const db = openDatabase(':memory:');
+    const acc = new AccountRepository(db).create({ address: 'w@x.com', kind: 'work' });
+    const hint = summarizeUserLabels(new EmailUserLabelRepository(db), acc.id);
+    expect(hint).toEqual({ text: '', labelCount: 0 });
+  });
+});
+
+describe('discovery hinting from user labels (Part D/F)', () => {
+  const summary = (messageId: string, fromAddr: string) => ({
+    messageId,
+    folder: '/INBOX',
+    subject: `Subj ${messageId}`,
+    fromAddr,
+    date: 1,
+    hasAttachments: false,
+  });
+
+  function harness(opts: { withRepo?: boolean; allowCloud?: boolean } = {}) {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const emailsRepo = new EmailRepository(db);
+    const userLabels = new EmailUserLabelRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const ids = Array.from({ length: 8 }, (_, i) => `u${i}`);
+    emailsRepo.upsertBatch(
+      ids.map((m) => ({
+        messageId: m,
+        accountId: acc.id,
+        folder: '/Clients/Acme',
+        subject: `Acme invoice ${m}`,
+      })),
+    );
+    for (const m of ids) {
+      userLabels.replaceForEmail(
+        acc.id,
+        m,
+        [{ source: 'thunderbird_tag', key: '$clients', label: 'Clients' }],
+        1,
+      );
+    }
+
+    let embedN = 0;
+    const chat = vi.fn(
+      async (o: { provider: string; messages: Array<{ role: string; content: string }> }) => {
+        void o;
+        return JSON.stringify({
+          topics: [
+            { label: 'Receipts & Invoices', description: 'Payment invoices.' },
+            { label: 'Banking Transactions', description: 'Bank statements and transfers.' },
+            { label: 'Security Alerts', description: 'Login and password alerts.' },
+            { label: 'Travel Bookings', description: 'Flights and hotels.' },
+            { label: 'Job Opportunities', description: 'Job listings and offers.' },
+          ],
+        });
+      },
+    );
+    const llm = { chat, embed: vi.fn(async () => Array.from(axis(embedN++))) };
+    const emailsFake = {
+      listSummaries: () => Array.from({ length: 200 }, (_, i) => summary(`m${i}`, `s${i % 5}@x.com`)),
+      listSummariesRandom: () => [],
+      listUncategorizedSummaries: () => [],
+      listSummariesByDomain: () => [],
+      listSenders: () => Array.from({ length: 250 }, (_, i) => ({ fromAddr: `s${i % 5}@x.com` })),
+    };
+    const embeddings = { listForAccount: () => [], search: () => [] };
+    const categories = {
+      listForAccount: () => [],
+      reconcileAutoCategories: () => ({ live: 5, omitted: [] }),
+    };
+    const audit = { log: vi.fn() };
+    const cfg = () => ({
+      allowCloudDiscovery: opts.allowCloud ?? false,
+      chatBaseUrl: opts.allowCloud ? 'https://api.openai.com/v1' : undefined,
+      chatModel: 'gpt-4o-mini',
+    });
+    const svc = new TopicDiscoveryService(
+      llm as never,
+      emailsFake as never,
+      embeddings as never,
+      categories as never,
+      silentLogger,
+      undefined,
+      audit as never,
+      cfg as never,
+      opts.withRepo === false ? undefined : (userLabels as never),
+    );
+    const userPrompt = () =>
+      (chat.mock.calls[0]?.[0].messages.find((m) => m.role === 'user')?.content ?? '') as string;
+    const okAudit = () =>
+      audit.log.mock.calls.map((c) => c[0]).find((a: { status: string }) => a.status === 'ok');
+    return { svc, acc, chat, userPrompt, okAudit };
+  }
+
+  it('includes user-label hints locally and records it in the audit', async () => {
+    const h = harness();
+    const res = await h.svc.discover(h.acc.id, 'bge-m3', 'gen');
+    expect(res.status).toBe('ok');
+    expect(h.chat.mock.calls[0]![0].provider).toBe('main');
+    expect(h.userPrompt()).toContain('Clients');
+    expect(h.userPrompt()).toContain('weak hints');
+    expect(h.okAudit().provider).toBe('local');
+    expect(h.okAudit().fieldsRead).toContain('user_label_hints');
+  });
+
+  it('sends hints to the cloud only under explicit cloud-discovery opt-in, and audits it', async () => {
+    const h = harness({ allowCloud: true });
+    const res = await h.svc.discover(h.acc.id, 'bge-m3', 'gen');
+    expect(res.status).toBe('ok');
+    expect(h.chat.mock.calls[0]![0].provider).toBe('chat');
+    expect(h.userPrompt()).toContain('Clients');
+    expect(h.okAudit().provider).toBe('cloud');
+    expect(h.okAudit().fieldsRead).toContain('user_label_hints');
+  });
+
+  it('omits the hint and the audit marker when no user-label repo is wired (old behavior)', async () => {
+    const h = harness({ withRepo: false });
+    await h.svc.discover(h.acc.id, 'bge-m3', 'gen');
+    expect(h.userPrompt()).not.toContain('weak hints');
+    expect(h.okAudit().fieldsRead).not.toContain('user_label_hints');
   });
 });
