@@ -25,6 +25,7 @@ export class ResidualDiscoveryService {
   constructor(
     private embeddings: EmbeddingRepository,
     private categories: CategoryRepository,
+    private multiPrototypeEnabled: () => boolean = () => false,
   ) {}
 
   /**
@@ -34,11 +35,20 @@ export class ResidualDiscoveryService {
    */
   selectResidual(accountId: string, embeddingModelId: string): ClusterPoint[] {
     const userAssigned = this.categories.getUserAssignedMessageIds(accountId);
-    const centroids = new Map(
-      this.categories
-        .getCentroidEntries(accountId, embeddingModelId)
-        .map((c) => [c.categoryId, c.vector] as const),
-    );
+    // Effective prototypes per category: sub-prototypes when the flag is on and present, else the
+    // aggregate. Coverage of an email is the MAX cosine over its assigned category's prototypes, so mail
+    // that a secondary sub-pattern covers is no longer wrongly declared residual. Flag off -> one
+    // aggregate vector per category -> identical to the pre-Phase-4 behavior.
+    const prototypesByCat = new Map<string, Float32Array[]>();
+    for (const p of this.categories.getEffectivePrototypeEntries(
+      accountId,
+      embeddingModelId,
+      this.multiPrototypeEnabled(),
+    )) {
+      const arr = prototypesByCat.get(p.categoryId);
+      if (arr) arr.push(p.vector);
+      else prototypesByCat.set(p.categoryId, [p.vector]);
+    }
     const autoByMsg = new Map<string, string[]>();
     for (const a of this.categories.listAutoAssignments(accountId)) {
       const arr = autoByMsg.get(a.messageId);
@@ -56,8 +66,8 @@ export class ResidualDiscoveryService {
       }
       let best = -Infinity;
       for (const catId of autoCats) {
-        const centroid = centroids.get(catId);
-        if (centroid) best = Math.max(best, cosineSimilarity(e.vector, centroid));
+        const protos = prototypesByCat.get(catId);
+        if (protos) for (const v of protos) best = Math.max(best, cosineSimilarity(e.vector, v));
       }
       if (best < RESIDUAL_COSINE_FLOOR) {
         residual.push({ messageId: e.messageId, vector: e.vector }); // low-confidence auto assignment

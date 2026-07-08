@@ -698,4 +698,55 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 23,
+    name: 'category_prototype_index',
+    up: (db) => {
+      // Phase 4: allow multiple prototypes per (category, model). Add prototype_index and widen the
+      // uniqueness to (category_id, model_id, prototype_index). prototype_index = 0 is the aggregate
+      // full-category centroid (identical meaning to the old single centroid); sub-prototypes are 1..K.
+      const table = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'category_embedding_index'",
+        )
+        .get();
+      if (!table) return;
+      const cols = db.prepare('PRAGMA table_info(category_embedding_index)').all() as Array<{
+        name: string;
+      }>;
+      if (cols.some((c) => c.name === 'prototype_index')) return;
+
+      // Rebuild the small index table only. The vec0 table category_embeddings is NEVER touched, and
+      // the rowid is copied EXPLICITLY, so every index row keeps pointing at its original vector.
+      // Existing rows become prototype_index = 0 (the aggregate). The delete trigger is dropped with
+      // the old table and recreated identically against the rebuilt one.
+      db.exec(`
+        DROP TRIGGER IF EXISTS trg_category_embedding_index_delete;
+
+        CREATE TABLE category_embedding_index_new (
+          rowid INTEGER PRIMARY KEY,
+          category_id TEXT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+          model_id TEXT NOT NULL,
+          prototype_index INTEGER NOT NULL DEFAULT 0,
+          email_count INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL,
+          UNIQUE (category_id, model_id, prototype_index)
+        );
+
+        INSERT INTO category_embedding_index_new
+          (rowid, category_id, model_id, prototype_index, email_count, updated_at)
+          SELECT rowid, category_id, model_id, 0, email_count, updated_at
+            FROM category_embedding_index;
+
+        DROP TABLE category_embedding_index;
+        ALTER TABLE category_embedding_index_new RENAME TO category_embedding_index;
+
+        CREATE TRIGGER trg_category_embedding_index_delete
+        AFTER DELETE ON category_embedding_index
+        BEGIN
+          DELETE FROM category_embeddings WHERE rowid = OLD.rowid;
+        END;
+      `);
+    },
+  },
 ];

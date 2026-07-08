@@ -31,6 +31,16 @@ export const LlmConfigSchema = z.object({
   allowCloudDiscovery: z.boolean().default(false),
 });
 
+/**
+ * Zod schema for opt-in application feature flags. Behavioral toggles that are NOT LLM-provider
+ * settings live here so LlmConfig stays provider-only. Every flag defaults false so a config file
+ * without a `features` block, or without a given flag, behaves exactly as before.
+ */
+export const FeaturesConfigSchema = z.object({
+  /** Phase 4: allow a category to carry multiple prototype centroids (nearest-prototype matching). */
+  multiPrototypeCategories: z.boolean().default(false),
+});
+
 /** Zod schema for the full application configuration. */
 export const AppConfigSchema = z.object({
   version: z.number().int().default(1),
@@ -38,6 +48,7 @@ export const AppConfigSchema = z.object({
   autoIndex: z.boolean().default(false),
   indexedFolders: z.array(z.string()).default([]),
   llm: LlmConfigSchema.default(() => LlmConfigSchema.parse({})),
+  features: FeaturesConfigSchema.default(() => FeaturesConfigSchema.parse({})),
   imap: ImapConfigSchema.optional(),
   authToken: z.string().optional(),
 });
@@ -46,6 +57,8 @@ export const AppConfigSchema = z.object({
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 /** LLM configuration object inferred from LlmConfigSchema. */
 export type LlmConfig = z.infer<typeof LlmConfigSchema>;
+/** Feature-flag configuration object inferred from FeaturesConfigSchema. */
+export type FeaturesConfig = z.infer<typeof FeaturesConfigSchema>;
 /** IMAP configuration object inferred from ImapConfigSchema. */
 export type ImapConfig = z.infer<typeof ImapConfigSchema>;
 

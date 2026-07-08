@@ -5,7 +5,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { LlmConfigSchema } from '../config/schema.js';
+import { LlmConfigSchema, FeaturesConfigSchema } from '../config/schema.js';
 import { saveConfig, redactConfig } from '../config/config.js';
 import { canonicalizeModelId } from '../util/model-id.js';
 import { EMBEDDING_DIM } from '../db/schema.js';
@@ -15,6 +15,7 @@ const UpdateConfigBody = z.object({
   autoIndex: z.boolean().optional(),
   indexedFolders: z.array(z.string()).optional(),
   llm: LlmConfigSchema.partial().optional(),
+  features: FeaturesConfigSchema.partial().optional(),
 });
 
 /**
@@ -79,6 +80,19 @@ export async function registerConfigRoutes(app: FastifyInstance, ctx: AppContext
         llmPatch.chatModel = canonicalizeModelId(llmPatch.chatModel);
       }
       Object.assign(ctx.config.llm, llmPatch);
+    }
+
+    // Merge only the feature keys the caller actually sent, so an absent flag keeps its current value.
+    const rawFeatures = (req.body as { features?: Record<string, unknown> } | null | undefined)
+      ?.features;
+    if (parsed.data.features && rawFeatures && typeof rawFeatures === 'object') {
+      for (const key of Object.keys(rawFeatures)) {
+        if (Object.prototype.hasOwnProperty.call(parsed.data.features, key)) {
+          (ctx.config.features as Record<string, unknown>)[key] = (
+            parsed.data.features as Record<string, unknown>
+          )[key];
+        }
+      }
     }
 
     saveConfig(ctx.config);

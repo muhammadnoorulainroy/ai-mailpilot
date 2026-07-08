@@ -93,6 +93,9 @@ export interface ServerConfig {
     priorityUseChatProvider?: boolean;
     allowCloudDiscovery?: boolean;
   };
+  features?: {
+    multiPrototypeCategories?: boolean;
+  };
 }
 
 /** Partial update payload for the server configuration. */
@@ -101,6 +104,7 @@ export interface UpdateConfigRequest {
   autoIndex?: boolean;
   indexedFolders?: string[];
   llm?: Partial<ServerConfig['llm']>;
+  features?: Partial<NonNullable<ServerConfig['features']>>;
 }
 
 /** HTTP client for the Core API, handling auth token storage, pairing, and all endpoints. */

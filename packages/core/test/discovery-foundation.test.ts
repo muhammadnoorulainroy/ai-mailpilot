@@ -20,11 +20,15 @@ import { CategoryImprovementService } from '../src/services/category-improvement
 import { discoveryProvider, assertDiscoveryLocal } from '../src/services/discovery-guard.js';
 import { SEED_TAXONOMY, getSeedSuggestions } from '../src/services/seed-taxonomy.js';
 import { seededShuffle } from '../src/util/rand.js';
+import { vectorToBuffer, bufferToVector } from '../src/util/vector.js';
 import { LlmConfigSchema, type LlmConfig } from '../src/config/schema.js';
 import type { LlmClient } from '../src/llm/client.js';
 
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} } as never;
-const config = (over: Partial<LlmConfig> = {}): LlmConfig => ({ ...LlmConfigSchema.parse({}), ...over });
+const config = (over: Partial<LlmConfig> = {}): LlmConfig => ({
+  ...LlmConfigSchema.parse({}),
+  ...over,
+});
 
 /** A stub LLM client whose chat/embed are spies; discovery guard tests never let these run. */
 function fakeLlm(): LlmClient {
@@ -48,9 +52,15 @@ describe('v18 backfill and canonical_key', () => {
   it('backfills existing categories to active with a unique canonical_key and first_seen_at', () => {
     const db = new BetterSqlite3(':memory:');
     sqliteVec.load(db);
-    runMigrations(db, migrations.filter((m) => m.version <= 17));
+    runMigrations(
+      db,
+      migrations.filter((m) => m.version <= 17),
+    );
     db.prepare('INSERT INTO accounts (id, address, kind, created_at) VALUES (?, ?, ?, ?)').run(
-      'acc', 'a@b.com', 'work', 1000,
+      'acc',
+      'a@b.com',
+      'work',
+      1000,
     );
     db.prepare(
       'INSERT INTO categories (id, account_id, label, description, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -58,7 +68,9 @@ describe('v18 backfill and canonical_key', () => {
 
     runMigrations(db, migrations); // applies only v18
 
-    const row = db.prepare('SELECT status, canonical_key, first_seen_at FROM categories WHERE id = ?').get('c1') as {
+    const row = db
+      .prepare('SELECT status, canonical_key, first_seen_at FROM categories WHERE id = ?')
+      .get('c1') as {
       status: string;
       canonical_key: string;
       first_seen_at: number;
@@ -72,15 +84,27 @@ describe('v18 backfill and canonical_key', () => {
   it('gives colliding labels distinct deterministic keys', () => {
     const db = new BetterSqlite3(':memory:');
     sqliteVec.load(db);
-    runMigrations(db, migrations.filter((m) => m.version <= 17));
-    db.prepare('INSERT INTO accounts (id, address, kind, created_at) VALUES (?, ?, ?, ?)').run('acc', 'a@b.com', 'work', 1000);
+    runMigrations(
+      db,
+      migrations.filter((m) => m.version <= 17),
+    );
+    db.prepare('INSERT INTO accounts (id, address, kind, created_at) VALUES (?, ?, ?, ?)').run(
+      'acc',
+      'a@b.com',
+      'work',
+      1000,
+    );
     const ins = db.prepare(
       'INSERT INTO categories (id, account_id, label, description, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
     );
     ins.run('c1', 'acc', 'Bills', null, 'auto', 1000, 1000);
     ins.run('c2', 'acc', 'bills', null, 'auto', 1001, 1001);
     runMigrations(db, migrations);
-    const keys = (db.prepare('SELECT canonical_key FROM categories ORDER BY created_at').all() as Array<{ canonical_key: string }>).map((r) => r.canonical_key);
+    const keys = (
+      db.prepare('SELECT canonical_key FROM categories ORDER BY created_at').all() as Array<{
+        canonical_key: string;
+      }>
+    ).map((r) => r.canonical_key);
     expect(keys).toEqual(['bills', 'bills_2']);
     db.close();
   });
@@ -89,9 +113,11 @@ describe('v18 backfill and canonical_key', () => {
     const db = openDatabase(':memory:');
     const acc = new AccountRepository(db).create({ address: 'a@b.com', kind: 'work' });
     expect(() =>
-      db.prepare(
-        "INSERT INTO categories (id, account_id, label, source, status, created_at, updated_at) VALUES ('x', ?, 'NoKey', 'auto', 'active', 1, 1)",
-      ).run(acc.id),
+      db
+        .prepare(
+          "INSERT INTO categories (id, account_id, label, source, status, created_at, updated_at) VALUES ('x', ?, 'NoKey', 'auto', 'active', 1, 1)",
+        )
+        .run(acc.id),
     ).toThrow(/canonical_key/);
     db.close();
   });
@@ -167,7 +193,12 @@ describe('v21 category proposal suggested_key backfill', () => {
       'merge:source-cat:target-cat',
     );
 
-    expect(runMigrations(db, migrations.filter((m) => m.version <= 21))).toEqual([21]);
+    expect(
+      runMigrations(
+        db,
+        migrations.filter((m) => m.version <= 21),
+      ),
+    ).toEqual([21]);
 
     const cols = db.prepare('PRAGMA table_info(category_proposals)').all() as Array<{
       name: string;
@@ -215,15 +246,212 @@ describe('v22 personal discovery opt-in default', () => {
       migrationInsert.run(m.version, m.name, 1000 + m.version);
     }
 
-    expect(runMigrations(db, migrations)).toEqual([22]);
+    expect(
+      runMigrations(
+        db,
+        migrations.filter((m) => m.version <= 22),
+      ),
+    ).toEqual([22]);
 
-    const rows = db.prepare('SELECT id, exclude_from_discovery FROM accounts ORDER BY id').all() as
-      Array<{ id: string; exclude_from_discovery: number }>;
+    const rows = db
+      .prepare('SELECT id, exclude_from_discovery FROM accounts ORDER BY id')
+      .all() as Array<{ id: string; exclude_from_discovery: number }>;
     expect(rows).toEqual([
       { id: 'already-off', exclude_from_discovery: 1 },
       { id: 'personal', exclude_from_discovery: 1 },
       { id: 'work', exclude_from_discovery: 0 },
     ]);
+    db.close();
+  });
+});
+
+describe('v23 category prototype index', () => {
+  const MODEL = 'bge-m3';
+  /** A distinctive centroid vector so byte preservation across the rebuild is checkable. */
+  function centroidVec(seed: number): Float32Array {
+    const v = new Float32Array(EMBEDDING_DIM);
+    for (let i = 0; i < 8; i++) v[i] = Math.sin(seed + i) * 0.5;
+    return v;
+  }
+
+  /** Build a v22-state DB (old category_embedding_index shape + vec0) with migrations 1..22 recorded. */
+  function buildV22Db(): Database {
+    const db = new BetterSqlite3(':memory:');
+    db.pragma('foreign_keys = ON');
+    sqliteVec.load(db);
+    db.exec(`
+      CREATE TABLE migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      CREATE TABLE categories (id TEXT PRIMARY KEY, label TEXT NOT NULL);
+      CREATE VIRTUAL TABLE category_embeddings USING vec0(embedding FLOAT[${EMBEDDING_DIM}]);
+      CREATE TABLE category_embedding_index (
+        rowid INTEGER PRIMARY KEY,
+        category_id TEXT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+        model_id TEXT NOT NULL,
+        email_count INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        UNIQUE (category_id, model_id)
+      );
+      CREATE TRIGGER trg_category_embedding_index_delete
+      AFTER DELETE ON category_embedding_index
+      BEGIN
+        DELETE FROM category_embeddings WHERE rowid = OLD.rowid;
+      END;
+    `);
+    const migrationInsert = db.prepare(
+      'INSERT INTO migrations (version, name, applied_at) VALUES (?, ?, ?)',
+    );
+    for (const m of migrations.filter((migration) => migration.version <= 22)) {
+      migrationInsert.run(m.version, m.name, 1000 + m.version);
+    }
+    return db;
+  }
+
+  /** Insert a vec0 embedding (vec0 auto-assigns the rowid) and return that rowid. */
+  function insertVec(db: Database, vec: Float32Array): number {
+    const info = db
+      .prepare('INSERT INTO category_embeddings (embedding) VALUES (?)')
+      .run(vectorToBuffer(vec));
+    return Number(info.lastInsertRowid);
+  }
+
+  /** Seed one category and its single (pre-Phase-4) centroid; returns the shared rowid. */
+  function seed(db: Database, categoryId: string, vec: Float32Array): number {
+    db.prepare('INSERT OR IGNORE INTO categories (id, label) VALUES (?, ?)').run(
+      categoryId,
+      categoryId,
+    );
+    const rowid = insertVec(db, vec);
+    db.prepare(
+      'INSERT INTO category_embedding_index (rowid, category_id, model_id, email_count, updated_at) VALUES (?, ?, ?, ?, ?)',
+    ).run(rowid, categoryId, MODEL, 5, 1000);
+    return rowid;
+  }
+
+  /** Add a sub-prototype (index >= 1) to an already-migrated DB; returns its rowid. */
+  function addSubPrototype(
+    db: Database,
+    categoryId: string,
+    prototypeIndex: number,
+    vec: Float32Array,
+  ): number {
+    const rowid = insertVec(db, vec);
+    db.prepare(
+      'INSERT INTO category_embedding_index (rowid, category_id, model_id, prototype_index, email_count, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(rowid, categoryId, MODEL, prototypeIndex, 3, 1);
+    return rowid;
+  }
+
+  function readVec(db: Database, categoryId: string, prototypeIndex: number): Float32Array | null {
+    const row = db
+      .prepare(
+        `SELECT ce.embedding AS embedding FROM category_embeddings ce
+           JOIN category_embedding_index cei ON cei.rowid = ce.rowid
+          WHERE cei.category_id = ? AND cei.prototype_index = ?`,
+      )
+      .get(categoryId, prototypeIndex) as { embedding: Buffer } | undefined;
+    return row ? bufferToVector(row.embedding) : null;
+  }
+
+  it('preserves legacy single centroids as prototype_index=0 with rowid and vector bytes intact', () => {
+    const db = buildV22Db();
+    const vecA = centroidVec(1);
+    const vecB = centroidVec(2);
+    const rowidA = seed(db, 'cat-a', vecA);
+    const rowidB = seed(db, 'cat-b', vecB);
+
+    expect(runMigrations(db, migrations)).toEqual([23]);
+
+    // Column added; existing rows are prototype_index=0 with their original rowid preserved.
+    const cols = db.prepare('PRAGMA table_info(category_embedding_index)').all() as Array<{
+      name: string;
+    }>;
+    expect(cols.some((c) => c.name === 'prototype_index')).toBe(true);
+    const rows = db
+      .prepare(
+        'SELECT rowid, category_id, prototype_index FROM category_embedding_index ORDER BY category_id',
+      )
+      .all() as Array<{ rowid: number; category_id: string; prototype_index: number }>;
+    expect(rows).toEqual([
+      { rowid: rowidA, category_id: 'cat-a', prototype_index: 0 },
+      { rowid: rowidB, category_id: 'cat-b', prototype_index: 0 },
+    ]);
+
+    // The vec rows still resolve through the preserved rowid, byte-for-byte.
+    expect(Array.from(readVec(db, 'cat-a', 0)!)).toEqual(Array.from(vecA));
+    expect(Array.from(readVec(db, 'cat-b', 0)!)).toEqual(Array.from(vecB));
+    db.close();
+  });
+
+  it('enforces UNIQUE(category_id, model_id, prototype_index): rejects a duplicate aggregate, accepts a sub-prototype', () => {
+    const db = buildV22Db();
+    seed(db, 'cat-a', centroidVec(1));
+    expect(runMigrations(db, migrations)).toEqual([23]);
+
+    // A second prototype_index=0 for the same (category, model) is rejected.
+    const dupRowid = insertVec(db, centroidVec(9));
+    expect(() =>
+      db
+        .prepare(
+          'INSERT INTO category_embedding_index (rowid, category_id, model_id, prototype_index, email_count, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+        )
+        .run(dupRowid, 'cat-a', MODEL, 0, 1, 1),
+    ).toThrow();
+
+    // A sub-prototype (index 1) for the same (category, model) is accepted.
+    expect(() => addSubPrototype(db, 'cat-a', 1, centroidVec(3))).not.toThrow();
+    db.close();
+  });
+
+  it('delete trigger removes the vec row for a deleted prototype but leaves siblings intact', () => {
+    const db = buildV22Db();
+    seed(db, 'cat-a', centroidVec(1));
+    expect(runMigrations(db, migrations)).toEqual([23]);
+    const subRowid = addSubPrototype(db, 'cat-a', 1, centroidVec(3));
+
+    // Delete only the sub-prototype's index row.
+    db.prepare(
+      'DELETE FROM category_embedding_index WHERE category_id = ? AND prototype_index = 1',
+    ).run('cat-a');
+
+    // Its vec row is gone (trigger); the aggregate (index 0) vec row survives.
+    expect(
+      (
+        db
+          .prepare('SELECT COUNT(*) AS n FROM category_embeddings WHERE rowid = ?')
+          .get(subRowid) as { n: number }
+      ).n,
+    ).toBe(0);
+    expect(readVec(db, 'cat-a', 0)).not.toBeNull();
+    db.close();
+  });
+
+  it('deleting a category cascades all its prototypes and their vec rows', () => {
+    const db = buildV22Db();
+    seed(db, 'cat-a', centroidVec(1));
+    expect(runMigrations(db, migrations)).toEqual([23]);
+    addSubPrototype(db, 'cat-a', 1, centroidVec(3));
+
+    db.prepare('DELETE FROM categories WHERE id = ?').run('cat-a');
+
+    // FK cascade removed both index rows; the trigger removed both vec rows.
+    expect(
+      (db.prepare('SELECT COUNT(*) AS n FROM category_embedding_index').get() as { n: number }).n,
+    ).toBe(0);
+    expect(
+      (db.prepare('SELECT COUNT(*) AS n FROM category_embeddings').get() as { n: number }).n,
+    ).toBe(0);
+    db.close();
+  });
+
+  it('is forward-only: a second run applies nothing', () => {
+    const db = buildV22Db();
+    seed(db, 'cat-a', centroidVec(1));
+    expect(runMigrations(db, migrations)).toEqual([23]);
+    expect(runMigrations(db, migrations)).toEqual([]);
     db.close();
   });
 });
@@ -288,8 +516,12 @@ describe('local-only discovery guard', () => {
   });
 
   it('assertDiscoveryLocal throws for a cloud provider when not opted in', () => {
-    expect(() => assertDiscoveryLocal(config({ allowCloudDiscovery: false }), 'chat')).toThrow(/local-only/);
-    expect(() => assertDiscoveryLocal(config({ allowCloudDiscovery: false }), 'main')).not.toThrow();
+    expect(() => assertDiscoveryLocal(config({ allowCloudDiscovery: false }), 'chat')).toThrow(
+      /local-only/,
+    );
+    expect(() =>
+      assertDiscoveryLocal(config({ allowCloudDiscovery: false }), 'main'),
+    ).not.toThrow();
   });
 
   it('topic discovery skips a personal account, writes a skipped audit row, and does not call the model', async () => {
@@ -299,8 +531,14 @@ describe('local-only discovery guard', () => {
     const llm = fakeLlm();
     const acc = accounts.create({ address: 'p@x.com', kind: 'personal' });
     const svc = new TopicDiscoveryService(
-      llm, new EmailRepository(db), new EmbeddingRepository(db), new CategoryRepository(db),
-      silentLogger, accounts, audit, () => config(),
+      llm,
+      new EmailRepository(db),
+      new EmbeddingRepository(db),
+      new CategoryRepository(db),
+      silentLogger,
+      accounts,
+      audit,
+      () => config(),
     );
     const res = await svc.discover(acc.id, 'bge-m3', 'qwen');
     expect(res.topicsCreated).toBe(0);
@@ -341,8 +579,15 @@ describe('local-only discovery guard', () => {
     const llm = fakeLlm();
     const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
     const svc = new CategoryImprovementService(
-      db, llm, new EmailRepository(db), new EmbeddingRepository(db), new CategoryRepository(db),
-      silentLogger, accounts, audit, () => config({ allowCloudDiscovery: false }),
+      db,
+      llm,
+      new EmailRepository(db),
+      new EmbeddingRepository(db),
+      new CategoryRepository(db),
+      silentLogger,
+      accounts,
+      audit,
+      () => config({ allowCloudDiscovery: false }),
     );
     await expect(svc.suggest(acc.id, 'bge-m3', 'gpt-4o', 'chat')).rejects.toThrow(/local-only/);
     expect(llm.chat).not.toHaveBeenCalled();
@@ -467,7 +712,9 @@ describe('improve categories respects category status', () => {
       merges: [],
     });
     const count = (
-      db.prepare('SELECT COUNT(*) AS c FROM email_categories WHERE category_id = ?').get(cat.id) as {
+      db
+        .prepare('SELECT COUNT(*) AS c FROM email_categories WHERE category_id = ?')
+        .get(cat.id) as {
         c: number;
       }
     ).c;

@@ -61,6 +61,120 @@ afterEach(() => {
   db.close();
 });
 
+describe('CategoryRepository multi-prototype centroids (Phase 4)', () => {
+  const MODEL = 'bge-m3';
+  let accountId: string;
+  let catA: string;
+
+  beforeEach(() => {
+    accountId = accounts.create({ address: 'w@x.com', kind: 'work' }).id;
+    catA = categories.create({
+      accountId,
+      label: 'Cat A',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'cat_a',
+    }).id;
+  });
+
+  it('saveCentroid twice updates the single aggregate row (prototype_index=0), no duplicate', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5);
+    categories.saveCentroid(catA, MODEL, vec(0.2), 8);
+    const protos = categories.getPrototypes(catA, MODEL);
+    expect(protos).toHaveLength(1);
+    expect(protos[0]!.prototypeIndex).toBe(0);
+    expect(protos[0]!.emailCount).toBe(8);
+    expect(categories.getCentroid(catA, MODEL)!.emailCount).toBe(8);
+  });
+
+  it('getCentroid and getCentroidEntries return only the aggregate even when sub-prototypes exist', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5); // aggregate 0
+    categories.saveCentroid(catA, MODEL, vec(0.9), 3, 1); // sub-prototype 1
+
+    expect(categories.getCentroid(catA, MODEL)!.emailCount).toBe(5);
+    const entriesForA = categories
+      .getCentroidEntries(accountId, MODEL)
+      .filter((e) => e.categoryId === catA);
+    expect(entriesForA).toHaveLength(1);
+    expect(entriesForA[0]!.emailCount).toBe(5);
+    // Both prototypes are visible through getPrototypes (write side).
+    expect(categories.getPrototypes(catA, MODEL).map((p) => p.prototypeIndex)).toEqual([0, 1]);
+  });
+
+  it('getEffectivePrototypeEntries(false) returns the aggregate only', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5);
+    categories.saveCentroid(catA, MODEL, vec(0.9), 3, 1);
+    const forA = categories
+      .getEffectivePrototypeEntries(accountId, MODEL, false)
+      .filter((e) => e.categoryId === catA);
+    expect(forA).toHaveLength(1);
+    expect(forA[0]!.prototypeIndex).toBe(0);
+  });
+
+  it('getEffectivePrototypeEntries(true) returns sub-prototypes if present, otherwise the aggregate', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5); // aggregate
+    categories.saveCentroid(catA, MODEL, vec(0.9), 3, 1); // sub 1
+    categories.saveCentroid(catA, MODEL, vec(0.5), 2, 2); // sub 2
+    const catB = categories.create({
+      accountId,
+      label: 'Cat B',
+      source: 'auto',
+      status: 'active',
+      canonicalKey: 'cat_b',
+    }).id;
+    categories.saveCentroid(catB, MODEL, vec(0.3), 4); // aggregate only
+
+    const eff = categories.getEffectivePrototypeEntries(accountId, MODEL, true);
+    expect(
+      eff
+        .filter((e) => e.categoryId === catA)
+        .map((e) => e.prototypeIndex)
+        .sort(),
+    ).toEqual([1, 2]);
+    expect(eff.filter((e) => e.categoryId === catB).map((e) => e.prototypeIndex)).toEqual([0]);
+  });
+
+  it('deleteCentroid removes all prototypes and their vec rows', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5);
+    categories.saveCentroid(catA, MODEL, vec(0.9), 3, 1);
+    categories.deleteCentroid(catA, MODEL);
+    expect(categories.getPrototypes(catA, MODEL)).toHaveLength(0);
+    expect(
+      (db.prepare('SELECT COUNT(*) AS n FROM category_embeddings').get() as { n: number }).n,
+    ).toBe(0);
+  });
+
+  it('savePrototypeSet writes aggregate 0 and replaces sub-prototypes 1..K', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5);
+    categories.saveCentroid(catA, MODEL, vec(0.9), 3, 1);
+    categories.saveCentroid(catA, MODEL, vec(0.8), 2, 2);
+    categories.savePrototypeSet(catA, MODEL, vec(0.2), 10, [{ vector: vec(0.7), emailCount: 6 }]);
+    const protos = categories.getPrototypes(catA, MODEL);
+    expect(protos.map((p) => p.prototypeIndex)).toEqual([0, 1]); // old sub 2 removed
+    expect(protos[0]!.emailCount).toBe(10);
+    expect(protos[1]!.emailCount).toBe(6);
+  });
+
+  it('savePrototypeSet rolls back atomically when a sub-prototype is invalid', () => {
+    categories.saveCentroid(catA, MODEL, vec(0.1), 5); // aggregate
+    categories.saveCentroid(catA, MODEL, vec(0.9), 3, 1); // sub 1
+    expect(() =>
+      categories.savePrototypeSet(catA, MODEL, vec(0.2), 10, [
+        { vector: new Float32Array(3), emailCount: 6 },
+      ]),
+    ).toThrow();
+    // Nothing changed: original aggregate (5) and original sub 1 (3) intact, no partial write.
+    const protos = categories.getPrototypes(catA, MODEL);
+    expect(protos.map((p) => p.prototypeIndex)).toEqual([0, 1]);
+    expect(protos[0]!.emailCount).toBe(5);
+    expect(protos[1]!.emailCount).toBe(3);
+  });
+
+  it('saveCentroid still enforces the embedding dimension', () => {
+    expect(() => categories.saveCentroid(catA, MODEL, new Float32Array(3), 1)).toThrow();
+  });
+});
+
 describe('AccountRepository discovery eligibility', () => {
   it('defaults personal accounts off and work accounts on for discovery', () => {
     const personal = accounts.create({ address: 'personal@x.y', kind: 'personal' });

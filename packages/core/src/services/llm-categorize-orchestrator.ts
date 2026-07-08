@@ -150,6 +150,7 @@ export class LlmCategorizeOrchestrator {
     private categories: CategoryRepository,
     private jobs: CategorizeJobRepository,
     private logger: Logger,
+    private multiPrototypeEnabled: () => boolean = () => false,
   ) {
     this.jobs.markRunningInterrupted(Date.now());
     const last = this.jobs.getMostRecent();
@@ -299,11 +300,20 @@ export class LlmCategorizeOrchestrator {
         vectorByMessageId.set(e.messageId, e.vector);
       }
 
-      const centroids = this.categories.getCentroidEntries(accountId, embeddingModelId);
-      const centroidIds = new Set(centroids.map((c) => c.categoryId));
+      // Shortlist ranking uses effective prototypes (nearest-prototype) when multi-prototype is on, so
+      // an email near a category's sub-pattern still shortlists that category. The centroidById map used
+      // for label collapsing is a category-to-category comparison, so it stays on the AGGREGATE centroid
+      // (one vector per category), consistent with keeping merge/collapse on the aggregate.
+      const aggregate = this.categories.getCentroidEntries(accountId, embeddingModelId);
+      const centroids = this.categories.getEffectivePrototypeEntries(
+        accountId,
+        embeddingModelId,
+        this.multiPrototypeEnabled(),
+      );
+      const centroidIds = new Set(aggregate.map((c) => c.categoryId));
       const ctx: CategorizeContext = {
         centroids,
-        centroidById: new Map(centroids.map((c) => [c.categoryId, c.vector])),
+        centroidById: new Map(aggregate.map((c) => [c.categoryId, c.vector])),
         candidateById: new Map(candidates.map((c) => [c.id, c])),
         noCentroid: candidates.filter((c) => !centroidIds.has(c.id)),
         totalCategories: candidates.length,

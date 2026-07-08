@@ -131,7 +131,9 @@ export interface NamedCandidate {
 export interface ActiveCategoryRef {
   label: string;
   description: string | null;
-  centroid: Float32Array | null;
+  /** The category's effective prototype vectors (aggregate, or sub-prototypes when enabled). A
+   * candidate that overlaps ANY of them is treated as overlapping the category. Empty when none. */
+  prototypes: Float32Array[];
   createdBy: 'auto' | 'user' | 'imported';
 }
 
@@ -254,11 +256,12 @@ export function validateCandidate(candidate: NamedCandidate, ctx: CandidateConte
   const activeLabels = ctx.activeCategories.map((c) => c.label);
   if (isNearDuplicateLabel(label, activeLabels)) return reject('overlaps_active_label');
   const clusterCentroid = ctx.cluster.centroid;
-  const overlapsContent = ctx.activeCategories.some(
-    (c) =>
-      c.centroid != null &&
-      c.centroid.length === clusterCentroid.length &&
-      cosineSimilarity(clusterCentroid, c.centroid) >= OVERLAP_CENTROID_COSINE,
+  const overlapsContent = ctx.activeCategories.some((c) =>
+    c.prototypes.some(
+      (proto) =>
+        proto.length === clusterCentroid.length &&
+        cosineSimilarity(clusterCentroid, proto) >= OVERLAP_CENTROID_COSINE,
+    ),
   );
   if (overlapsContent) return reject('overlaps_active_content');
 

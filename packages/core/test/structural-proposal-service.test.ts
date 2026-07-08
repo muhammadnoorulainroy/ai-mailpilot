@@ -19,7 +19,10 @@ import { CategoryProposalRepository } from '../src/repositories/category-proposa
 import { EmbeddingRepository } from '../src/repositories/embedding-repository.js';
 import { EmailRepository } from '../src/repositories/email-repository.js';
 import { CategoryHealthService } from '../src/services/category-health-service.js';
-import { StructuralProposalService } from '../src/services/structural-proposal-service.js';
+import {
+  StructuralProposalService,
+  MERGE_MIN_OVERLAP,
+} from '../src/services/structural-proposal-service.js';
 
 const MODEL = 'bge-m3';
 const GEN_MODEL = 'qwen';
@@ -124,7 +127,7 @@ function tiltedFromAxis0(v0: number, v1: number): Float32Array {
 }
 
 /** Builds the harness. `chat` is the local model's naming response (or a throw), only used for splits. */
-function harness(chat: () => Promise<string> = async () => DEFAULT_NAMING) {
+function harness(chat: () => Promise<string> = async () => DEFAULT_NAMING, multiPrototype = false) {
   const db = openDatabase(':memory:');
   const accounts = new AccountRepository(db);
   const categories = new CategoryRepository(db);
@@ -157,9 +160,10 @@ function harness(chat: () => Promise<string> = async () => DEFAULT_NAMING) {
     llm,
     getConfig,
     silentLogger,
+    () => multiPrototype,
   );
   const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
-  return { db, categories, proposals, embeddings, emails, service, accountId: acc.id };
+  return { db, categories, proposals, embeddings, emails, health, service, accountId: acc.id };
 }
 
 type Harness = ReturnType<typeof harness>;
@@ -825,5 +829,81 @@ describe('StructuralProposalService split parent-purpose gate', () => {
     expect(splits).toHaveLength(1);
     const children = h.proposals.listChildren(splits[0]!.id);
     expect(children.map((c) => c.label).sort()).toEqual(['Card Statements', 'Flight Bookings']);
+  });
+});
+
+describe('StructuralProposalService multi-prototype conservatism (Phase 4)', () => {
+  it('does not merge two categories that only share a sub-prototype (merge stays on aggregate)', async () => {
+    // Flag ON. Two auto categories whose AGGREGATE centroids are orthogonal (overlap 0) but which each
+    // carry a sub-prototype on the same axis 5. Merge must ignore the sub-prototypes: a naive
+    // max-pairwise-over-prototypes overlap would report 1.0 and wrongly merge distinct purposes.
+    const h = harness(async () => DEFAULT_NAMING, true);
+    const alpha = makeCategory(h, 'Alpha', 'alpha', { centroid: axis(0), members: 3, memberDim: 0 });
+    const beta = makeCategory(h, 'Beta', 'beta', { centroid: axis(1), members: 3, memberDim: 1 });
+    h.categories.savePrototypeSet(alpha.id, MODEL, axis(0), 3, [{ vector: axis(5), emailCount: 3 }]);
+    h.categories.savePrototypeSet(beta.id, MODEL, axis(1), 3, [{ vector: axis(5), emailCount: 3 }]);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    expect(result.created.filter((c) => c.kind === 'merge')).toHaveLength(0);
+    // The aggregate overlap gate rejects the pair before it is even counted as a merge candidate.
+    expect(result.mergeCandidates).toBe(0);
+    // Health overlap is measured on the aggregate centroids only, so it stays far below the threshold.
+    const metrics = h.health.metricsForAccount(h.accountId, MODEL);
+    for (const m of metrics) {
+      expect(m.overlap ?? 0).toBeLessThan(MERGE_MIN_OVERLAP);
+    }
+  });
+
+  it('still merges a genuine same-purpose near-duplicate with the flag on and sub-prototypes present', async () => {
+    // Flag ON with divergent sub-prototypes on both sides. The aggregate centroids are identical, so the
+    // merge decision is unchanged from flag-off: sub-prototypes neither block nor are needed for it.
+    const h = harness(async () => DEFAULT_NAMING, true);
+    const invoices = makeCategory(h, 'Invoices', 'invoices', {
+      centroid: axis(0),
+      members: 3,
+      memberDim: 0,
+    });
+    const receipts = makeCategory(h, 'Receipts', 'receipts', {
+      centroid: axis(0),
+      members: 5,
+      memberDim: 0,
+    });
+    h.categories.savePrototypeSet(invoices.id, MODEL, axis(0), 3, [{ vector: axis(3), emailCount: 3 }]);
+    h.categories.savePrototypeSet(receipts.id, MODEL, axis(0), 5, [{ vector: axis(7), emailCount: 5 }]);
+
+    const result = await h.service.generate(h.accountId, MODEL, GEN_MODEL);
+
+    const merges = result.created.filter((c) => c.kind === 'merge');
+    expect(merges).toHaveLength(1);
+    // The larger category (Receipts) survives as the target; sub-prototypes did not alter the outcome.
+    expect(merges[0]!.categoryId).toBe(receipts.id);
+    expect(merges[0]!.sourceCategoryId).toBe(invoices.id);
+  });
+
+  it('rejects a split child that overlaps a sub-prototype of another active category (flag on only)', async () => {
+    // Big Bucket splits cleanly into an invoices child (axis 0) and a travel child (axis 5). A separate
+    // active category "Newsletters" has an aggregate on axis 9 but a sub-prototype on axis 5. With the
+    // flag ON, the travel child overlaps that sub-prototype and is dropped, leaving a single survivor and
+    // no split. With the flag OFF, only the axis-9 aggregate is visible, so both children survive.
+    function build(multiPrototype: boolean): Harness {
+      const h = harness(async () => DEFAULT_NAMING, multiPrototype);
+      makeSplittable(h);
+      const news = makeCategory(h, 'Newsletters', 'news', {
+        centroid: axis(9),
+        members: 4,
+        memberDim: 9,
+      });
+      h.categories.savePrototypeSet(news.id, MODEL, axis(9), 4, [{ vector: axis(5), emailCount: 4 }]);
+      return h;
+    }
+
+    const offH = build(false);
+    const offResult = await offH.service.generate(offH.accountId, MODEL, GEN_MODEL);
+    expect(offResult.created.filter((c) => c.kind === 'split')).toHaveLength(1);
+
+    const onH = build(true);
+    const onResult = await onH.service.generate(onH.accountId, MODEL, GEN_MODEL);
+    expect(onResult.created.filter((c) => c.kind === 'split')).toHaveLength(0);
   });
 });

@@ -123,10 +123,19 @@ export function buildContext(): AppContext {
   };
 
   const triageService = new TriageService(llm, logger);
-  const categorizationService = new CategorizationService(repos.categories, repos.embeddings);
+  const categorizationService = new CategorizationService(
+    repos.categories,
+    repos.embeddings,
+    () => config.features.multiPrototypeCategories,
+  );
   const llmCategorizer = new LlmCategorizer(llm);
 
-  const residualDiscovery = new ResidualDiscoveryService(repos.embeddings, repos.categories);
+  const multiPrototypeEnabled = (): boolean => config.features.multiPrototypeCategories;
+  const residualDiscovery = new ResidualDiscoveryService(
+    repos.embeddings,
+    repos.categories,
+    multiPrototypeEnabled,
+  );
   const discoveryProposalService = new DiscoveryProposalService(
     residualDiscovery,
     repos.emails,
@@ -134,11 +143,13 @@ export function buildContext(): AppContext {
     llm,
     () => config.llm,
     logger,
+    multiPrototypeEnabled,
   );
   const categoryCentroidRebuild = new CategoryCentroidRebuildService(
     repos.categories,
     repos.embeddings,
     logger,
+    () => config.features.multiPrototypeCategories,
   );
   const categoryHealth = new CategoryHealthService(repos.categories, repos.embeddings);
 
@@ -171,6 +182,7 @@ export function buildContext(): AppContext {
       repos.accounts,
       repos.discoveryAudit,
       () => config.llm,
+      multiPrototypeEnabled,
     ),
     discoveryProposal: new DiscoveryProposalOrchestrator(
       db,
@@ -196,6 +208,7 @@ export function buildContext(): AppContext {
       llm,
       () => config.llm,
       logger,
+      multiPrototypeEnabled,
     ),
     category: new CategoryOrchestrator(
       categorizationService,
@@ -211,8 +224,14 @@ export function buildContext(): AppContext {
       repos.categories,
       repos.categorizeJobs,
       logger,
+      () => config.features.multiPrototypeCategories,
     ),
-    correction: new CorrectionService(db, repos.categories, repos.embeddings),
+    correction: new CorrectionService(
+      db,
+      repos.categories,
+      repos.embeddings,
+      () => config.features.multiPrototypeCategories,
+    ),
     dashboard: new DashboardService(repos.emails, repos.triage, repos.categories),
     priority: new PriorityService(repos.triage),
     emailAssistant: new EmailAssistantService(

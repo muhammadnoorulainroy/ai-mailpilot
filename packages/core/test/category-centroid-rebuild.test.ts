@@ -28,13 +28,18 @@ function axis(dim: number): Float32Array {
   return v;
 }
 
-function setup() {
+function setup(multiPrototype = false) {
   const db = openDatabase(':memory:');
   const accounts = new AccountRepository(db);
   const categories = new CategoryRepository(db);
   const emails = new EmailRepository(db);
   const embeddings = new EmbeddingRepository(db);
-  const service = new CategoryCentroidRebuildService(categories, embeddings, silentLogger);
+  const service = new CategoryCentroidRebuildService(
+    categories,
+    embeddings,
+    silentLogger,
+    () => multiPrototype,
+  );
   return { db, accounts, categories, emails, embeddings, service };
 }
 
@@ -309,5 +314,134 @@ describe('CategoryCentroidRebuildService', () => {
     const ranked = rankCategories(axis(0), entries);
     expect(ranked[0]!.categoryId).toBe(cat.id);
     h.db.close();
+  });
+});
+
+describe('CategoryCentroidRebuildService multi-prototype (Phase 4)', () => {
+  /** Fill a category with `n` user members per axis in `axes`, then return the harness. */
+  function seedGroups(
+    h: Harness,
+    accountId: string,
+    categoryId: string,
+    groups: Array<[number, number]>,
+  ) {
+    let idx = 0;
+    for (const [dim, count] of groups) {
+      for (let i = 0; i < count; i++) userMember(h, accountId, categoryId, `m${idx++}`, axis(dim));
+    }
+  }
+
+  it('flag off: rebuild writes only the aggregate even for clearly two-cluster data', () => {
+    const h = setup(false);
+    const acc = h.accounts.create({ address: 'a@x.com', kind: 'work' });
+    const cat = h.categories.create({ accountId: acc.id, label: 'Broad', source: 'user' });
+    seedGroups(h, acc.id, cat.id, [
+      [0, 4],
+      [5, 4],
+    ]);
+
+    const res = h.service.rebuild(acc.id, cat.id, MODEL);
+
+    expect(res.subPrototypeCount).toBe(0);
+    expect(h.categories.getPrototypes(cat.id, MODEL).map((p) => p.prototypeIndex)).toEqual([0]);
+    h.db.close();
+  });
+
+  it('flag on, unimodal: writes only the aggregate (no sub-prototypes)', () => {
+    const h = setup(true);
+    const acc = h.accounts.create({ address: 'a@x.com', kind: 'work' });
+    const cat = h.categories.create({ accountId: acc.id, label: 'Tight', source: 'user' });
+    seedGroups(h, acc.id, cat.id, [[0, 6]]);
+
+    const res = h.service.rebuild(acc.id, cat.id, MODEL);
+
+    expect(res.subPrototypeCount).toBe(0);
+    expect(h.categories.getPrototypes(cat.id, MODEL).map((p) => p.prototypeIndex)).toEqual([0]);
+    // The aggregate is on axis 0.
+    expect(
+      cosineSimilarity(h.categories.getCentroid(cat.id, MODEL)!.vector, axis(0)),
+    ).toBeGreaterThan(0.99);
+    h.db.close();
+  });
+
+  it('flag on, two well-separated groups: writes aggregate 0 plus two sub-prototypes', () => {
+    const h = setup(true);
+    const acc = h.accounts.create({ address: 'a@x.com', kind: 'work' });
+    const cat = h.categories.create({ accountId: acc.id, label: 'Broad', source: 'user' });
+    seedGroups(h, acc.id, cat.id, [
+      [0, 4],
+      [5, 4],
+    ]);
+
+    const res = h.service.rebuild(acc.id, cat.id, MODEL);
+
+    expect(res.subPrototypeCount).toBe(2);
+    const protos = h.categories.getPrototypes(cat.id, MODEL);
+    expect(protos.map((p) => p.prototypeIndex)).toEqual([0, 1, 2]);
+    // The two sub-prototypes recover the two axes; the aggregate is the blend.
+    const subDims = protos
+      .filter((p) => p.prototypeIndex >= 1)
+      .map((p) =>
+        cosineSimilarity(p.vector, axis(0)) > 0.99
+          ? 0
+          : cosineSimilarity(p.vector, axis(5)) > 0.99
+            ? 5
+            : -1,
+      )
+      .sort((a, b) => a - b);
+    expect(subDims).toEqual([0, 5]);
+    h.db.close();
+  });
+
+  it('flag on: a sub-cluster below the member floor is ignored (aggregate only)', () => {
+    const h = setup(true);
+    const acc = h.accounts.create({ address: 'a@x.com', kind: 'work' });
+    const cat = h.categories.create({ accountId: acc.id, label: 'Broad', source: 'user' });
+    // 4 on axis 0 (viable) + 2 on axis 5 (below MIN_TRUSTED_REBUILD): only one viable cluster -> no split.
+    seedGroups(h, acc.id, cat.id, [
+      [0, 4],
+      [5, 2],
+    ]);
+
+    const res = h.service.rebuild(acc.id, cat.id, MODEL);
+
+    expect(res.subPrototypeCount).toBe(0);
+    expect(h.categories.getPrototypes(cat.id, MODEL).map((p) => p.prototypeIndex)).toEqual([0]);
+    h.db.close();
+  });
+
+  it('flag on: turning a multi-prototype category unimodal removes stale sub-prototypes', () => {
+    const h = setup(true);
+    const acc = h.accounts.create({ address: 'a@x.com', kind: 'work' });
+    const cat = h.categories.create({ accountId: acc.id, label: 'Broad', source: 'user' });
+    // Seed a stale sub-prototype set directly, then rebuild from unimodal members.
+    h.categories.savePrototypeSet(cat.id, MODEL, axis(0), 8, [
+      { vector: axis(0), emailCount: 4 },
+      { vector: axis(5), emailCount: 4 },
+    ]);
+    seedGroups(h, acc.id, cat.id, [[0, 6]]);
+
+    const res = h.service.rebuild(acc.id, cat.id, MODEL);
+
+    expect(res.subPrototypeCount).toBe(0);
+    expect(h.categories.getPrototypes(cat.id, MODEL).map((p) => p.prototypeIndex)).toEqual([0]);
+    h.db.close();
+  });
+
+  it('is deterministic: identical members yield identical sub-prototypes across runs', () => {
+    const build = () => {
+      const h = setup(true);
+      const acc = h.accounts.create({ address: 'a@x.com', kind: 'work' });
+      const cat = h.categories.create({ accountId: acc.id, label: 'Broad', source: 'user' });
+      seedGroups(h, acc.id, cat.id, [
+        [0, 4],
+        [5, 4],
+      ]);
+      h.service.rebuild(acc.id, cat.id, MODEL);
+      const protos = h.categories.getPrototypes(cat.id, MODEL);
+      h.db.close();
+      return protos.map((p) => `${p.prototypeIndex}:${Array.from(p.vector.slice(0, 8)).join(',')}`);
+    };
+    expect(build()).toEqual(build());
   });
 });
