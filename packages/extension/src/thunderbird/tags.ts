@@ -9,6 +9,12 @@ import { loadSyncPrefs } from '../settings/sync-prefs.js';
 
 const KEY_PREFIX = 'mailpilot_';
 
+/**
+ * Prefix for a MailPilot tag's visible label when the user already owns a tag with the same name.
+ * Keeps the user's tag untouched while still creating a distinct MailPilot tag Thunderbird accepts.
+ */
+const DISAMBIGUATION_PREFIX = 'AI: ';
+
 const PAGE_SIZE = 500;
 
 const PALETTE: string[] = [
@@ -22,9 +28,19 @@ const PALETTE: string[] = [
   '#0D5A2B',
 ];
 
-/** Derive a Thunderbird-safe tag key from a category id, namespaced with the MailPilot prefix. */
-function tagKeyFor(categoryId: string): string {
-  return (KEY_PREFIX + categoryId).toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+/**
+ * Derive a Thunderbird-safe MailPilot tag key from a category's canonical key, falling back to its
+ * id only when the canonical key is missing. Keying on the canonical key (stable across id churn)
+ * means a category reset/re-discovery that mints new ids reuses the same tag instead of colliding.
+ */
+export function tagKeyFor(cat: { id: string; canonicalKey?: string }): string {
+  const base = cat.canonicalKey && cat.canonicalKey.length > 0 ? cat.canonicalKey : cat.id;
+  return (KEY_PREFIX + base).toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+}
+
+/** Whether a Thunderbird tag is MailPilot-owned (safe to create, rename, adopt, or clean). */
+function isMailpilotTag(key: string): boolean {
+  return key.startsWith(KEY_PREFIX);
 }
 
 /**
@@ -43,28 +59,60 @@ function colorFor(index: number): string {
 }
 
 /**
- * Ensure one Thunderbird tag per category. Creates missing tags, renames tags whose label
- * changed, and returns a categoryId to tagKey map for setting tags on messages.
+ * Ensure one Thunderbird tag per category and return a categoryId to tagKey map for setting tags on
+ * messages. Collision-safe and non-destructive to user tags:
+ * - Exact key present: reuse it, renaming only the visible label when the category label changed.
+ * - Key absent but a MailPilot tag already shows this label (e.g. left over from an old category id
+ *   after a reset): adopt that tag's key instead of creating a duplicate label.
+ * - A non-MailPilot user tag already shows this label: never touch it; create the MailPilot tag under
+ *   a disambiguated visible label ("AI: <label>") so Thunderbird accepts it.
+ * Never updates, renames, or deletes a non-MailPilot tag.
  */
-async function ensureCategoryTags(categories: CategoryDto[]): Promise<Map<string, string>> {
+export async function ensureCategoryTags(categories: CategoryDto[]): Promise<Map<string, string>> {
   const existing = await browser.messages.tags.list();
   const byKey = new Map(existing.map((t) => [t.key, t]));
+  const mailpilotByLabel = new Map<string, string>();
+  const userLabels = new Set<string>();
+  for (const t of existing) {
+    if (isMailpilotTag(t.key)) mailpilotByLabel.set(t.tag.toLowerCase(), t.key);
+    else userLabels.add(t.tag.toLowerCase());
+  }
+  // A visible label the user owns must not be taken by a create/rename; use a disambiguated one.
+  const safeLabel = (label: string): string =>
+    userLabels.has(label.toLowerCase()) ? DISAMBIGUATION_PREFIX + label : label;
 
   const result = new Map<string, string>();
+  const usedKeys = new Set<string>();
   for (let i = 0; i < categories.length; i++) {
     const cat = categories[i];
     if (!cat) continue;
 
-    const key = tagKeyFor(cat.id);
+    const key = tagKeyFor(cat);
     const color = colorFor(i);
-    const tag = byKey.get(key);
+    const existingTag = byKey.get(key);
 
-    if (!tag) {
-      await browser.messages.tags.create(key, cat.label, color);
-    } else if (tag.tag !== cat.label) {
-      await browser.messages.tags.update(key, { tag: cat.label });
+    if (existingTag) {
+      const desired = safeLabel(cat.label);
+      if (existingTag.tag !== desired) {
+        await browser.messages.tags.update(key, { tag: desired });
+      }
+      result.set(cat.id, key);
+      usedKeys.add(key);
+      continue;
     }
+
+    // Adopt a leftover MailPilot tag that already shows this label (old id-keyed tag after a reset),
+    // so we never ask Thunderbird to create a second tag with a label it already has.
+    const adoptKey = mailpilotByLabel.get(cat.label.toLowerCase());
+    if (adoptKey && !usedKeys.has(adoptKey)) {
+      result.set(cat.id, adoptKey);
+      usedKeys.add(adoptKey);
+      continue;
+    }
+
+    await browser.messages.tags.create(key, safeLabel(cat.label), color);
     result.set(cat.id, key);
+    usedKeys.add(key);
   }
 
   return result;

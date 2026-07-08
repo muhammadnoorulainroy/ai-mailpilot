@@ -49,6 +49,7 @@ function toDto(row: CategoryRow & { emailCount: number }): CategoryDto {
     id: row.id,
     accountId: row.accountId,
     label: row.label,
+    canonicalKey: row.canonicalKey,
     description: row.description,
     source: row.source,
     emailCount: row.emailCount,

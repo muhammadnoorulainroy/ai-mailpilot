@@ -304,6 +304,8 @@ export interface CategoryDto {
   id: string;
   accountId: string;
   label: string;
+  /** Stable per-account key derived from the label, frozen at creation. Survives id churn. */
+  canonicalKey: string;
   description: string | null;
   source: CategorySource;
   emailCount: number;
