@@ -14,6 +14,8 @@ import type {
   IngestAttachmentsRequest,
   IngestAttachmentsResponse,
   SyncStateRequest,
+  SyncUserLabelsRequest,
+  SyncUserLabelsResponse,
   SyncStateResponse,
   EmbedRunRequest,
   EmbedRunResponse,
@@ -247,6 +249,11 @@ export class CoreClient {
   /** Report which of the given message ids still need a body fetched, so resync can skip complete emails. */
   syncState(req: SyncStateRequest): Promise<SyncStateResponse> {
     return this.request('/emails/sync-state', { method: 'POST', body: JSON.stringify(req) });
+  }
+
+  /** Capture the user's tags/folder for already-indexed messages without re-fetching bodies. */
+  syncUserLabels(req: SyncUserLabelsRequest): Promise<SyncUserLabelsResponse> {
+    return this.request('/emails/user-labels', { method: 'POST', body: JSON.stringify(req) });
   }
 
   /** Start an embedding run. */

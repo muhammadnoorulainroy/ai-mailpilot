@@ -58,10 +58,15 @@ export class EmailUserLabelRepository {
         'SELECT source, key, label FROM email_user_labels WHERE account_id = ? AND message_id = ? ORDER BY source, label',
       ),
       stats: db.prepare(
-        `SELECT source, key, MAX(label) AS label, COUNT(*) AS count
-           FROM email_user_labels
-          WHERE account_id = ? AND source = ?
-          GROUP BY source, key
+        // Label is the most-recently-synced one for the key, so a Thunderbird tag rename is reflected
+        // rather than showing an arbitrary historical label.
+        `SELECT l.source AS source, l.key AS key, COUNT(*) AS count,
+                (SELECT x.label FROM email_user_labels x
+                  WHERE x.account_id = l.account_id AND x.source = l.source AND x.key = l.key
+                  ORDER BY x.synced_at DESC, x.label ASC LIMIT 1) AS label
+           FROM email_user_labels l
+          WHERE l.account_id = ? AND l.source = ?
+          GROUP BY l.source, l.key
           ORDER BY count DESC, label ASC
           LIMIT ?`,
       ),

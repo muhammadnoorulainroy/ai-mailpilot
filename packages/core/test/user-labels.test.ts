@@ -48,12 +48,22 @@ describe('user-label ingest helpers', () => {
     expect(labels.some((l) => l.label === '')).toBe(false);
   });
 
-  it('excludes generic system folders but keeps meaningful ones', () => {
+  it('excludes generic system folders (including provider variants) but keeps meaningful ones', () => {
     expect(isGenericFolder('/INBOX')).toBe(true);
     expect(isGenericFolder('/Trash')).toBe(true);
+    for (const p of ['/[Gmail]/Sent Mail', '/[Gmail]/All Mail', '/[Gmail]/Starred', '/Bin']) {
+      expect(isGenericFolder(p)).toBe(true);
+    }
     expect(isGenericFolder('/INBOX/University')).toBe(false);
     expect(folderLabel('/INBOX')).toBeNull();
     expect(folderLabel('/INBOX/University')).toEqual({ key: 'inbox_university', label: 'University' });
+  });
+
+  it('matches on the leaf segment: a nested folder whose leaf is a generic word is dropped (by design)', () => {
+    // Intentional: a nested folder named like a system folder (e.g. /Clients/Archive) is treated as
+    // generic so provider system folders like /[Gmail]/Trash are excluded. Low harm: just no hint.
+    expect(isGenericFolder('/Clients/Archive')).toBe(true);
+    expect(isGenericFolder('/Clients/Acme')).toBe(false);
   });
 
   it('adds a folder label only for a non-generic folder', () => {
@@ -164,6 +174,24 @@ describe('EmailUserLabelRepository', () => {
     expect(h.labels.representativeSubjects(h.accountId, 'thunderbird_tag', '$work', 5).length).toBe(3);
   });
 
+  it('topLabels shows the most-recently-synced label after a Thunderbird tag rename', () => {
+    const h = seed();
+    h.labels.replaceForEmail(
+      h.accountId,
+      'm1',
+      [{ source: 'thunderbird_tag', key: '$k', label: 'Old Name' }],
+      1,
+    );
+    h.labels.replaceForEmail(
+      h.accountId,
+      'm2',
+      [{ source: 'thunderbird_tag', key: '$k', label: 'New Name' }],
+      2,
+    );
+    const top = h.labels.topLabels(h.accountId, 'thunderbird_tag', 10).find((t) => t.key === '$k');
+    expect(top).toMatchObject({ label: 'New Name', count: 2 });
+  });
+
   it('cascades label deletion when its email is deleted', () => {
     const h = seed();
     h.labels.replaceForEmail(
@@ -237,14 +265,58 @@ describe('/emails/push user-label ingestion', () => {
     await h.app.close();
   });
 
-  it('leaves emails and embeddings untouched', async () => {
+  it('leaves an already-embedded message intact when its labels change on re-sync', async () => {
     const h = await pushHarness();
-    await h.push([{ messageId: 'm1', folder: '/Clients/Acme', subject: 's', tags: [{ key: '$x', label: 'X' }] }]);
+    await h.push([
+      { messageId: 'm1', folder: '/Clients/Acme', subject: 's', body: 'hello', tags: [{ key: '$x', label: 'X' }] },
+    ]);
+    h.embeddings.saveEmbedding({ messageId: 'm1', accountId: h.accountId, modelId: 'bge-m3' }, axis(0));
+    const embCount = () =>
+      (h.db.prepare('SELECT COUNT(*) AS n FROM email_embedding_index').get() as { n: number }).n;
+    expect(embCount()).toBe(1);
+    // Re-sync the same message with a changed tag but the same body: the embedding must survive.
+    await h.push([
+      { messageId: 'm1', folder: '/Clients/Acme', subject: 's', body: 'hello', tags: [{ key: '$y', label: 'Y' }] },
+    ]);
+    expect(embCount()).toBe(1);
     expect(h.emails.count(h.accountId)).toBe(1);
-    const embCount = (
-      h.db.prepare('SELECT COUNT(*) AS n FROM email_embedding_index').get() as { n: number }
-    ).n;
-    expect(embCount).toBe(0);
+    await h.app.close();
+  });
+});
+
+describe('/emails/user-labels body-less backfill', () => {
+  it('captures labels for existing messages without touching emails or embeddings, skipping unknown ids', async () => {
+    const h = await pushHarness();
+    // m1 is a fully-synced, embedded message; m-missing was never synced.
+    await h.push([
+      { messageId: 'm1', folder: '/Clients/Acme', subject: 's', body: 'hello', tags: [] },
+    ]);
+    h.embeddings.saveEmbedding({ messageId: 'm1', accountId: h.accountId, modelId: 'bge-m3' }, axis(0));
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: '/emails/user-labels',
+      payload: {
+        accountId: h.accountId,
+        items: [
+          { messageId: 'm1', folder: '/Clients/Acme', tags: [{ key: '$work', label: 'Work' }] },
+          { messageId: 'm-missing', folder: '/Clients/Acme', tags: [{ key: '$work', label: 'Work' }] },
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().updated).toBe(1);
+    expect(h.emailUserLabels.labelsForEmail(h.accountId, 'm1')).toContainEqual({
+      source: 'thunderbird_tag',
+      key: '$work',
+      label: 'Work',
+    });
+    // The unknown message never gained labels; emails and embeddings are unchanged.
+    expect(h.emailUserLabels.labelsForEmail(h.accountId, 'm-missing')).toEqual([]);
+    expect(h.emails.count(h.accountId)).toBe(1);
+    expect(
+      (h.db.prepare('SELECT COUNT(*) AS n FROM email_embedding_index').get() as { n: number }).n,
+    ).toBe(1);
     await h.app.close();
   });
 });
@@ -398,6 +470,73 @@ describe('UserLabelSuggestionService (Part E, import-prep only)', () => {
     // All the label's emails share one embedding axis, so they are perfectly coherent.
     expect(clients!.coherence).toBeCloseTo(1, 5);
   });
+
+  it('scores a mid-range coherence for a mixed label and null when too few are embedded', () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const emails = new EmailRepository(db);
+    const embeddings = new EmbeddingRepository(db);
+    const labels = new EmailUserLabelRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const ids = ['a1', 'a2', 'a3', 'a4'];
+    emails.upsertBatch(ids.map((m) => ({ messageId: m, accountId: acc.id, folder: '/X', subject: m })));
+    for (const m of ids) {
+      labels.replaceForEmail(acc.id, m, [{ source: 'thunderbird_tag', key: '$mix', label: 'mix' }], 1);
+    }
+    // Half the emails on axis 0, half on axis 1 (orthogonal): coherence is well below 1 but positive.
+    embeddings.saveEmbedding({ messageId: 'a1', accountId: acc.id, modelId: 'bge-m3' }, axis(0));
+    embeddings.saveEmbedding({ messageId: 'a2', accountId: acc.id, modelId: 'bge-m3' }, axis(0));
+    embeddings.saveEmbedding({ messageId: 'a3', accountId: acc.id, modelId: 'bge-m3' }, axis(1));
+    embeddings.saveEmbedding({ messageId: 'a4', accountId: acc.id, modelId: 'bge-m3' }, axis(1));
+    const mix = new UserLabelSuggestionService(labels, embeddings)
+      .suggest(acc.id, 'bge-m3')
+      .find((s) => s.key === '$mix');
+    expect(mix!.coherence).toBeGreaterThan(0.6);
+    expect(mix!.coherence!).toBeLessThan(0.8);
+
+    // A label with only one embedded email cannot be scored: coherence is null.
+    const acc2 = accounts.create({ address: 'y@x.com', kind: 'work' });
+    emails.upsertBatch([
+      { messageId: 'b1', accountId: acc2.id, folder: '/Y', subject: 'b1' },
+      { messageId: 'b2', accountId: acc2.id, folder: '/Y', subject: 'b2' },
+      { messageId: 'b3', accountId: acc2.id, folder: '/Y', subject: 'b3' },
+      { messageId: 'b4', accountId: acc2.id, folder: '/Y', subject: 'b4' },
+    ]);
+    for (const m of ['b1', 'b2', 'b3', 'b4']) {
+      labels.replaceForEmail(acc2.id, m, [{ source: 'thunderbird_tag', key: '$solo', label: 'solo' }], 1);
+    }
+    embeddings.saveEmbedding({ messageId: 'b1', accountId: acc2.id, modelId: 'bge-m3' }, axis(2));
+    const solo = new UserLabelSuggestionService(labels, embeddings)
+      .suggest(acc2.id, 'bge-m3')
+      .find((s) => s.key === '$solo');
+    expect(solo!.coherence).toBeNull();
+  });
+});
+
+describe('canonicalKey stability across reset (Thunderbird tag identity linchpin)', () => {
+  it('re-derives the same canonicalKey for a re-created same-label category after a reset', () => {
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const categories = new CategoryRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const first = categories.create({
+      accountId: acc.id,
+      label: 'Banking Transactions',
+      source: 'auto',
+    });
+    expect(first.canonicalKey).toBeTruthy();
+    // A reset wipes DB categories (ids change) but not Thunderbird tags. The re-discovered category
+    // must derive the SAME canonicalKey so its mailpilot_<canonicalKey> tag key is reused, not duplicated.
+    db.prepare('DELETE FROM categories WHERE id = ?').run(first.id);
+    const second = categories.create({
+      accountId: acc.id,
+      label: 'Banking Transactions',
+      source: 'auto',
+    });
+    expect(second.id).not.toBe(first.id);
+    expect(second.canonicalKey).toBe(first.canonicalKey);
+    db.close();
+  });
 });
 
 describe('summarizeUserLabels hint builder (Part D)', () => {
@@ -464,7 +603,7 @@ describe('discovery hinting from user labels (Part D/F)', () => {
     hasAttachments: false,
   });
 
-  function harness(opts: { withRepo?: boolean; allowCloud?: boolean } = {}) {
+  function harness(opts: { withRepo?: boolean; allowCloud?: boolean; insufficient?: boolean } = {}) {
     const db = openDatabase(':memory:');
     const accounts = new AccountRepository(db);
     const emailsRepo = new EmailRepository(db);
@@ -489,10 +628,16 @@ describe('discovery hinting from user labels (Part D/F)', () => {
     }
 
     let embedN = 0;
-    const chat = vi.fn(
-      async (o: { provider: string; messages: Array<{ role: string; content: string }> }) => {
-        void o;
-        return JSON.stringify({
+    // Vague, banned labels produce zero concrete topics -> the run ends 'insufficient' after the
+    // hinted prompt was already sent, exercising the insufficient() audit path.
+    const topicsJson = opts.insufficient
+      ? JSON.stringify({
+          topics: [
+            { label: 'Notifications', description: 'x' },
+            { label: 'General Updates', description: 'y' },
+          ],
+        })
+      : JSON.stringify({
           topics: [
             { label: 'Receipts & Invoices', description: 'Payment invoices.' },
             { label: 'Banking Transactions', description: 'Bank statements and transfers.' },
@@ -501,6 +646,10 @@ describe('discovery hinting from user labels (Part D/F)', () => {
             { label: 'Job Opportunities', description: 'Job listings and offers.' },
           ],
         });
+    const chat = vi.fn(
+      async (o: { provider: string; messages: Array<{ role: string; content: string }> }) => {
+        void o;
+        return topicsJson;
       },
     );
     const llm = { chat, embed: vi.fn(async () => Array.from(axis(embedN++))) };
@@ -535,9 +684,10 @@ describe('discovery hinting from user labels (Part D/F)', () => {
     );
     const userPrompt = () =>
       (chat.mock.calls[0]?.[0].messages.find((m) => m.role === 'user')?.content ?? '') as string;
-    const okAudit = () =>
-      audit.log.mock.calls.map((c) => c[0]).find((a: { status: string }) => a.status === 'ok');
-    return { svc, acc, chat, userPrompt, okAudit };
+    const auditByStatus = (status: string) =>
+      audit.log.mock.calls.map((c) => c[0]).find((a: { status: string }) => a.status === status);
+    const okAudit = () => auditByStatus('ok');
+    return { svc, acc, chat, userPrompt, okAudit, auditByStatus };
   }
 
   it('includes user-label hints locally and records it in the audit', async () => {
@@ -566,5 +716,14 @@ describe('discovery hinting from user labels (Part D/F)', () => {
     await h.svc.discover(h.acc.id, 'bge-m3', 'gen');
     expect(h.userPrompt()).not.toContain('weak hints');
     expect(h.okAudit().fieldsRead).not.toContain('user_label_hints');
+  });
+
+  it('records the hint exposure even when the run ends insufficient after sending the prompt', async () => {
+    const h = harness({ insufficient: true });
+    const res = await h.svc.discover(h.acc.id, 'bge-m3', 'gen');
+    expect(res.status).toBe('insufficient_categories');
+    // The hinted prompt was already sent, so the audit must not claim the labels were unexposed.
+    expect(h.userPrompt()).toContain('weak hints');
+    expect(h.auditByStatus('insufficient').fieldsRead).toContain('user_label_hints');
   });
 });

@@ -161,6 +161,18 @@ async function runSyncImpl(force = false): Promise<void> {
           onProgress: (n) => {
             syncState.processed += n;
           },
+          // Backfill the user's tags/folder for already-synced messages without re-fetching bodies,
+          // so an existing mailbox's organization is captured on a normal sync. Skipped on force
+          // (every message is fetched and pushed with its tags anyway).
+          onLabelsOnly: force
+            ? undefined
+            : async (items) => {
+                try {
+                  await coreClient.syncUserLabels({ accountId: coreAccountId, items });
+                } catch (err) {
+                  console.warn('[MailPilot] user-label backfill batch failed', err);
+                }
+              },
         },
       );
       syncState.pushed += fetched;

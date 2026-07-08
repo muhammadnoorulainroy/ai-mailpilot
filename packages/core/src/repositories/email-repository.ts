@@ -288,6 +288,24 @@ export class EmailRepository {
     return messageIds.filter((id) => !synced.has(id));
   }
 
+  /** Of the given message ids, those already stored for the account (preserving input order). */
+  filterExisting(accountId: string, messageIds: string[]): string[] {
+    if (messageIds.length === 0) return [];
+    const present = new Set<string>();
+    const CHUNK = 800;
+    for (let i = 0; i < messageIds.length; i += CHUNK) {
+      const chunk = messageIds.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT message_id FROM emails WHERE account_id = ? AND message_id IN (${placeholders})`,
+        )
+        .all(accountId, ...chunk) as Array<{ message_id: string }>;
+      for (const r of rows) present.add(r.message_id);
+    }
+    return messageIds.filter((id) => present.has(id));
+  }
+
   /**
    * Keyword BM25 search over subject, sender, and body via the FTS5 index, best first.
    * The query is sanitized into a safe FTS5 MATCH expression. An empty query returns [].

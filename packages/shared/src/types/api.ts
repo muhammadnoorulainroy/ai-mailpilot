@@ -102,6 +102,27 @@ export interface PushEmailsResponse {
   total: number;
 }
 
+/** One message's current folder and user tags, for a body-less label-only sync. */
+export interface SyncUserLabelsItem {
+  messageId: string;
+  folder: string;
+  tags?: PushEmailTag[];
+}
+
+/**
+ * Request to sync only the user-owned labels (tags/folder) of already-indexed messages, without
+ * touching their bodies. Lets an existing mailbox's organization be captured without a re-fetch.
+ */
+export interface SyncUserLabelsRequest {
+  accountId: string;
+  items: SyncUserLabelsItem[];
+}
+
+/** Result of a label-only sync: how many messages had their labels updated. */
+export interface SyncUserLabelsResponse {
+  updated: number;
+}
+
 /** Request to reconcile the mailbox state by message ids. */
 export interface SyncStateRequest {
   accountId: string;

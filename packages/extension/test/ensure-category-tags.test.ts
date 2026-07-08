@@ -138,4 +138,45 @@ describe('ensureCategoryTags: stable key + collision handling', () => {
       expect.any(String),
     );
   });
+
+  it('never collapses two categories: adoption skips a tag that is another category’s own key', async () => {
+    // Leftover tag mailpilot_billing labeled "Bills". Category A could adopt it by label, but it is
+    // category B's own derived key, so A must not steal it and the two must stay on distinct tags.
+    fakeTagStore([{ key: 'mailpilot_billing', tag: 'Bills' }]);
+    const map = await ensureCategoryTags([
+      cat({ id: 'A', label: 'Bills', canonicalKey: 'bills' }),
+      cat({ id: 'B', label: 'Invoices', canonicalKey: 'billing' }),
+    ]);
+    expect(map.get('B')).toBe('mailpilot_billing');
+    expect(map.get('A')).not.toBe('mailpilot_billing');
+    expect(new Set(map.values()).size).toBe(2);
+  });
+
+  it('handles two categories whose labels differ only in case without throwing', async () => {
+    const store = fakeTagStore([]);
+    const map = await ensureCategoryTags([
+      cat({ id: 'A', label: 'Work', canonicalKey: 'work' }),
+      cat({ id: 'B', label: 'work', canonicalKey: 'work_2' }),
+    ]);
+    expect(map.get('A')).toBe('mailpilot_work');
+    expect(map.get('B')).toBe('mailpilot_work_2');
+    expect(store.create).toHaveBeenCalledTimes(2);
+    const labels = store.tags.map((t) => t.tag.toLowerCase());
+    expect(labels).toContain('work');
+    expect(labels).toContain('ai: work');
+  });
+
+  it('a single failing tag create does not abort tagging for the rest', async () => {
+    const store = fakeTagStore([]);
+    store.create.mockImplementationOnce(async () => {
+      throw new Error('boom');
+    });
+    const map = await ensureCategoryTags([
+      cat({ id: 'A', label: 'Alpha', canonicalKey: 'alpha' }),
+      cat({ id: 'B', label: 'Beta', canonicalKey: 'beta' }),
+    ]);
+    expect(map.get('A')).toBe('mailpilot_alpha');
+    expect(map.get('B')).toBe('mailpilot_beta');
+    expect(store.create).toHaveBeenCalledTimes(2);
+  });
 });

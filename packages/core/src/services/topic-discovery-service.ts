@@ -200,6 +200,8 @@ interface StagedTopic {
  */
 export class TopicDiscoveryService {
   private running = false;
+  /** Whether the in-progress run put user-label hints in the prompt, so every audit path records it. */
+  private lastRunLabelHints = false;
 
   /** Wire up the repositories, LLM client, and logger the discovery run depends on. */
   constructor(
@@ -239,6 +241,9 @@ export class TopicDiscoveryService {
         provider: provider === 'main' ? 'local' : 'cloud',
         status: 'failed',
         modelId: generationModelId,
+        fieldsRead: this.lastRunLabelHints
+          ? ['subject', 'from_addr', 'user_label_hints']
+          : ['subject', 'from_addr'],
         error: String(err),
       });
       throw err;
@@ -257,6 +262,7 @@ export class TopicDiscoveryService {
     embeddingModelId: string,
     generationModelId: string,
   ): Promise<DiscoveryResult> {
+    this.lastRunLabelHints = false;
     const cfg = this.getConfig?.();
     const provider = cfg ? discoveryProvider(cfg) : 'main';
     const accountKind = this.accounts?.findById(accountId)?.kind ?? 'unknown';
@@ -333,13 +339,13 @@ export class TopicDiscoveryService {
     // Include the user's own tags/folders as weak hints. Privacy: local always; cloud only when the
     // user has explicitly opted into cloud discovery (which is also what lets discovery run at all on
     // the cloud provider). Only a small, summarized top-labels view is ever sent, never the full set.
-    let labelHintsIncluded = false;
+    this.lastRunLabelHints = false;
     const mayIncludeLabels = provider === 'main' || (cfg?.allowCloudDiscovery ?? false);
     if (this.userLabelRepo && mayIncludeLabels) {
       const hint = summarizeUserLabels(this.userLabelRepo, accountId);
       if (hint.labelCount > 0) {
         userPrompt += `\n\n${hint.text}`;
-        labelHintsIncluded = true;
+        this.lastRunLabelHints = true;
       }
     }
 
@@ -354,7 +360,9 @@ export class TopicDiscoveryService {
         poolSize: pool.length,
         sampleSize: sample.length,
         emailsExposed: sample.length,
-        fieldsRead: ['subject', 'from_addr'],
+        fieldsRead: this.lastRunLabelHints
+          ? ['subject', 'from_addr', 'user_label_hints']
+          : ['subject', 'from_addr'],
       });
       return {
         status: 'insufficient_categories',
@@ -494,7 +502,7 @@ export class TopicDiscoveryService {
       poolSize: pool.length,
       sampleSize: sample.length,
       emailsExposed: sample.length,
-      fieldsRead: labelHintsIncluded
+      fieldsRead: this.lastRunLabelHints
         ? ['subject', 'from_addr', 'user_label_hints']
         : ['subject', 'from_addr'],
       omittedCategories: omitted,
