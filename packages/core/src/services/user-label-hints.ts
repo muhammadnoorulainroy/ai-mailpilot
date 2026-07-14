@@ -61,7 +61,7 @@ export function summarizeUserLabels(
     'The user already organizes some mail with the tags and folders below. Treat these ONLY as weak hints:\n' +
     `${sections.join('\n')}\n` +
     'A topic MAY align with one of these, but do NOT create a topic just because a tag or folder exists, do NOT ' +
-    'copy a personal or noisy label as a topic, and keep every topic purpose-based. These are the user’s own ' +
+    "copy a personal or noisy label as a topic, and keep every topic purpose-based. These are the user's own " +
     'labels and stay separate from the AI categories you propose.';
   return { text, labelCount };
 }

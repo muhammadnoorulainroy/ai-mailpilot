@@ -52,6 +52,7 @@ import type {
   CategoryDto,
   CategoryListResponse,
   UserLabelSuggestionsResponse,
+  CoverResidualResponse,
   CategoryUpdateRequest,
   CategoryMergeRequest,
   CategoryMergeResponse,
@@ -98,6 +99,7 @@ export interface ServerConfig {
   };
   features?: {
     multiPrototypeCategories?: boolean;
+    residualBuckets?: boolean;
   };
 }
 
@@ -507,6 +509,14 @@ export class CoreClient {
     const qs = new URLSearchParams({ accountId });
     if (embeddingModelId) qs.set('embeddingModelId', embeddingModelId);
     return this.request(`/categories/user-label-suggestions?${qs.toString()}`);
+  }
+
+  /** Cover the uncategorized long tail with signal-matched broad buckets (no-op unless enabled). */
+  coverResidual(accountId: string): Promise<CoverResidualResponse> {
+    return this.request('/categories/cover-residual', {
+      method: 'POST',
+      body: JSON.stringify({ accountId }),
+    });
   }
 
   /** Fetch the proposed folder plan for an account. */

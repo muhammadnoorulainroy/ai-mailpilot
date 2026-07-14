@@ -776,6 +776,13 @@ export interface UserLabelSuggestionsResponse {
   suggestions: UserLabelSuggestionDto[];
 }
 
+/** Outcome of covering the uncategorized long tail with signal-matched broad buckets. */
+export interface CoverResidualResponse {
+  scanned: number;
+  buckets: Array<{ label: string; created: boolean; assigned: number }>;
+  totalAssigned: number;
+}
+
 /** The dashboard payload with email counts, triage buckets, and categories. */
 export interface DashboardResponse {
   accountId: string;

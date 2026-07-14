@@ -39,6 +39,8 @@ export const LlmConfigSchema = z.object({
 export const FeaturesConfigSchema = z.object({
   /** Phase 4: allow a category to carry multiple prototype centroids (nearest-prototype matching). */
   multiPrototypeCategories: z.boolean().default(false),
+  /** Cover the uncategorized long tail with signal-matched broad buckets (Newsletters, Promotions, ...). */
+  residualBuckets: z.boolean().default(false),
 });
 
 /** Zod schema for the full application configuration. */

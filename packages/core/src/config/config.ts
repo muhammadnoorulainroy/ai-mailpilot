@@ -87,6 +87,7 @@ export function redactConfig(config: AppConfig): SafeConfig {
     // Feature flags carry no secrets; expose them so the UI can reflect and toggle them.
     features: {
       multiPrototypeCategories: config.features.multiPrototypeCategories,
+      residualBuckets: config.features.residualBuckets,
     },
   };
 }
