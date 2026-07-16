@@ -1082,7 +1082,7 @@ export class ChatService {
     const scope = parseTimeScope(query, Date.now());
     const semanticQuery = expandQueryBilingual(scope ? stripTimeScope(query, scope) : query);
 
-    const qvec = await this.llm.embed(semanticQuery, modelId);
+    const qvec = await this.llm.embed(semanticQuery, modelId, 'query');
     const vectorHits = this.embeddings.search(accountId, modelId, qvec, overfetch);
     const vectorIds = vectorHits.map((h) => h.messageId);
     const keywordIds = this.emails.keywordSearch(accountId, semanticQuery, overfetch);

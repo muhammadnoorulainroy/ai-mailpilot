@@ -107,6 +107,43 @@ export function buildEmbeddingInput(
   return lines.join('\n');
 }
 
+/** Whether embedding input is stored content (clustered/matched) or a search query. */
+export type EmbeddingKind = 'document' | 'query';
+
+/**
+ * Instruction-tuned embedding models (Qwen3-Embedding) take a task instruction that steers the vector.
+ * We embed stored content with a PURPOSE instruction so same-purpose mail groups together (fixing the
+ * centroid-collapse where notifications, jobs, and receipts embed alike), and search queries with a
+ * RETRIEVAL instruction. The purpose instruction names only generic, universal email FUNCTIONS, never
+ * domain categories, so it generalizes across mailboxes and keeps every user in one shared embedding
+ * space (required for federated learning).
+ */
+const EMBED_INSTRUCTIONS: Record<EmbeddingKind, string> = {
+  document:
+    'Represent this email by its purpose and type (such as a request, a notification, a confirmation, ' +
+    'an announcement, a newsletter, a report, or an alert), so emails of the same type group together ' +
+    'regardless of sender or wording.',
+  query: 'Given a search query, retrieve emails relevant to the query.',
+};
+
+/** True for embedding models that expect an `Instruct:`/`Query:` task prefix (Qwen3-Embedding family). */
+export function isInstructionTunedEmbedding(model: string | undefined): boolean {
+  return !!model && /^qwen3-embedding/i.test(model);
+}
+
+/**
+ * Wrap embedding input with the model-appropriate task instruction. Models that are not
+ * instruction-tuned (e.g. bge-m3) get the text unchanged, so switching the embedding model is safe.
+ */
+export function withEmbeddingInstruction(
+  text: string,
+  model: string | undefined,
+  kind: EmbeddingKind = 'document',
+): string {
+  if (!isInstructionTunedEmbedding(model)) return text;
+  return `Instruct: ${EMBED_INSTRUCTIONS[kind]}\nQuery: ${text}`;
+}
+
 /**
  * Turn free text into a safe FTS5 MATCH string for keyword retrieval. Extracts word
  * tokens so French words survive, drops punctuation and FTS5 operators, quotes each

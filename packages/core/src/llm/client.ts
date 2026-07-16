@@ -4,6 +4,7 @@
  */
 import { z } from 'zod';
 import type { LlmConfig } from '../config/schema.js';
+import { withEmbeddingInstruction, type EmbeddingKind } from '../util/text.js';
 
 /** LLM HTTP error carrying the response status so callers can separate a transient hiccup from a permanent misconfiguration. */
 export class LlmApiError extends Error {
@@ -93,8 +94,8 @@ export interface ChatCompletionOptions {
 /** Client for embedding and chat completion calls against an OpenAI-compatible LLM endpoint. */
 export interface LlmClient {
   health(): Promise<{ ok: boolean; models: string[] }>;
-  embed(text: string, model?: string): Promise<number[]>;
-  embedBatch(texts: string[], model?: string): Promise<number[][]>;
+  embed(text: string, model?: string, kind?: EmbeddingKind): Promise<number[]>;
+  embedBatch(texts: string[], model?: string, kind?: EmbeddingKind): Promise<number[][]>;
   chat(opts: ChatCompletionOptions): Promise<string>;
   chatStream(opts: ChatCompletionOptions): AsyncIterable<string>;
 }
@@ -200,10 +201,11 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
     },
 
     /** Return the embedding vector for a single text, defaulting to the configured embedding model. */
-    async embed(text, model) {
+    async embed(text, model, kind) {
+      const resolved = model ?? getConfig().embeddingModel;
       const result = await request(
         '/embeddings',
-        { input: text, model: model ?? getConfig().embeddingModel },
+        { input: withEmbeddingInstruction(text, resolved, kind), model: resolved },
         EmbeddingsSchema,
       );
       const first = result.data[0];
@@ -212,10 +214,14 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
     },
 
     /** Embed many texts at once, reordering results by their returned index so output aligns with the input order. */
-    async embedBatch(texts, model) {
+    async embedBatch(texts, model, kind) {
+      const resolved = model ?? getConfig().embeddingModel;
       const result = await request(
         '/embeddings',
-        { input: texts, model: model ?? getConfig().embeddingModel },
+        {
+          input: texts.map((t) => withEmbeddingInstruction(t, resolved, kind)),
+          model: resolved,
+        },
         EmbeddingsSchema,
       );
       const ordered = result.data.every((d) => typeof d.index === 'number')
