@@ -33,7 +33,11 @@ describe('config routes: feature flags', () => {
     const { app } = await buildApp();
     const res = await app.inject({ method: 'GET', url: '/config' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().features).toEqual({ multiPrototypeCategories: false, residualBuckets: false });
+    expect(res.json().features).toEqual({
+      multiPrototypeCategories: false,
+      residualBuckets: false,
+      clusterRepresentativeSampling: false,
+    });
     await app.close();
   });
 
@@ -89,7 +93,11 @@ describe('config routes: feature flags', () => {
     });
     const res = await app.inject({ method: 'GET', url: '/config' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().features).toEqual({ multiPrototypeCategories: false, residualBuckets: false });
+    expect(res.json().features).toEqual({
+      multiPrototypeCategories: false,
+      residualBuckets: false,
+      clusterRepresentativeSampling: false,
+    });
     expect(res.json().autoIndex).toBe(true);
     await app.close();
   });

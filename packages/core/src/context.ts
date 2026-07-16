@@ -177,6 +177,7 @@ export function buildContext(): AppContext {
       repos.discoveryAudit,
       () => config.llm,
       repos.emailUserLabels,
+      () => config.features.clusterRepresentativeSampling,
     ),
     categoryImprovement: new CategoryImprovementService(
       db,

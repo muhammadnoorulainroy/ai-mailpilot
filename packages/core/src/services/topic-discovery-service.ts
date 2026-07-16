@@ -9,7 +9,8 @@ import type { CategoryRepository } from '../repositories/category-repository.js'
 import type { EmailRepository, EmailSummary } from '../repositories/email-repository.js';
 import type { EmbeddingRepository } from '../repositories/embedding-repository.js';
 import { parseLlmJson, stripCodeFence } from '../util/json-llm.js';
-import { cosineFromL2Distance, l2Distance, meanNormalize } from '../util/vector.js';
+import { cosineFromL2Distance, dot, l2Distance, meanNormalize } from '../util/vector.js';
+import { clusterResidual, type ClusterPoint } from './discovery-clustering.js';
 import { purposeSignature } from './categorize-strategy.js';
 import type { AccountRepository } from '../repositories/account-repository.js';
 import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
@@ -214,6 +215,7 @@ export class TopicDiscoveryService {
     private audit?: DiscoveryAuditRepository,
     private getConfig?: () => LlmConfig,
     private userLabelRepo?: EmailUserLabelRepository,
+    private clusterSampling: () => boolean = () => false,
   ) {}
 
   /**
@@ -308,13 +310,19 @@ export class TopicDiscoveryService {
       return { status: 'ok', topicsCreated: 0, emailsSampled: 0, centroidsComputed: 0 };
     }
 
-    const sample = mixedSampleBySender(
-      pool,
-      SAMPLE_SIZE,
-      stableHash(`${accountId}|${embeddingModelId}`),
-    );
+    const sampleSeed = stableHash(`${accountId}|${embeddingModelId}`);
+    const clusterSample = this.clusterSampling();
+    const sample = clusterSample
+      ? clusterRepresentativeSample(
+          pool,
+          (messageId) =>
+            this.embeddings.getEmbedding({ messageId, accountId, modelId: embeddingModelId }),
+          SAMPLE_SIZE,
+          sampleSeed,
+        )
+      : mixedSampleBySender(pool, SAMPLE_SIZE, sampleSeed);
     this.logger.info(
-      { accountId, sampleSize: sample.length, pool: pool.length, inboxSize },
+      { accountId, sampleSize: sample.length, pool: pool.length, inboxSize, clusterSample },
       'topic discovery: sampling',
     );
 
@@ -926,6 +934,83 @@ export function mixedSampleBySender<T extends { fromAddr: string | null }>(
     result.push(rest[i]!);
   }
   return result;
+}
+
+/**
+ * Sample for topic discovery by CONTENT variety instead of by sender. Leader-clusters the pool's
+ * embeddings into micro-clusters of near-identical mail, then takes one representative (the member
+ * nearest its cluster centroid) from each, largest clusters first, filling any shortfall round-robin
+ * from the next-nearest members. This shows the LLM one example of every distinct KIND of mail,
+ * including the intra-sender variety (LinkedIn jobs vs messages vs invitations) that sender-mixing
+ * collapses into a single sender slot. Deterministic for a given seed. Falls back to
+ * mixedSampleBySender when too few emails carry an embedding to cluster on.
+ */
+export function clusterRepresentativeSample(
+  pool: EmailSummary[],
+  vectorOf: (messageId: string) => Float32Array | null,
+  n: number,
+  seed: number,
+): EmailSummary[] {
+  if (pool.length <= n) return [...pool];
+
+  const emailById = new Map<string, EmailSummary>();
+  const vecById = new Map<string, Float32Array>();
+  const points: ClusterPoint[] = [];
+  for (const e of pool) {
+    const vector = vectorOf(e.messageId);
+    if (!vector) continue;
+    points.push({ messageId: e.messageId, vector });
+    emailById.set(e.messageId, e);
+    vecById.set(e.messageId, vector);
+  }
+  // Too few embedded emails to cluster on, or no clusters emerged: keep the proven sender behaviour.
+  if (points.length < n) return mixedSampleBySender(pool, n, seed);
+  const clusters = clusterResidual(points, seed);
+  if (clusters.length === 0) return mixedSampleBySender(pool, n, seed);
+
+  // Each cluster's members ordered closest-to-centroid first, so members[0] is the representative;
+  // clusters ordered largest first so the loudest kinds of mail are covered before the long tail.
+  const ranked = clusters
+    .map((c) =>
+      [...c.memberIds].sort((a, b) => {
+        const d = dot(c.centroid, vecById.get(b)!) - dot(c.centroid, vecById.get(a)!);
+        return d !== 0 ? d : compareIds(a, b);
+      }),
+    )
+    .sort((a, b) => b.length - a.length || compareIds(a[0]!, b[0]!));
+
+  // Round-robin across clusters: every representative first (max variety), then seconds, thirds, ...
+  const chosen: EmailSummary[] = [];
+  const picked = new Set<string>();
+  for (let layer = 0; chosen.length < n; layer++) {
+    let progressed = false;
+    for (const members of ranked) {
+      if (layer >= members.length) continue;
+      progressed = true;
+      const id = members[layer]!;
+      chosen.push(emailById.get(id)!);
+      picked.add(id);
+      if (chosen.length >= n) break;
+    }
+    if (!progressed) break; // every cluster exhausted
+  }
+
+  // Points dropped as cluster noise can leave a shortfall; top up sender-diverse from the rest.
+  if (chosen.length < n) {
+    chosen.push(
+      ...mixedSampleBySender(
+        pool.filter((e) => !picked.has(e.messageId)),
+        n - chosen.length,
+        (seed ^ 0x85ebca6b) >>> 0,
+      ),
+    );
+  }
+  return chosen.slice(0, n);
+}
+
+/** Stable string comparison for deterministic tie-breaks. */
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /** Lowercase sender domain extracted from a From header. */

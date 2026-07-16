@@ -100,6 +100,7 @@ export interface ServerConfig {
   features?: {
     multiPrototypeCategories?: boolean;
     residualBuckets?: boolean;
+    clusterRepresentativeSampling?: boolean;
   };
 }
 

@@ -88,6 +88,7 @@ export function redactConfig(config: AppConfig): SafeConfig {
     features: {
       multiPrototypeCategories: config.features.multiPrototypeCategories,
       residualBuckets: config.features.residualBuckets,
+      clusterRepresentativeSampling: config.features.clusterRepresentativeSampling,
     },
   };
 }

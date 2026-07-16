@@ -41,6 +41,8 @@ export const FeaturesConfigSchema = z.object({
   multiPrototypeCategories: z.boolean().default(false),
   /** Cover the uncategorized long tail with signal-matched broad buckets (Newsletters, Promotions, ...). */
   residualBuckets: z.boolean().default(false),
+  /** Sample discovery by content-cluster representatives instead of by sender, for variety coverage. */
+  clusterRepresentativeSampling: z.boolean().default(false),
 });
 
 /** Zod schema for the full application configuration. */

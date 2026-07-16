@@ -2370,7 +2370,11 @@ describe('redactConfig (M8)', () => {
     expect(safeLlm.chatApiKeySet).toBe(true);
     expect(safe.locale).toBe('en');
     // Feature flags carry no secrets and are exposed so the UI can reflect them.
-    expect(safe.features).toEqual({ multiPrototypeCategories: false, residualBuckets: false });
+    expect(safe.features).toEqual({
+      multiPrototypeCategories: false,
+      residualBuckets: false,
+      clusterRepresentativeSampling: false,
+    });
   });
 
   it('enforces chat tuning bounds and accepts null to clear back to default', () => {
