@@ -1,0 +1,6 @@
+# Pinned so clustering stays byte-for-byte reproducible across machines. Bump deliberately, then
+# re-verify determinism (ml/tests/test_cluster.py::test_determinism) before shipping.
+numpy==2.2.1
+scikit-learn==1.9.0
+umap-learn==0.5.12
+pytest==8.3.4
