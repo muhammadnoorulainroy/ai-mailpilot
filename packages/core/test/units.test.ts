@@ -1246,15 +1246,15 @@ describe('topic discovery sampling and label hygiene', () => {
         calls.push('recent');
         return [summary('m1', 'r@a.com'), summary('dup', 'z@a.com')];
       },
-      listSummariesRandom: () => {
+      listSummariesSeeded: () => {
         calls.push('historical');
         return [summary('m2', 'h@b.com')];
       },
-      listUncategorizedSummaries: () => {
+      listUncategorizedSummariesStable: () => {
         calls.push('uncat');
         return [summary('m3', 'u@c.com')];
       },
-      listSummariesByDomain: () => {
+      listSummariesByDomainSeeded: () => {
         calls.push('domain');
         return [summary('m4', 'd@github.com'), summary('dup', 'z@a.com')];
       },
@@ -1286,9 +1286,9 @@ describe('topic discovery sampling and label hygiene', () => {
     const emails = {
       listSummaries: () =>
         Array.from({ length: 200 }, (_, i) => summary(`m${i}`, `u${i % 5}@x.com`)),
-      listSummariesRandom: () => [],
-      listUncategorizedSummaries: () => [],
-      listSummariesByDomain: () => [],
+      listSummariesSeeded: () => [],
+      listUncategorizedSummariesStable: () => [],
+      listSummariesByDomainSeeded: () => [],
       listSenders: () => Array.from({ length: 250 }, (_, i) => ({ fromAddr: `u${i % 5}@x.com` })),
     };
     const categories = { reconcileAutoCategories: vi.fn(() => 0) };
@@ -1318,9 +1318,9 @@ describe('topic discovery sampling and label hygiene', () => {
     const emails = {
       listSummaries: () =>
         Array.from({ length: 200 }, (_, i) => summary(`m${i}`, `u${i % 5}@x.com`)),
-      listSummariesRandom: () => [],
-      listUncategorizedSummaries: () => [],
-      listSummariesByDomain: () => [],
+      listSummariesSeeded: () => [],
+      listUncategorizedSummariesStable: () => [],
+      listSummariesByDomainSeeded: () => [],
       listSenders: () => Array.from({ length: 250 }, (_, i) => ({ fromAddr: `u${i % 5}@x.com` })),
     };
     const categories = { reconcileAutoCategories: vi.fn() };

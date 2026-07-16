@@ -10,7 +10,11 @@ import type { EmailRepository, EmailSummary } from '../repositories/email-reposi
 import type { EmbeddingRepository } from '../repositories/embedding-repository.js';
 import { parseLlmJson, stripCodeFence } from '../util/json-llm.js';
 import { cosineFromL2Distance, dot, l2Distance, meanNormalize } from '../util/vector.js';
-import { clusterResidual, type ClusterPoint } from './discovery-clustering.js';
+import {
+  clusterResidual,
+  type ClusterPoint,
+  type DiscoveredCluster,
+} from './discovery-clustering.js';
 import { purposeSignature } from './categorize-strategy.js';
 import type { AccountRepository } from '../repositories/account-repository.js';
 import type { DiscoveryAuditRepository } from '../repositories/discovery-audit-repository.js';
@@ -139,7 +143,10 @@ const SMALL_INBOX_MAX = 200;
 const MODEST_INBOX_MAX = 2000;
 const MIN_CATEGORIES_LARGE = 8;
 const TARGET_TOPIC_COUNT = '10 to 16';
-const ASSIGNMENT_THRESHOLD = 1.0;
+/** Minimum cosine an email needs to its nearest topic to seed that topic's centroid (no force-fit). */
+const SEED_FLOOR_COSINE = 0.5;
+/** A discovered topic that gathers fewer real members than this is dropped (empty / thin mislabelled). */
+const MIN_CATEGORY_MEMBERS = 10;
 
 /** Minimum number of concrete categories required to accept a taxonomy, scaled to inbox size. */
 function minCategoriesFor(inboxSize: number): number {
@@ -304,6 +311,7 @@ export class TopicDiscoveryService {
     const pool = this.buildDiscoveryPool(
       accountId,
       freq.slice(0, TOP_DOMAIN_COUNT).map(([d]) => d),
+      stableHash(`${accountId}|${embeddingModelId}|pool`),
     );
     if (pool.length === 0) {
       auditNoData(pool.length);
@@ -461,38 +469,16 @@ export class TopicDiscoveryService {
     await this.reconcileWithExisting(accountId, embeddingModelId, kept);
 
     const allEntries = this.embeddings.listForAccount(accountId, embeddingModelId);
-    const vectorsByMsg = new Map<string, Float32Array>();
-    for (const e of allEntries) vectorsByMsg.set(e.messageId, e.vector);
-
-    const staged: StagedTopic[] = [];
-    for (const { topic, vec } of kept) {
-      const matched = this.embeddings
-        .search(accountId, embeddingModelId, vec, 50)
-        .filter((h) => h.distance < ASSIGNMENT_THRESHOLD);
-
-      const matchedVectors: Float32Array[] = [];
-      for (const h of matched) {
-        const v = vectorsByMsg.get(h.messageId);
-        if (v) matchedVectors.push(v);
-      }
-
-      const centroid = matchedVectors.length > 0 ? meanNormalize(matchedVectors) : null;
-      staged.push(
-        centroid
-          ? {
-              label: topic.label,
-              description: topic.description,
-              centroid,
-              emailCount: matched.length,
-            }
-          : {
-              label: topic.label,
-              description: topic.description,
-              centroid: vec,
-              emailCount: 0,
-            },
-      );
-    }
+    const staged =
+      allEntries.length > 0
+        ? seedCentroidsCompetitive(kept, allEntries)
+        : // No embeddings to seed from (un-embedded inbox): keep the label as the centroid.
+          kept.map(({ topic, vec }) => ({
+            label: topic.label,
+            description: topic.description,
+            centroid: vec,
+            emailCount: 0,
+          }));
 
     const { live: centroidsComputed, omitted } = this.categories.reconcileAutoCategories(
       accountId,
@@ -582,19 +568,33 @@ export class TopicDiscoveryService {
   }
 
   /**
-   * Assemble the candidate email pool to sample from, mixing recent, random historical,
-   * uncategorized, and per-top-domain examples, deduplicated by message id.
+   * Assemble the candidate email pool to sample from, mixing recent, historical, uncategorized, and
+   * per-top-domain examples, deduplicated by message id. Every draw is deterministic for a given
+   * seed (seeded historical/domain spreads, stable-ordered uncategorized), so discovery on an
+   * unchanged inbox is repeatable rather than resampling a different pool each run.
    */
-  private buildDiscoveryPool(accountId: string, topDomains: string[]): EmailSummary[] {
+  private buildDiscoveryPool(
+    accountId: string,
+    topDomains: string[],
+    seed: number,
+  ): EmailSummary[] {
     const recent = this.emails.listSummaries({ accountId, limit: RECENT_POOL });
-    const historical = this.emails.listSummariesRandom(accountId, HISTORICAL_POOL);
-    const uncategorized = this.emails.listUncategorizedSummaries(accountId, UNCATEGORIZED_POOL);
+    const historical = this.emails.listSummariesSeeded(accountId, HISTORICAL_POOL, seed);
+    const uncategorized = this.emails.listUncategorizedSummariesStable(
+      accountId,
+      UNCATEGORIZED_POOL,
+    );
     const domainExamples: EmailSummary[] = [];
-    for (const domain of topDomains) {
+    topDomains.forEach((domain, i) => {
       domainExamples.push(
-        ...this.emails.listSummariesByDomain(accountId, domain, PER_DOMAIN_EXAMPLES),
+        ...this.emails.listSummariesByDomainSeeded(
+          accountId,
+          domain,
+          PER_DOMAIN_EXAMPLES,
+          seed + i + 1,
+        ),
       );
-    }
+    });
     return dedupeById([...recent, ...historical, ...domainExamples, ...uncategorized]);
   }
 
@@ -611,7 +611,7 @@ export class TopicDiscoveryService {
         { role: 'user', content: userPrompt },
       ],
       responseFormat: 'json_object',
-      temperature: 0.2,
+      temperature: 0,
       maxTokens: TOPIC_OUTPUT_TOKENS,
       think: false,
     });
@@ -937,13 +937,14 @@ export function mixedSampleBySender<T extends { fromAddr: string | null }>(
 }
 
 /**
- * Sample for topic discovery by CONTENT variety instead of by sender. Leader-clusters the pool's
- * embeddings into micro-clusters of near-identical mail, then takes one representative (the member
- * nearest its cluster centroid) from each, largest clusters first, filling any shortfall round-robin
- * from the next-nearest members. This shows the LLM one example of every distinct KIND of mail,
- * including the intra-sender variety (LinkedIn jobs vs messages vs invitations) that sender-mixing
- * collapses into a single sender slot. Deterministic for a given seed. Falls back to
- * mixedSampleBySender when too few emails carry an embedding to cluster on.
+ * Sample for topic discovery with two complementary halves. The VARIETY half leader-clusters the
+ * pool's embeddings and takes one representative (the member nearest its centroid) from each of the
+ * largest content clusters, so a loud sender's distinct message types (LinkedIn jobs vs messages vs
+ * invitations) each get an example that plain sender-mixing collapses into one slot. The VOLUME half
+ * is a sender-mixed sample of the rest, so broad high-frequency mail (promotions, newsletters) that
+ * variety sampling spreads thin across many clusters stays visible in proportion to how much of the
+ * inbox it is. Deterministic for a given seed. Falls back to mixedSampleBySender when too few emails
+ * carry an embedding to cluster on.
  */
 export function clusterRepresentativeSample(
   pool: EmailSummary[],
@@ -968,44 +969,83 @@ export function clusterRepresentativeSample(
   const clusters = clusterResidual(points, seed);
   if (clusters.length === 0) return mixedSampleBySender(pool, n, seed);
 
-  // Each cluster's members ordered closest-to-centroid first, so members[0] is the representative;
-  // clusters ordered largest first so the loudest kinds of mail are covered before the long tail.
-  const ranked = clusters
-    .map((c) =>
-      [...c.memberIds].sort((a, b) => {
-        const d = dot(c.centroid, vecById.get(b)!) - dot(c.centroid, vecById.get(a)!);
-        return d !== 0 ? d : compareIds(a, b);
-      }),
-    )
-    .sort((a, b) => b.length - a.length || compareIds(a[0]!, b[0]!));
+  // Variety half: one representative from each of the largest content clusters, largest first.
+  const varietyBudget = Math.ceil(n / 2);
+  const reps = clusters
+    .map((c) => ({ id: representativeId(c, vecById), size: c.size }))
+    .sort((a, b) => b.size - a.size || compareIds(a.id, b.id))
+    .slice(0, varietyBudget)
+    .map((r) => r.id);
+  const picked = new Set(reps);
+  const chosen = reps.map((id) => emailById.get(id)!);
 
-  // Round-robin across clusters: every representative first (max variety), then seconds, thirds, ...
-  const chosen: EmailSummary[] = [];
-  const picked = new Set<string>();
-  for (let layer = 0; chosen.length < n; layer++) {
-    let progressed = false;
-    for (const members of ranked) {
-      if (layer >= members.length) continue;
-      progressed = true;
-      const id = members[layer]!;
-      chosen.push(emailById.get(id)!);
-      picked.add(id);
-      if (chosen.length >= n) break;
+  // Volume half: sender-mixed sample of everything not already chosen, so dominant broad buckets
+  // (which the variety half under-samples by design) show up in proportion to their volume.
+  chosen.push(
+    ...mixedSampleBySender(
+      pool.filter((e) => !picked.has(e.messageId)),
+      n - chosen.length,
+      (seed ^ 0x85ebca6b) >>> 0,
+    ),
+  );
+  return chosen;
+}
+
+/**
+ * Seed each topic's centroid from the emails actually nearest to IT, competitively: every email joins
+ * only its single closest topic (above SEED_FLOOR_COSINE), so one topic cannot poach mail that
+ * belongs to another and the centroid reflects a real cluster rather than the loose lexical
+ * neighbours of the label text. Topics that gather fewer than MIN_CATEGORY_MEMBERS real members are
+ * dropped, so empty and thin mislabelled categories (a "Course Materials" that is really one
+ * newsletter) never persist. Deterministic: input order does not affect the result.
+ */
+export function seedCentroidsCompetitive(
+  kept: ReadonlyArray<{ topic: DiscoveredTopic; vec: Float32Array }>,
+  entries: ReadonlyArray<{ messageId: string; vector: Float32Array }>,
+): StagedTopic[] {
+  const members: Float32Array[][] = kept.map(() => []);
+  for (const e of entries) {
+    let bestIdx = -1;
+    let bestCos = SEED_FLOOR_COSINE;
+    for (let i = 0; i < kept.length; i++) {
+      const cos = dot(kept[i]!.vec, e.vector);
+      if (cos > bestCos) {
+        bestCos = cos;
+        bestIdx = i;
+      }
     }
-    if (!progressed) break; // every cluster exhausted
+    if (bestIdx >= 0) members[bestIdx]!.push(e.vector);
   }
+  const staged: StagedTopic[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const mem = members[i]!;
+    if (mem.length < MIN_CATEGORY_MEMBERS) continue; // drop empty / thin mislabelled categories
+    const centroid = meanNormalize(mem);
+    if (!centroid) continue;
+    staged.push({
+      label: kept[i]!.topic.label,
+      description: kept[i]!.topic.description,
+      centroid,
+      emailCount: mem.length,
+    });
+  }
+  return staged;
+}
 
-  // Points dropped as cluster noise can leave a shortfall; top up sender-diverse from the rest.
-  if (chosen.length < n) {
-    chosen.push(
-      ...mixedSampleBySender(
-        pool.filter((e) => !picked.has(e.messageId)),
-        n - chosen.length,
-        (seed ^ 0x85ebca6b) >>> 0,
-      ),
-    );
+/** The member of a cluster nearest its centroid; ties broken by id so the pick is deterministic. */
+function representativeId(cluster: DiscoveredCluster, vecById: Map<string, Float32Array>): string {
+  let bestId = cluster.memberIds[0]!;
+  let best = -Infinity;
+  for (const id of cluster.memberIds) {
+    const v = vecById.get(id);
+    if (!v) continue;
+    const cos = dot(cluster.centroid, v);
+    if (cos > best || (cos === best && id < bestId)) {
+      best = cos;
+      bestId = id;
+    }
   }
-  return chosen.slice(0, n);
+  return bestId;
 }
 
 /** Stable string comparison for deterministic tie-breaks. */

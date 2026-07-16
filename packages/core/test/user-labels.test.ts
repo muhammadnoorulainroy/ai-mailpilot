@@ -655,9 +655,9 @@ describe('discovery hinting from user labels (Part D/F)', () => {
     const llm = { chat, embed: vi.fn(async () => Array.from(axis(embedN++))) };
     const emailsFake = {
       listSummaries: () => Array.from({ length: 200 }, (_, i) => summary(`m${i}`, `s${i % 5}@x.com`)),
-      listSummariesRandom: () => [],
-      listUncategorizedSummaries: () => [],
-      listSummariesByDomain: () => [],
+      listSummariesSeeded: () => [],
+      listUncategorizedSummariesStable: () => [],
+      listSummariesByDomainSeeded: () => [],
       listSenders: () => Array.from({ length: 250 }, (_, i) => ({ fromAddr: `s${i % 5}@x.com` })),
     };
     const embeddings = { listForAccount: () => [], search: () => [] };

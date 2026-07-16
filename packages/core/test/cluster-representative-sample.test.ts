@@ -1,8 +1,9 @@
 /**
- * Cluster-representative discovery sampling: pick the LLM sample by content variety instead of by
- * sender, so every distinct KIND of mail is represented (including a loud sender's different message
- * types). Verifies full cluster coverage, proportional fill for the largest clusters, that it beats
- * sender-mixing on intra-sender variety, determinism, and the fallbacks (too few embeddings, tiny pool).
+ * Cluster-representative discovery sampling (hybrid): a VARIETY half (one representative per largest
+ * content cluster) plus a VOLUME half (sender-mixed sample of the rest). Verifies full coverage when
+ * the budget allows, that the largest clusters get proportionally more of the sample, that smaller
+ * distinct clusters are still represented when one cluster dominates (the anti-dilution property that
+ * plain sender-mixing loses), determinism, and the fallbacks (too few embeddings, tiny pool).
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -76,18 +77,19 @@ const EIGHT_CLUSTERS: ClusterSpec[] = [
   { cluster: 7, sender: 'h@x.com', count: 5 },
 ];
 
-describe('clusterRepresentativeSample', () => {
+describe('clusterRepresentativeSample (hybrid)', () => {
   it('covers every content cluster and is deterministic', () => {
     const { pool, vectorOf, clusterOf } = buildPool(EIGHT_CLUSTERS);
     const sample = clusterRepresentativeSample(pool, vectorOf, 20, 123);
     expect(sample).toHaveLength(20);
-    expect(distinctClusters(sample, clusterOf)).toBe(8); // one representative from every cluster
+    // varietyBudget = 10 >= 8 clusters, so the variety half alone represents every cluster.
+    expect(distinctClusters(sample, clusterOf)).toBe(8);
 
     const again = clusterRepresentativeSample(pool, vectorOf, 20, 123);
     expect(again.map((e) => e.messageId)).toEqual(sample.map((e) => e.messageId));
   });
 
-  it('gives the largest clusters proportionally more of the sample', () => {
+  it('gives the largest cluster proportionally more of the sample than the smallest', () => {
     const { pool, vectorOf, clusterOf } = buildPool(EIGHT_CLUSTERS);
     const sample = clusterRepresentativeSample(pool, vectorOf, 20, 123);
     const counts = new Map<number, number>();
@@ -95,24 +97,30 @@ describe('clusterRepresentativeSample', () => {
       const c = clusterOf(e.messageId);
       counts.set(c, (counts.get(c) ?? 0) + 1);
     }
-    // The four largest clusters (the two 40s and two 20s) each get an extra pick; the tail gets one.
-    expect(counts.get(0)).toBe(3); // a 40-email cluster
-    expect(counts.get(7)).toBe(2); // a 5-email cluster
+    // The volume half is sender-frequency-weighted, so the 40-email cluster outweighs the 5-email one.
+    expect(counts.get(0)!).toBeGreaterThan(counts.get(7)!);
   });
 
-  it('captures intra-sender variety that sender-mixing collapses', () => {
-    const spec: ClusterSpec[] = [];
-    // One loud sender whose mail spans 12 distinct content clusters, plus a few quiet single-cluster
-    // senders. Sender-mixing gives the loud sender one diversity slot; content clustering does not.
-    for (let k = 0; k < 12; k++) spec.push({ cluster: k, sender: 'jobs@linkedin.com', count: 8 });
-    for (let k = 12; k < 15; k++) spec.push({ cluster: k, sender: `q${k}@x.com`, count: 5 });
+  it('still represents smaller distinct clusters when one cluster dominates the sender', () => {
+    // One loud sender whose mail is one huge content cluster plus several small distinct ones.
+    const spec: ClusterSpec[] = [
+      { cluster: 0, sender: 'jobs@linkedin.com', count: 1000 },
+      { cluster: 1, sender: 'jobs@linkedin.com', count: 15 },
+      { cluster: 2, sender: 'jobs@linkedin.com', count: 12 },
+      { cluster: 3, sender: 'jobs@linkedin.com', count: 10 },
+      { cluster: 4, sender: 'jobs@linkedin.com', count: 8 },
+      { cluster: 5, sender: 'jobs@linkedin.com', count: 6 },
+    ];
     const { pool, vectorOf, clusterOf } = buildPool(spec);
 
-    const clusterSample = clusterRepresentativeSample(pool, vectorOf, 10, 7);
-    const senderSample = mixedSampleBySender(pool, 10, 7);
+    const hybrid = clusterRepresentativeSample(pool, vectorOf, 8, 7);
+    const covered = new Set(hybrid.map((e) => clusterOf(e.messageId)));
+    // varietyBudget = 4: the four largest clusters each get a representative, not just the huge one.
+    for (const c of [0, 1, 2, 3]) expect(covered.has(c)).toBe(true);
 
-    expect(distinctClusters(clusterSample, clusterOf)).toBe(10); // ten distinct kinds in ten slots
-    expect(distinctClusters(clusterSample, clusterOf)).toBeGreaterThan(
+    // Plain sender-mixing drowns in the dominant cluster, so it covers fewer distinct kinds.
+    const senderSample = mixedSampleBySender(pool, 8, 7);
+    expect(distinctClusters(hybrid, clusterOf)).toBeGreaterThan(
       distinctClusters(senderSample, clusterOf),
     );
   });
