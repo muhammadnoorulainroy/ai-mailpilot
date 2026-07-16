@@ -87,6 +87,25 @@ const SELECT_FULL_COLS =
 const SELECT_SUMMARY_COLS =
   'message_id, account_id, folder, subject, from_addr, date, has_attachments, indexed_at';
 
+/** Largest signed 32-bit prime, the modulus for the seeded rowid permutation used to spread samples. */
+const ORDER_MOD = 2147483647;
+
+/**
+ * Turn a seed into (mul, off) for `((rowid * mul) + off) % ORDER_MOD`. Both are spread across the full
+ * 32-bit range first, so mul is large: consecutive rowids then jump by ~mul and wrap the modulus,
+ * scrambling the order. mul is coprime with the prime modulus, so distinct rowids get distinct keys,
+ * making this a deterministic, well-spread permutation rather than a near-sorted-by-rowid list.
+ */
+function seedOrderParams(seed: number): { mul: number; off: number } {
+  const s = seed >>> 0;
+  const m = Math.imul(s ^ 0x9e3779b9, 0x85ebca6b) >>> 0;
+  const o = Math.imul(s ^ 0x638bce77, 0xc2b2ae35) >>> 0;
+  return {
+    mul: 1 + (m % (ORDER_MOD - 1)),
+    off: o % ORDER_MOD,
+  };
+}
+
 /** Reads and writes emails and their search index in the local database. */
 export class EmailRepository {
   private readonly stmts: {
@@ -100,9 +119,11 @@ export class EmailRepository {
     countUnembedded: Statement<unknown[]>;
     listSummariesForAccount: Statement<unknown[]>;
     listSummariesRandomForAccount: Statement<unknown[]>;
+    listSummariesSeededForAccount: Statement<unknown[]>;
     listUncategorizedSummaries: Statement<unknown[]>;
     listUncategorizedSummariesStable: Statement<unknown[]>;
     listSummariesByDomain: Statement<unknown[]>;
+    listSummariesByDomainSeeded: Statement<unknown[]>;
     listIdsForAccount: Statement<unknown[]>;
     listSendersForAccount: Statement<unknown[]>;
   };
@@ -157,6 +178,14 @@ export class EmailRepository {
            ORDER BY RANDOM()
            LIMIT ?`,
       ),
+      // Deterministic spread across the whole account: a seeded linear permutation of rowid, so the
+      // same seed yields the same "random-looking" subset every run (repeatable discovery).
+      listSummariesSeededForAccount: db.prepare(
+        `SELECT ${SELECT_SUMMARY_COLS}
+           FROM emails WHERE account_id = ?
+           ORDER BY ((rowid * ?) + ?) % 2147483647
+           LIMIT ?`,
+      ),
       listUncategorizedSummaries: db.prepare(
         `SELECT ${SELECT_SUMMARY_COLS.split(', ')
           .map((c) => `e.${c}`)
@@ -183,6 +212,12 @@ export class EmailRepository {
         `SELECT ${SELECT_SUMMARY_COLS}
            FROM emails WHERE account_id = ? AND from_addr LIKE ? ESCAPE '\\'
            ORDER BY RANDOM()
+           LIMIT ?`,
+      ),
+      listSummariesByDomainSeeded: db.prepare(
+        `SELECT ${SELECT_SUMMARY_COLS}
+           FROM emails WHERE account_id = ? AND from_addr LIKE ? ESCAPE '\\'
+           ORDER BY ((rowid * ?) + ?) % 2147483647
            LIMIT ?`,
       ),
       listIdsForAccount: db.prepare(
@@ -416,6 +451,21 @@ export class EmailRepository {
     return rows.map((r) => this.summaryFromRow(r));
   }
 
+  /**
+   * Deterministic spread across the whole account: the same seed yields the same subset every run.
+   * Use instead of listSummariesRandom when discovery must be repeatable.
+   */
+  listSummariesSeeded(accountId: string, limit: number, seed: number): EmailSummary[] {
+    const { mul, off } = seedOrderParams(seed);
+    const rows = this.stmts.listSummariesSeededForAccount.all(
+      accountId,
+      mul,
+      off,
+      limit,
+    ) as EmailSummaryDbRow[];
+    return rows.map((r) => this.summaryFromRow(r));
+  }
+
   /** Random summaries for emails that have no category assignment yet. */
   listUncategorizedSummaries(accountId: string, limit: number): EmailSummary[] {
     const rows = this.stmts.listUncategorizedSummaries.all(accountId, limit) as EmailSummaryDbRow[];
@@ -437,6 +487,25 @@ export class EmailRepository {
     const rows = this.stmts.listSummariesByDomain.all(
       accountId,
       `%@${escaped}%`,
+      limit,
+    ) as EmailSummaryDbRow[];
+    return rows.map((r) => this.summaryFromRow(r));
+  }
+
+  /** Deterministic summaries from a single sender domain: the same seed yields the same subset. */
+  listSummariesByDomainSeeded(
+    accountId: string,
+    domain: string,
+    limit: number,
+    seed: number,
+  ): EmailSummary[] {
+    const escaped = domain.replace(/[\\%_]/g, '\\$&');
+    const { mul, off } = seedOrderParams(seed);
+    const rows = this.stmts.listSummariesByDomainSeeded.all(
+      accountId,
+      `%@${escaped}%`,
+      mul,
+      off,
       limit,
     ) as EmailSummaryDbRow[];
     return rows.map((r) => this.summaryFromRow(r));
