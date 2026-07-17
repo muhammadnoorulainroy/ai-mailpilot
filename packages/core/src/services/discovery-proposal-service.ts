@@ -30,6 +30,9 @@ import type { DiscoveredCluster } from './discovery-clustering.js';
 /** Largest clusters named per run, so the prompt and the model's answer stay bounded. */
 export const NAMING_MAX_CLUSTERS = 24;
 const NAMING_OUTPUT_TOKENS = 1800;
+/** Clusters named per LLM call. Naming all at once overflows a local model, which then returns
+ * nothing usable; small batches keep each prompt and answer within reach. */
+const NAMING_BATCH_SIZE = 6;
 
 /** A rejected proposal with the deterministic reason, for the audit trail and later review UI. */
 export interface RejectedProposal {
@@ -109,17 +112,23 @@ export class DiscoveryProposalService {
     // (`/no_think`, `think`), which would pollute or fail an OpenAI-style request.
     const local = provider === 'main';
     const model = local ? generationModelId : cfg.chatModel || generationModelId;
-    const raw = await this.llm.chat({
-      model,
-      provider,
-      messages: buildNamingMessages(namingInputs, { noThink: local }),
-      responseFormat: 'json_object',
-      temperature: 0.2,
-      maxTokens: NAMING_OUTPUT_TOKENS,
-      think: local ? false : undefined,
-    });
-
-    const parsed = parseNamedCandidates(raw, chosen.length);
+    // Name in small batches: one prompt with every cluster overflows a local model and returns nothing
+    // usable. Cluster indices are global (ClusterNamingInput.index), so batch results merge directly.
+    const parsed: ReturnType<typeof parseNamedCandidates> = [];
+    for (let i = 0; i < namingInputs.length; i += NAMING_BATCH_SIZE) {
+      const raw = await this.llm.chat({
+        model,
+        provider,
+        messages: buildNamingMessages(namingInputs.slice(i, i + NAMING_BATCH_SIZE), {
+          noThink: local,
+        }),
+        responseFormat: 'json_object',
+        temperature: 0.2,
+        maxTokens: NAMING_OUTPUT_TOKENS,
+        think: local ? false : undefined,
+      });
+      parsed.push(...parseNamedCandidates(raw, chosen.length));
+    }
     const candidates: NamedCandidate[] = parsed.map((p) => ({
       clusterIndex: p.clusterIndex,
       action: p.action,
