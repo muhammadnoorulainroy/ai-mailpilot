@@ -39,7 +39,6 @@ import { ResidualDiscoveryService } from './services/residual-discovery-service.
 import { DiscoveryProposalService } from './services/discovery-proposal-service.js';
 import { DiscoveryProposalOrchestrator } from './services/discovery-proposal-orchestrator.js';
 import { CategoryCentroidRebuildService } from './services/category-centroid-rebuild-service.js';
-import { ResidualBucketService } from './services/residual-bucket-service.js';
 import { CategoryHealthService } from './services/category-health-service.js';
 import { StructuralProposalService } from './services/structural-proposal-service.js';
 import { TriageOrchestrator } from './services/triage-orchestrator.js';
@@ -77,7 +76,6 @@ export interface Services {
   discoveryProposal: DiscoveryProposalOrchestrator;
   categoryCentroidRebuild: CategoryCentroidRebuildService;
   categoryHealth: CategoryHealthService;
-  residualBucket: ResidualBucketService;
   structuralProposal: StructuralProposalService;
   category: CategoryOrchestrator;
   llmCategorize: LlmCategorizeOrchestrator;
@@ -206,12 +204,6 @@ export function buildContext(): AppContext {
     ),
     categoryCentroidRebuild,
     categoryHealth,
-    residualBucket: new ResidualBucketService(
-      repos.categories,
-      repos.emails,
-      logger,
-      () => config.features.residualBuckets,
-    ),
     structuralProposal: new StructuralProposalService(
       repos.categories,
       repos.categoryProposals,

@@ -26,10 +26,6 @@ const UserLabelSuggestionsQuery = z.object({
   embeddingModelId: z.string().optional(),
 });
 
-const CoverResidualBody = z.object({
-  accountId: z.string().min(1),
-});
-
 const ProposalActionBody = z.object({
   accountId: z.string().min(1),
 });
@@ -391,23 +387,6 @@ export async function registerCategoryRoutes(app: FastifyInstance, ctx: AppConte
       accountId: parsed.data.accountId,
       suggestions: service.suggest(parsed.data.accountId, parsed.data.embeddingModelId),
     };
-  });
-
-  // Cover the uncategorized long tail with signal-matched broad buckets (Newsletters, Promotions,
-  // Notifications). No-op unless features.residualBuckets is enabled. Creates/widens categories and
-  // files matching uncategorized mail by deterministic signal; never reads embeddings or the LLM.
-  app.post('/categories/cover-residual', async (req, reply) => {
-    const parsed = CoverResidualBody.safeParse(req.body);
-    if (!parsed.success) {
-      reply.code(400).send({ error: 'invalid body', issues: parsed.error.issues });
-      return;
-    }
-    const account = ctx.repos.accounts.findById(parsed.data.accountId);
-    if (!account) {
-      reply.code(404).send({ error: 'account not found' });
-      return;
-    }
-    return ctx.services.residualBucket.coverResidual(parsed.data.accountId);
   });
 
   app.get('/folder-plan', async (req, reply) => {

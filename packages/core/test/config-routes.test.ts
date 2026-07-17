@@ -35,7 +35,6 @@ describe('config routes: feature flags', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().features).toEqual({
       multiPrototypeCategories: false,
-      residualBuckets: false,
       clusterRepresentativeSampling: false,
     });
     await app.close();
@@ -95,7 +94,6 @@ describe('config routes: feature flags', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().features).toEqual({
       multiPrototypeCategories: false,
-      residualBuckets: false,
       clusterRepresentativeSampling: false,
     });
     expect(res.json().autoIndex).toBe(true);

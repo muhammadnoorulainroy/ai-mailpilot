@@ -2372,7 +2372,6 @@ describe('redactConfig (M8)', () => {
     // Feature flags carry no secrets and are exposed so the UI can reflect them.
     expect(safe.features).toEqual({
       multiPrototypeCategories: false,
-      residualBuckets: false,
       clusterRepresentativeSampling: false,
     });
   });

@@ -143,32 +143,6 @@ function showContent(): void {
 }
 
 /** Fetches and renders the dashboard for the current account, ignoring results if the account changed mid-request. */
-/**
- * Cover the uncategorized long tail: create/widen broad buckets (Newsletters, Promotions,
- * Notifications) and file matching mail by signal. Only useful when the Experimental flag is on.
- */
-async function coverUncategorized(): Promise<void> {
-  const account = state.currentAccountId;
-  if (!account) return;
-  const btn = $<HTMLButtonElement>('btn-cover-residual');
-  btn.disabled = true;
-  setStatus('Covering uncategorized mail...');
-  try {
-    const res = await coreClient.coverResidual(account);
-    if (res.totalAssigned === 0) {
-      setStatus('No broad buckets matched enough uncategorized mail.');
-    } else {
-      const parts = res.buckets.map((b) => `${b.label} (+${b.assigned})`).join(', ');
-      setStatus(`Filed ${res.totalAssigned} emails: ${parts}`);
-    }
-    await refreshDashboard();
-  } catch (err) {
-    setStatus(err instanceof Error ? err.message : String(err));
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 async function refreshDashboard(): Promise<void> {
   const account = state.currentAccountId;
   if (!account) return;
@@ -635,8 +609,6 @@ async function refreshChatProvider(): Promise<void> {
     priorityCloudProvider = cfg.llm.priorityUseChatProvider
       ? providerLabelFor(cfg.llm.chatBaseUrl)
       : null;
-    const coverBtn = document.getElementById('btn-cover-residual');
-    if (coverBtn) coverBtn.hidden = !(cfg.features?.residualBuckets ?? false);
   } catch {
     chatCloudProvider = null;
     categorizeCloudProvider = null;
@@ -2476,9 +2448,6 @@ function attachHandlers(): void {
   });
   $<HTMLButtonElement>('btn-improve').addEventListener('click', () => {
     void improveCategories();
-  });
-  $<HTMLButtonElement>('btn-cover-residual').addEventListener('click', () => {
-    void coverUncategorized();
   });
   $<HTMLButtonElement>('improve-cancel').addEventListener('click', closeImproveModal);
   $<HTMLButtonElement>('improve-apply').addEventListener('click', () => {
