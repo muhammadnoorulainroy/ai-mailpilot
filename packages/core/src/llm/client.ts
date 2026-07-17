@@ -73,6 +73,11 @@ const ChatCompletionSchema = z.object({
     .optional(),
 });
 
+/** Ollama native /api/chat response, where a suppressed reasoning block leaves content in message.content. */
+const OllamaChatSchema = z.object({
+  message: z.object({ content: z.string() }),
+});
+
 /** A single chat message with its role and text content. */
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
@@ -85,7 +90,10 @@ export interface ChatCompletionOptions {
   maxTokens?: number;
   /** Override the request timeout. Bulk callers pass a larger value for slow local models under load. */
   timeoutMs?: number;
-  /** Ollama reasoning toggle. False asks a thinking model to answer directly, ignored by servers that lack it. */
+  /**
+   * Ollama reasoning toggle. False routes the call through Ollama's native /api/chat, the only endpoint
+   * where a reasoning model actually skips its hidden think block; the OpenAI-compatible path ignores it.
+   */
   think?: boolean;
   /** Which endpoint to call. 'chat' prefers the cloud chat provider when configured, 'main' uses the local baseUrl. Defaults to 'chat'. */
   provider?: 'main' | 'chat';
@@ -189,6 +197,58 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
     }
   }
 
+  /**
+   * Call Ollama's native /api/chat with think disabled. Unlike the OpenAI-compatible endpoint, this one
+   * honors think:false, so a reasoning model answers directly instead of spending the token budget inside
+   * a think block and returning empty content. format:json keeps structured callers on strict JSON.
+   */
+  async function nativeChatCompletion(opts: ChatCompletionOptions): Promise<string> {
+    const { baseUrl, headers } = endpointFor(opts.provider ?? 'chat');
+    const url = `${baseUrl.replace(/\/v1$/, '')}/api/chat`;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const isAbort = (err: unknown): boolean => err instanceof Error && err.name === 'AbortError';
+    try {
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            model: opts.model ?? getConfig().generationModel,
+            messages: opts.messages,
+            stream: false,
+            think: false,
+            ...(opts.responseFormat === 'json_object' ? { format: 'json' } : {}),
+            options: {
+              temperature: opts.temperature ?? 0.2,
+              ...(opts.maxTokens ? { num_predict: opts.maxTokens } : {}),
+            },
+          }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (isAbort(err)) throw new Error(`LLM API /api/chat: timed out after ${timeoutMs}ms`);
+        throw err;
+      }
+      if (!res.ok) {
+        const text = (await res.text()).slice(0, MAX_ERROR_TEXT);
+        throw new LlmApiError(res.status, '/api/chat', text);
+      }
+      let json: unknown;
+      try {
+        json = await res.json();
+      } catch (err) {
+        if (isAbort(err)) throw new Error(`LLM API /api/chat: timed out after ${timeoutMs}ms`);
+        throw new Error('LLM API /api/chat: response was not valid JSON');
+      }
+      return OllamaChatSchema.parse(json).message.content;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   return {
     /** Probe the endpoint, returning ok plus available model ids, or ok false on any failure. */
     async health() {
@@ -232,6 +292,14 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
 
     /** Run a non-streaming chat completion and return the first choice's content. */
     async chat(opts) {
+      if (opts.think === false) {
+        try {
+          return await nativeChatCompletion(opts);
+        } catch (err) {
+          // A local server without Ollama's native endpoint returns 404; fall back to the OpenAI path.
+          if (!(err instanceof LlmApiError && err.status === 404)) throw err;
+        }
+      }
       const result = await request(
         '/chat/completions',
         {

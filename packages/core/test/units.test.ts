@@ -2274,6 +2274,73 @@ describe('LlmClient 429 backoff', () => {
   });
 });
 
+describe('LlmClient think:false native routing', () => {
+  const makeClient = () =>
+    createLlmClient(
+      () =>
+        ({
+          baseUrl: 'http://local/v1',
+          embeddingModel: 'bge-m3',
+          generationModel: 'g',
+          embeddingDimensions: 1024,
+          chatRerank: true,
+          categorizeUseChatProvider: false,
+        }) as never,
+    );
+
+  it('routes think:false to Ollama /api/chat with think disabled and format json', async () => {
+    let calledUrl = '';
+    let sentBody: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      calledUrl = url;
+      sentBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: { role: 'assistant', content: '{"ok":1}' } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const answer = await makeClient().chat({
+        messages: [{ role: 'user', content: 'hi' }],
+        think: false,
+        responseFormat: 'json_object',
+        maxTokens: 500,
+      });
+      expect(answer).toBe('{"ok":1}');
+      expect(calledUrl).toBe('http://local/api/chat');
+      expect(sentBody.think).toBe(false);
+      expect(sentBody.format).toBe('json');
+      expect((sentBody.options as Record<string, unknown>).num_predict).toBe(500);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('falls back to the OpenAI-compatible path when the native endpoint 404s', async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      urls.push(url);
+      if (url.endsWith('/api/chat')) return new Response('not found', { status: 404 });
+      return new Response(
+        JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'fallback' } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const answer = await makeClient().chat({
+        messages: [{ role: 'user', content: 'hi' }],
+        think: false,
+      });
+      expect(answer).toBe('fallback');
+      expect(urls).toEqual(['http://local/api/chat', 'http://local/v1/chat/completions']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe('config PATCH llm merge', () => {
   it('a partial llm patch preserves keys the caller did not send', () => {
     const stored = LlmConfigSchema.parse({
