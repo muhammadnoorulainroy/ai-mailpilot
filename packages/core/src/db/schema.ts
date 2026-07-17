@@ -771,4 +771,55 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 25,
+    name: 'attachment_chunk_context',
+    up: (db) => {
+      // Contextual retrieval for attachment chunks. A chunk lifted out of a PDF carried no trace of
+      // the document it came from, so neither its vector nor its FTS row could be reached by a
+      // question naming the file, sender, or date. `context` holds that header; the FTS index is
+      // rebuilt over (text, context) so a bare MATCH searches both. The update trigger keeps the
+      // external-content index in sync when a backfill fills context in on existing rows.
+      db.exec(`
+        ALTER TABLE attachment_chunks ADD COLUMN context TEXT;
+
+        DROP TRIGGER trg_attachment_chunks_insert;
+        DROP TRIGGER trg_attachment_chunks_delete;
+        DROP TABLE attachment_fts;
+
+        CREATE VIRTUAL TABLE attachment_fts USING fts5(
+          text, context,
+          content='attachment_chunks',
+          content_rowid='rowid',
+          tokenize='unicode61 remove_diacritics 2'
+        );
+
+        INSERT INTO attachment_fts(rowid, text, context)
+          SELECT rowid, text, context FROM attachment_chunks;
+
+        CREATE TRIGGER trg_attachment_chunks_insert
+        AFTER INSERT ON attachment_chunks BEGIN
+          INSERT INTO attachment_fts(rowid, text, context)
+          VALUES (new.rowid, new.text, new.context);
+        END;
+
+        CREATE TRIGGER trg_attachment_chunks_delete
+        AFTER DELETE ON attachment_chunks BEGIN
+          DELETE FROM attachment_chunk_embedding_index WHERE chunk_rowid = OLD.rowid;
+          INSERT INTO attachment_fts(attachment_fts, rowid, text, context)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.context);
+        END;
+
+        CREATE TRIGGER trg_attachment_chunks_update
+        AFTER UPDATE ON attachment_chunks
+        WHEN old.text IS NOT new.text OR old.context IS NOT new.context
+        BEGIN
+          INSERT INTO attachment_fts(attachment_fts, rowid, text, context)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.context);
+          INSERT INTO attachment_fts(rowid, text, context)
+          VALUES (new.rowid, new.text, new.context);
+        END;
+      `);
+    },
+  },
 ];

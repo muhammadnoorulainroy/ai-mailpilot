@@ -5,7 +5,11 @@
  * must name only generic email functions, never domain categories, so it generalizes across mailboxes.
  */
 import { describe, it, expect } from 'vitest';
-import { withEmbeddingInstruction, isInstructionTunedEmbedding } from '../src/util/text.js';
+import {
+  withEmbeddingInstruction,
+  isInstructionTunedEmbedding,
+  buildChunkContext,
+} from '../src/util/text.js';
 
 describe('withEmbeddingInstruction', () => {
   it('passes text through unchanged for non-instruction models', () => {
@@ -41,5 +45,46 @@ describe('withEmbeddingInstruction', () => {
     for (const banned of ['job', 'linkedin', 'github', 'bank', 'developer', 'course', 'student']) {
       expect(doc).not.toContain(banned);
     }
+  });
+
+  it('gives attachment excerpts their own instruction, not the email-purpose taxonomy', () => {
+    const out = withEmbeddingInstruction('clause 4', 'qwen3-embedding:0.6b', 'attachment');
+    expect(out).toContain('document');
+    expect(out).not.toContain('purpose and type');
+    expect(out.endsWith('\nQuery: clause 4')).toBe(true);
+  });
+
+  it('names no domain-specific category in the attachment instruction either', () => {
+    const att = withEmbeddingInstruction('x', 'qwen3-embedding:0.6b', 'attachment').toLowerCase();
+    for (const banned of ['insurance', 'contract', 'invoice', 'grade', 'bank', 'course']) {
+      expect(att).not.toContain(banned);
+    }
+  });
+});
+
+describe('buildChunkContext (contextual retrieval)', () => {
+  const parts = {
+    filename: 'Contrat Habitation ADH 2024.pdf',
+    subject: 'Votre contrat',
+    fromAddr: 'contact@adh-assurances.fr',
+    date: Date.UTC(2024, 2, 15),
+  };
+
+  it('situates a chunk with the document name, sender, date, and subject', () => {
+    const ctx = buildChunkContext(parts);
+    expect(ctx).toBe(
+      'Document: Contrat Habitation ADH 2024.pdf | From: contact@adh-assurances.fr | ' +
+        'Date: 2024-03-15 | Subject: Votre contrat',
+    );
+  });
+
+  it('omits fields it does not know rather than emitting empty labels', () => {
+    expect(buildChunkContext({ filename: 'a.pdf' })).toBe('Document: a.pdf');
+    expect(buildChunkContext({ filename: 'a.pdf', subject: '  ' })).toBe('Document: a.pdf');
+    expect(buildChunkContext({})).toBe('');
+  });
+
+  it('drops an unparseable date instead of writing "Invalid Date"', () => {
+    expect(buildChunkContext({ filename: 'a.pdf', date: Number.NaN })).toBe('Document: a.pdf');
   });
 });

@@ -260,7 +260,7 @@ export function buildContext(): AppContext {
       repos.attachments,
       logger,
     ),
-    attachment: new AttachmentService(llm, repos.attachments, logger),
+    attachment: new AttachmentService(llm, repos.attachments, repos.emails, logger),
   };
 
   logger.info({ llmBaseUrl: config.llm.baseUrl }, 'context initialized');

@@ -107,8 +107,47 @@ export function buildEmbeddingInput(
   return lines.join('\n');
 }
 
-/** Whether embedding input is stored content (clustered/matched) or a search query. */
-export type EmbeddingKind = 'document' | 'query';
+/**
+ * Format an epoch-ms timestamp as YYYY-MM-DD, or '' when absent or invalid.
+ */
+function isoDay(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '';
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+}
+
+/**
+ * The parent document's identity for one attachment chunk.
+ */
+export interface ChunkContextParts {
+  filename?: string | null;
+  subject?: string | null;
+  fromAddr?: string | null;
+  date?: number | null;
+}
+
+/**
+ * Situate an attachment chunk in the document it came from. A chunk lifted out of a PDF carries no
+ * clue which file, sender, or date it belongs to, so a question naming the document ("my Revolut
+ * deposit insurance limit") cannot reach a chunk whose text never repeats the name. Prefixing the
+ * parent's identity is the cheap, deterministic form of contextual retrieval: no per-chunk LLM call,
+ * and the same header is indexed for keyword search so an exact name in the filename is matchable.
+ */
+export function buildChunkContext(parts: ChunkContextParts): string {
+  const fields: string[] = [];
+  const filename = parts.filename?.trim();
+  const from = parts.fromAddr?.trim();
+  const subject = parts.subject?.trim();
+  const day = isoDay(parts.date);
+  if (filename) fields.push(`Document: ${filename}`);
+  if (from) fields.push(`From: ${from}`);
+  if (day) fields.push(`Date: ${day}`);
+  if (subject) fields.push(`Subject: ${subject}`);
+  return fields.join(' | ');
+}
+
+/** Whether embedding input is stored email content, an attachment excerpt, or a search query. */
+export type EmbeddingKind = 'document' | 'query' | 'attachment';
 
 /**
  * Instruction-tuned embedding models (Qwen3-Embedding) take a task instruction that steers the vector.
@@ -117,12 +156,19 @@ export type EmbeddingKind = 'document' | 'query';
  * RETRIEVAL instruction. The purpose instruction names only generic, universal email FUNCTIONS, never
  * domain categories, so it generalizes across mailboxes and keeps every user in one shared embedding
  * space (required for federated learning).
+ *
+ * Attachment excerpts take their own instruction: they are retrieval-only (never clustered into
+ * categories), and a contract clause or a grade table is not a "request" or "notification", so
+ * steering them with the email-purpose taxonomy describes the wrong thing.
  */
 const EMBED_INSTRUCTIONS: Record<EmbeddingKind, string> = {
   document:
     'Represent this email by its purpose and type (such as a request, a notification, a confirmation, ' +
     'an announcement, a newsletter, a report, or an alert), so emails of the same type group together ' +
     'regardless of sender or wording.',
+  attachment:
+    'Represent this excerpt from a document attached to an email, together with the document it ' +
+    'belongs to, so it can be retrieved by a question about that document.',
   query: 'Given a search query, retrieve emails relevant to the query.',
 };
 

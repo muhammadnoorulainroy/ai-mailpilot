@@ -27,7 +27,9 @@ function buildPdf(text: string): Uint8Array {
     }
   }
   if (cur) lines.push(cur);
-  const streamBody = lines.map((ln, i) => `BT /F1 11 Tf 72 ${720 - i * 16} Td (${ln}) Tj ET`).join('\n');
+  const streamBody = lines
+    .map((ln, i) => `BT /F1 11 Tf 72 ${720 - i * 16} Td (${ln}) Tj ET`)
+    .join('\n');
   const objs = [
     '<< /Type /Catalog /Pages 2 0 R >>',
     '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
@@ -78,7 +80,10 @@ describe('chunkText', () => {
   });
 
   it('splits long text into overlapping chunks that cover all content', () => {
-    const sentences = Array.from({ length: 60 }, (_, i) => `Sentence number ${i} about the project deadline.`).join(' ');
+    const sentences = Array.from(
+      { length: 60 },
+      (_, i) => `Sentence number ${i} about the project deadline.`,
+    ).join(' ');
     const chunks = chunkText(sentences, { maxChars: 400, overlapChars: 80 });
     expect(chunks.length).toBeGreaterThan(1);
     chunks.forEach((c) => expect(c.length).toBeLessThanOrEqual(400));
@@ -96,20 +101,27 @@ describe('extractAttachmentText', () => {
   });
 
   it('strips HTML attachments', async () => {
-    const html = new TextEncoder().encode('<html><body><p>Hello <b>viva</b> schedule</p></body></html>');
+    const html = new TextEncoder().encode(
+      '<html><body><p>Hello <b>viva</b> schedule</p></body></html>',
+    );
     const r = await extractAttachmentText(html, 'note.html', 'text/html');
     expect(r.text).toContain('viva schedule');
     expect(r.text).not.toContain('<b>');
   });
 
   it('extracts text from a real PDF', async () => {
-    const r = await extractAttachmentText(buildPdf('Project viva on June 4 2018'), 'schedule.pdf', 'application/pdf');
+    const r = await extractAttachmentText(
+      buildPdf('Project viva on June 4 2018'),
+      'schedule.pdf',
+      'application/pdf',
+    );
     expect(r.status).toBe('extracted');
     expect(r.text).toContain('Project viva on June 4 2018');
   });
 
   it('extracts the FULL text of a multi-line PDF (no truncation)', async () => {
-    const full = 'Internal memo. The Q3 budget deadline is July 15 2026. The project codename is BLUEFOX and the lead is Maxime.';
+    const full =
+      'Internal memo. The Q3 budget deadline is July 15 2026. The project codename is BLUEFOX and the lead is Maxime.';
     const r = await extractAttachmentText(buildPdf(full), 'memo.pdf', 'application/pdf');
     expect(r.text).toContain('budget deadline');
     expect(r.text).toContain('codename is BLUEFOX');
@@ -129,7 +141,9 @@ describe('extractAttachmentText', () => {
   });
 
   it('classifies password-protected PDF errors as terminal (so they are not retried)', () => {
-    expect(isEncryptedPdfError({ name: 'PasswordException', message: 'No password given' })).toBe(true);
+    expect(isEncryptedPdfError({ name: 'PasswordException', message: 'No password given' })).toBe(
+      true,
+    );
     expect(isEncryptedPdfError({ name: 'PasswordException', message: '' })).toBe(true);
     expect(isEncryptedPdfError(new Error('Incorrect Password'))).toBe(true);
     expect(isEncryptedPdfError(new Error('Invalid PDF structure'))).toBe(false);
@@ -162,9 +176,19 @@ describe('AttachmentRepository', () => {
   /** Seeds an account, email, attachment and two extracted chunks, returning the account id and chunk rowids. */
   function seedAttachment(): { accountId: string; rowids: number[] } {
     const acct = accounts.create({ address: 'a@x.y', kind: 'work' });
-    emails.upsertBatch([{ messageId: 'm1', accountId: acct.id, folder: 'INBOX', subject: 'Report' }]);
-    const { id } = attachments.upsertAttachment({ messageId: 'm1', accountId: acct.id, filename: 'report.pdf', partName: '1.2' });
-    const rowids = attachments.replaceChunks(id, 'm1', acct.id, ['budget deadline July', 'viva schedule June']);
+    emails.upsertBatch([
+      { messageId: 'm1', accountId: acct.id, folder: 'INBOX', subject: 'Report' },
+    ]);
+    const { id } = attachments.upsertAttachment({
+      messageId: 'm1',
+      accountId: acct.id,
+      filename: 'report.pdf',
+      partName: '1.2',
+    });
+    const rowids = attachments.replaceChunks(id, 'm1', acct.id, [
+      'budget deadline July',
+      'viva schedule June',
+    ]);
     attachments.setStatus(id, 'extracted', 40);
     return { accountId: acct.id, rowids };
   }
@@ -192,22 +216,73 @@ describe('AttachmentRepository', () => {
     void acctEmails;
     expect(attachments.keywordSearchChunks(accountId, 'budget', 5).length).toBe(1);
 
-    const a = attachments.upsertAttachment({ messageId: 'm1', accountId, filename: 'report.pdf', partName: '1.2' });
+    const a = attachments.upsertAttachment({
+      messageId: 'm1',
+      accountId,
+      filename: 'report.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a.id, 'm1', accountId, ['zebra migration patterns']);
     expect(attachments.keywordSearchChunks(accountId, 'budget', 5)).toEqual([]);
     expect(attachments.keywordSearchChunks(accountId, 'zebra', 5).length).toBe(1);
   });
 
+  it('indexes a chunk context so the document name is findable in text that never repeats it', () => {
+    const acct = accounts.create({ address: 'a@x.y', kind: 'work' });
+    emails.upsertBatch([
+      { messageId: 'm2', accountId: acct.id, folder: 'INBOX', subject: 'Votre contrat' },
+    ]);
+    const { id } = attachments.upsertAttachment({
+      messageId: 'm2',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADH 2024.pdf',
+      partName: '1.2',
+    });
+    // The chunk body never names the insurer; only the context header does.
+    const rowids = attachments.replaceChunks(
+      id,
+      'm2',
+      acct.id,
+      ['Les garanties sont accordees du 01/01/2024 au 31/12/2024.'],
+      'Document: Contrat Habitation ADH 2024.pdf | From: contact@adh-assurances.fr',
+    );
+    attachments.setStatus(id, 'extracted', 60);
+
+    // Without the indexed context this returns nothing: "ADH" appears nowhere in the chunk text.
+    expect(attachments.keywordSearchChunks(acct.id, 'ADH', 5)).toContain(rowids[0]);
+    expect(attachments.keywordSearchChunks(acct.id, 'garanties', 5)).toContain(rowids[0]);
+  });
+
+  it('keeps the FTS index in sync when a backfill fills context in on an existing chunk', () => {
+    const { accountId, rowids } = seedAttachment();
+    expect(attachments.keywordSearchChunks(accountId, 'Revolut', 5)).toEqual([]);
+
+    db.prepare('UPDATE attachment_chunks SET context = ? WHERE rowid = ?').run(
+      'Document: Revolut deposit insurance.pdf',
+      rowids[0]!,
+    );
+
+    expect(attachments.keywordSearchChunks(accountId, 'Revolut', 5)).toContain(rowids[0]);
+    // The original text stays searchable after the update.
+    expect(attachments.keywordSearchChunks(accountId, 'budget', 5)).toContain(rowids[0]);
+  });
+
   it('skips re-extracting an already-extracted attachment (idempotent upsert status)', () => {
     const { accountId } = seedAttachment();
-    const again = attachments.upsertAttachment({ messageId: 'm1', accountId, filename: 'report.pdf', partName: '1.2' });
+    const again = attachments.upsertAttachment({
+      messageId: 'm1',
+      accountId,
+      filename: 'report.pdf',
+      partName: '1.2',
+    });
     expect(again.priorStatus).toBe('extracted');
   });
 
   it('deleting the email cascades to attachments, chunks, embeddings, and FTS', () => {
     const { accountId, rowids } = seedAttachment();
     attachments.saveChunkEmbedding(rowids[0]!, accountId, 'bge-m3', vec(0));
-    const count = (t: string): number => (db.prepare(`SELECT count(*) AS c FROM ${t}`).get() as { c: number }).c;
+    const count = (t: string): number =>
+      (db.prepare(`SELECT count(*) AS c FROM ${t}`).get() as { c: number }).c;
     expect(count('attachments')).toBe(1);
     expect(count('attachment_chunks')).toBe(2);
     expect(count('attachment_chunk_embedding_index')).toBe(1);
