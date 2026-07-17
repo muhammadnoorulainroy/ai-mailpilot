@@ -88,6 +88,7 @@ export function redactConfig(config: AppConfig): SafeConfig {
     features: {
       multiPrototypeCategories: config.features.multiPrototypeCategories,
       clusterRepresentativeSampling: config.features.clusterRepresentativeSampling,
+      crossEncoderRerank: config.features.crossEncoderRerank,
     },
   };
 }

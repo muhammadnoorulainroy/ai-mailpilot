@@ -99,6 +99,7 @@ export interface ServerConfig {
   features?: {
     multiPrototypeCategories?: boolean;
     clusterRepresentativeSampling?: boolean;
+    crossEncoderRerank?: boolean;
   };
 }
 

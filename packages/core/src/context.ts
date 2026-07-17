@@ -27,6 +27,7 @@ import { CategorizationService } from './services/categorization-service.js';
 import { CategoryImprovementService } from './services/category-improvement-service.js';
 import { CategoryOrchestrator } from './services/category-orchestrator.js';
 import { ChatService } from './services/chat-service.js';
+import { RerankerClient } from './services/reranker-client.js';
 import { CorrectionService } from './services/correction-service.js';
 import { DashboardService } from './services/dashboard-service.js';
 import { EmailAssistantService } from './services/email-assistant-service.js';
@@ -134,6 +135,10 @@ export function buildContext(): AppContext {
   const llmCategorizer = new LlmCategorizer(llm);
 
   const multiPrototypeEnabled = (): boolean => config.features.multiPrototypeCategories;
+
+  // Optional local cross-encoder reranker: created only when opted in, so its warm Python sidecar and
+  // model download are never spawned by default. When absent, chat reranking uses fusion / LLM order.
+  const reranker = config.features.crossEncoderRerank ? new RerankerClient({ logger }) : undefined;
   const residualDiscovery = new ResidualDiscoveryService(
     repos.embeddings,
     repos.categories,
@@ -259,6 +264,7 @@ export function buildContext(): AppContext {
       repos.conversations,
       repos.attachments,
       logger,
+      reranker,
     ),
     attachment: new AttachmentService(llm, repos.attachments, repos.emails, logger),
   };

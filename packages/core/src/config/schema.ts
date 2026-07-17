@@ -41,6 +41,8 @@ export const FeaturesConfigSchema = z.object({
   multiPrototypeCategories: z.boolean().default(false),
   /** Sample discovery by content-cluster representatives instead of by sender, for variety coverage. */
   clusterRepresentativeSampling: z.boolean().default(false),
+  /** Rerank chat retrieval with a local cross-encoder sidecar (ml/rerank_server.py) instead of an LLM. */
+  crossEncoderRerank: z.boolean().default(false),
 });
 
 /** Zod schema for the full application configuration. */

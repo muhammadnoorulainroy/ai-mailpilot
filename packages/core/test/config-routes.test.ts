@@ -36,6 +36,7 @@ describe('config routes: feature flags', () => {
     expect(res.json().features).toEqual({
       multiPrototypeCategories: false,
       clusterRepresentativeSampling: false,
+      crossEncoderRerank: false,
     });
     await app.close();
   });
@@ -95,6 +96,7 @@ describe('config routes: feature flags', () => {
     expect(res.json().features).toEqual({
       multiPrototypeCategories: false,
       clusterRepresentativeSampling: false,
+      crossEncoderRerank: false,
     });
     expect(res.json().autoIndex).toBe(true);
     await app.close();

@@ -2440,6 +2440,7 @@ describe('redactConfig (M8)', () => {
     expect(safe.features).toEqual({
       multiPrototypeCategories: false,
       clusterRepresentativeSampling: false,
+      crossEncoderRerank: false,
     });
   });
 

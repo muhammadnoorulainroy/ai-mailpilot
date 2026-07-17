@@ -407,6 +407,22 @@
                 <span class="toggle-track"><span class="toggle-thumb"></span></span>
               </label>
             </div>
+
+            <div class="row-between" style="margin-top: var(--space-4)">
+              <div>
+                <div class="label">Cross-encoder chat reranking</div>
+                <span class="hint"
+                  >Rank chat search results with a local cross-encoder model instead of the language
+                  model, for more accurate sources on local answers. Requires the Python reranker
+                  dependencies (see ml/requirements-rerank.txt); downloads a model on first use.
+                  Stays on your machine.</span
+                >
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="toggle-cross-encoder-rerank" />
+                <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              </label>
+            </div>
           </div>
 
           <div class="card">
