@@ -100,6 +100,7 @@ export interface ServerConfig {
     multiPrototypeCategories?: boolean;
     clusterRepresentativeSampling?: boolean;
     crossEncoderRerank?: boolean;
+    llmQueryUnderstanding?: boolean;
   };
 }
 

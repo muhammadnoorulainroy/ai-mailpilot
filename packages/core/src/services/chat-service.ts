@@ -560,7 +560,7 @@ export function matchNamedDocument(
 }
 
 const WANTS_DATES =
-  /\b(date|dates|p[ée]riode|validit|valable|valid|d[ée]but|\bfin\b|start|end|dur[ée]e|duration|garantie|effet|expir|deadline|[ée]ch[ée]ance)\b/i;
+  /\b(date|dates|p[ée]riode|period|validit|valable|valid|coverage|cover|d[ée]but|\bfin\b|start|end|dur[ée]e|duration|garantie|effet|expir|deadline|[ée]ch[ée]ance)\b/i;
 const DATE_PATTERN = /\b\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{2,4}\b/g;
 const PERIOD_MARKERS =
   /\b(valable|comprise\s+entre|date\s+d['e ]?effet|date\s+de\s+fin|effet\s+des\s+garanties|garanties?\s+(?:sont\s+)?accord|valid\s+(?:from|until)|p[ée]riode\s+comprise|du\s+\d.*\bau\s+\d)\b/i;
@@ -579,14 +579,16 @@ const BILINGUAL_GROUPS: string[][] = [
   ['defense', 'soutenance'],
   ['summary', 'resume'],
   ['attachment', 'piece jointe'],
+  ['coverage', 'couverture', 'garantie', 'garanties'],
+  ['period', 'periode', 'duration', 'duree', 'validity', 'validite'],
 ];
 
 /**
- * Append cross-language equivalents of any document/concept terms the query uses, so retrieval can
- * match a document written in the other language. Retrieval only, the generation question is left
- * as the user wrote it.
+ * Cross-language equivalents of any document/concept terms the query uses, so retrieval and filename
+ * matching can reach a document written in the other language. Returns only the ADDED terms (not the
+ * original words), so callers can merge them with other sources such as LLM query analysis.
  */
-export function expandQueryBilingual(query: string): string {
+export function bilingualExpansionTerms(query: string): string[] {
   const norm = normalizeForMatch(query);
   const additions: string[] = [];
   for (const group of BILINGUAL_GROUPS) {
@@ -598,7 +600,79 @@ export function expandQueryBilingual(query: string): string {
       }
     }
   }
-  return additions.length > 0 ? `${query} ${additions.join(' ')}` : query;
+  return additions;
+}
+
+/** Append `terms` to `query`, skipping any already present. Used to build a retrieval/match query. */
+export function withExpansionTerms(query: string, terms: string[]): string {
+  const norm = normalizeForMatch(query);
+  const add = terms.filter(
+    (t, i) => t && !norm.includes(normalizeForMatch(t)) && terms.indexOf(t) === i,
+  );
+  return add.length > 0 ? `${query} ${add.join(' ')}` : query;
+}
+
+/**
+ * Append cross-language equivalents of the query's document/concept terms, so retrieval can match a
+ * document written in the other language. Retrieval only; the generation question is left as written.
+ */
+export function expandQueryBilingual(query: string): string {
+  return withExpansionTerms(query, bilingualExpansionTerms(query));
+}
+
+/** Structured understanding of a chat query, used to steer retrieval across languages and toward dates. */
+export interface QueryAnalysis {
+  /** Cross-language equivalents and key synonyms to ADD to the retrieval and filename-match query. */
+  expansionTerms: string[];
+  /** True if the question asks about a date, period, validity, duration, deadline, or expiry. */
+  wantsDates: boolean;
+}
+
+const QUERY_ANALYSIS_TOKENS = 200;
+
+/**
+ * Prompt for the query-understanding step: turn a question into retrieval hints without answering it.
+ * The model lists cross-language (French<->English) equivalents of the key nouns/topics, so a query in
+ * one language can reach a document written in the other, and flags whether the question seeks a date
+ * or period. Learned, so it generalizes beyond a fixed synonym table (the industry-standard approach).
+ */
+export function buildQueryAnalysisPrompt(question: string): string {
+  return (
+    `You prepare a search over the user's emails, which may be written in French OR English. For the ` +
+    `question below, return ONLY a JSON object:\n` +
+    `{"expansionTerms": string[], "wantsDates": boolean}\n` +
+    `- expansionTerms: TRANSLATE the key nouns and topics into the OTHER language (if the question is ` +
+    `English, give the FRENCH words; if French, give the English words), so a query in one language ` +
+    `can match a document written in the other. Up to 6 SHORT lowercase terms; do NOT repeat words ` +
+    `already in the question. Example: "home insurance contract" -> ["assurance","habitation","contrat","logement"].\n` +
+    `- wantsDates: true if the question asks about any date, time period, validity, duration, coverage ` +
+    `period, deadline, start/end, or expiry; otherwise false.\n\n` +
+    `Question: "${question}"`
+  );
+}
+
+/** Parse the query-analysis JSON defensively; returns null if it is missing or carries nothing usable. */
+export function parseQueryAnalysis(raw: string): QueryAnalysis | null {
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const obj = JSON.parse(match[0]) as { expansionTerms?: unknown; wantsDates?: unknown };
+    const terms = Array.isArray(obj.expansionTerms)
+      ? [
+          ...new Set(
+            obj.expansionTerms
+              .filter((t): t is string => typeof t === 'string')
+              .map((t) => t.trim().toLowerCase())
+              .filter((t) => t.length > 0 && t.length <= 40),
+          ),
+        ].slice(0, 8)
+      : [];
+    const wantsDates = obj.wantsDates === true;
+    if (terms.length === 0 && !wantsDates) return null;
+    return { expansionTerms: terms, wantsDates };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -610,6 +684,7 @@ export function expandQueryBilingual(query: string): string {
 export function rankChunksByLexicalOverlap<T extends { text: string }>(
   chunks: T[],
   query: string,
+  wantsDatesOverride?: boolean,
 ): T[] {
   const expanded = expandQueryBilingual(query);
   const qTokens = [
@@ -619,7 +694,7 @@ export function rankChunksByLexicalOverlap<T extends { text: string }>(
         .filter((t) => t.length >= 4),
     ),
   ];
-  const wantsDates = WANTS_DATES.test(expanded);
+  const wantsDates = wantsDatesOverride ?? WANTS_DATES.test(expanded);
   if (qTokens.length === 0 && !wantsDates) return chunks;
   return chunks
     .map((c, i) => {
@@ -826,6 +901,10 @@ export interface ChatParams {
    * sets this false for local and reranking then keeps fusion order. Defaults to true when unset.
    */
   rerankWithLlm?: boolean;
+  /** Run an LLM query-understanding pass to steer retrieval across languages and toward dates. Off by default. */
+  analyzeQuery?: boolean;
+  /** True when answering on a cloud model, which has a larger context window than a local one. */
+  cloud?: boolean;
   /** Whether the answer model streams reasoning in think tags, as local qwen3 does. Default true. */
   thinking?: boolean;
   /** Max answer tokens, overrides ANSWER_TOKENS. */
@@ -1008,6 +1087,39 @@ export class ChatService {
   }
 
   /**
+   * LLM query understanding: derive cross-language expansion terms and a date-intent flag with one
+   * fast call, so retrieval can reach a document written in the other language and boost date chunks
+   * for a date question, without relying on a hand-maintained synonym table. Returns null when the
+   * feature is off or the call fails, so callers fall back to the deterministic heuristics.
+   */
+  private async analyzeQuery(question: string, params: ChatParams): Promise<QueryAnalysis | null> {
+    if (params.analyzeQuery !== true) return null;
+    try {
+      const suppress = params.thinking === true;
+      const prompt = buildQueryAnalysisPrompt(question);
+      const raw = await this.llm.chat({
+        model: params.condenseModelId,
+        messages: [{ role: 'user', content: suppress ? `${prompt}\n${NO_THINK}` : prompt }],
+        temperature: 0,
+        maxTokens: QUERY_ANALYSIS_TOKENS,
+        responseFormat: 'json_object',
+        timeoutMs: CONDENSE_TIMEOUT_MS,
+      });
+      const analysis = parseQueryAnalysis(stripThinking(raw));
+      if (analysis) {
+        this.logger.info(
+          { terms: analysis.expansionTerms.length, wantsDates: analysis.wantsDates },
+          'chat: query analyzed',
+        );
+      }
+      return analysis;
+    } catch (err) {
+      this.logger.warn({ err }, 'chat: query analysis failed (kept heuristics)');
+      return null;
+    }
+  }
+
+  /**
    * Condense a follow-up into a standalone question using the fast generation model. Returns the
    * original question for first turns or on failure.
    */
@@ -1080,12 +1192,24 @@ export class ChatService {
     userQuestion: string = query,
     anchorIds: string[] = [],
   ): Promise<RetrievedEmail[]> {
+    // Query understanding: LLM expansion terms (when enabled) merged with the deterministic bilingual
+    // groups, plus a language-agnostic date-intent flag. Both fix cross-lingual retrieval and English
+    // date questions; the LLM layer generalizes beyond the fixed synonym table when it is on.
+    const analysis = await this.analyzeQuery(query, params);
+    const extraTerms = analysis?.expansionTerms ?? [];
+    const wantsDates =
+      (analysis?.wantsDates ?? false) || WANTS_DATES.test(query) || WANTS_DATES.test(userQuestion);
+
+    const namedQuery = withExpansionTerms(userQuestion, [
+      ...bilingualExpansionTerms(userQuestion),
+      ...extraTerms,
+    ]);
     const named = isAggregateQuery(userQuestion)
       ? null
-      : this.matchNamedAttachment(accountId, userQuestion);
+      : this.matchNamedAttachment(accountId, namedQuery);
     if (named) {
       this.logger.info({ filename: named.filename }, 'chat: filename-targeted retrieval');
-      return this.retrieveFromNamedDocument(accountId, named, userQuestion, params);
+      return this.retrieveFromNamedDocument(accountId, named, userQuestion, params, wantsDates);
     }
 
     const modelId = params.embeddingModelId;
@@ -1096,7 +1220,11 @@ export class ChatService {
     const rangeLimit = Math.max(RANGE_CANDIDATES, overfetch);
 
     const scope = parseTimeScope(query, Date.now());
-    const semanticQuery = expandQueryBilingual(scope ? stripTimeScope(query, scope) : query);
+    const base = scope ? stripTimeScope(query, scope) : query;
+    const semanticQuery = withExpansionTerms(base, [
+      ...bilingualExpansionTerms(base),
+      ...extraTerms,
+    ]);
 
     const qvec = await this.llm.embed(semanticQuery, modelId, 'query');
     const vectorHits = this.embeddings.search(accountId, modelId, qvec, overfetch);
@@ -1162,7 +1290,7 @@ export class ChatService {
 
     if (anchorIds.length > 0) this.includeAnchors(accountId, result, anchorIds, !scope);
 
-    if (!scope) this.expandWithEmailAttachments(accountId, result, userQuestion);
+    if (!scope) this.expandWithEmailAttachments(accountId, result, userQuestion, wantsDates);
 
     return dedupeDocumentVersions(result, userQuestion);
   }
@@ -1247,6 +1375,7 @@ export class ChatService {
     accountId: string,
     items: RetrievedEmail[],
     query: string,
+    wantsDates?: boolean,
   ): void {
     const present = new Set(items.filter((i) => i.attachmentName).map((i) => i.body));
     const expanded = new Set<string>();
@@ -1261,7 +1390,10 @@ export class ChatService {
         ATTACH_SCAN_MAX,
       );
       if (chunks.length === 0) continue;
-      for (const c of rankChunksByLexicalOverlap(chunks, query).slice(0, ATTACH_EXPAND_TOP)) {
+      for (const c of rankChunksByLexicalOverlap(chunks, query, wantsDates).slice(
+        0,
+        ATTACH_EXPAND_TOP,
+      )) {
         if (present.has(c.text)) continue;
         present.add(c.text);
         additions.push({
@@ -1408,11 +1540,11 @@ export class ChatService {
     match: { attachmentId: string; messageId: string; filename: string },
     query: string,
     params: ChatParams,
+    wantsDates?: boolean,
   ): RetrievedEmail[] {
-    const local = params.thinking === true;
-    const maxChunks = local ? NAMED_DOC_CHUNKS_LOCAL : NAMED_DOC_CHUNKS_CLOUD;
+    const maxChunks = params.cloud ? NAMED_DOC_CHUNKS_CLOUD : NAMED_DOC_CHUNKS_LOCAL;
     const chunks = this.attachments.loadAllChunksForAttachment(accountId, match.attachmentId);
-    const ranked = rankChunksByLexicalOverlap(chunks, query).slice(0, maxChunks);
+    const ranked = rankChunksByLexicalOverlap(chunks, query, wantsDates).slice(0, maxChunks);
     const email = this.emails.findById(match.messageId, accountId);
     const items: RetrievedEmail[] = ranked.map((c) => ({
       messageId: match.messageId,

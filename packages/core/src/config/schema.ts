@@ -43,6 +43,8 @@ export const FeaturesConfigSchema = z.object({
   clusterRepresentativeSampling: z.boolean().default(false),
   /** Rerank chat retrieval with a local cross-encoder sidecar (ml/rerank_server.py) instead of an LLM. */
   crossEncoderRerank: z.boolean().default(false),
+  /** Run an LLM query-understanding pass before chat retrieval (cross-language terms, date intent). */
+  llmQueryUnderstanding: z.boolean().default(false),
 });
 
 /** Zod schema for the full application configuration. */

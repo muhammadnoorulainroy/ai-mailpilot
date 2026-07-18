@@ -60,6 +60,9 @@ import {
   filenameMatchScore,
   dedupeDocumentVersions,
   expandQueryBilingual,
+  bilingualExpansionTerms,
+  withExpansionTerms,
+  parseQueryAnalysis,
   rankChunksByLexicalOverlap,
   makeThinkSplitter,
   parseRerankOrder,
@@ -393,6 +396,55 @@ describe('normalizeForMatch / normalizeFilename', () => {
   it('normalizeFilename additionally splits camelCase for run-together filenames', () => {
     expect(normalizeFilename('StagesEtranger-1.pdf')).toBe('stages etranger 1 pdf');
     expect(normalizeFilename('SujetStageM2_CAP-ART.pdf')).toBe('sujet stage m2 cap art pdf');
+  });
+});
+
+describe('F7 cross-lingual retrieval + date detection', () => {
+  it('reaches a French-named document from an English query via bilingual expansion (was the F7 miss)', () => {
+    const files = ['Contrat Habitation ADHE-20260603-bba7c844.pdf', 'Health insurance info.pdf'];
+    const q = 'what is the coverage period of my home insurance contract document';
+    // The raw English query cannot reach the French contract; "insurance" instead pulls the WRONG
+    // English health-insurance file (the F7 bug: English query never targets the French document).
+    expect(matchNamedDocument(q, files)?.index).toBe(1);
+    // With bilingual expansion the query carries "contrat"/"habitation" and correctly targets index 0.
+    const expanded = withExpansionTerms(q, bilingualExpansionTerms(q));
+    expect(matchNamedDocument(expanded, files)?.index).toBe(0);
+  });
+
+  it('boosts a date chunk for an English "coverage period" question (was missed by the French-only regex)', () => {
+    const chunks = [
+      // Shares the query words "coverage"/"period" but holds NO date.
+      {
+        text: 'This section explains the coverage period concept and what a period means in general.',
+      },
+      // The actual answer: French period with dates, only "periode" overlaps the query lexically.
+      { text: 'Les garanties sont accordees pour la periode du 08/08/2025 au 31/08/2026.' },
+    ];
+    // "coverage"/"period" now trigger date intent, so the chunk with the real dates wins despite less
+    // lexical overlap. Before the fix (French-only WANTS_DATES) the first chunk would win on tokens.
+    const ranked = rankChunksByLexicalOverlap(chunks, 'what is the coverage period');
+    expect(ranked[0]!.text).toContain('08/08/2025');
+  });
+
+  it('parses a query-analysis object and drops junk / empty results', () => {
+    const ok = parseQueryAnalysis('{"expansionTerms":["contrat","habitation"],"wantsDates":true}');
+    expect(ok).toEqual({ expansionTerms: ['contrat', 'habitation'], wantsDates: true });
+    // Tolerates surrounding prose and normalizes/dedupes terms.
+    expect(
+      parseQueryAnalysis('here: {"expansionTerms":["Contrat"," contrat "],"wantsDates":false}'),
+    ).toEqual({
+      expansionTerms: ['contrat'],
+      wantsDates: false,
+    });
+    expect(parseQueryAnalysis('{"expansionTerms":[],"wantsDates":false}')).toBeNull();
+    expect(parseQueryAnalysis('not json at all')).toBeNull();
+  });
+
+  it('withExpansionTerms appends only new terms', () => {
+    expect(withExpansionTerms('home insurance', ['assurance', 'home', 'habitation'])).toBe(
+      'home insurance assurance habitation',
+    );
+    expect(withExpansionTerms('home insurance', [])).toBe('home insurance');
   });
 });
 
@@ -2053,7 +2105,12 @@ describe('CategoryImprovementService', () => {
       },
       listForAccount: () => [{ id: 'c1', label: 'Broad Bucket', description: 'many kinds' }],
       getCentroidEntries: () => [
-        { categoryId: 'c1', label: 'Broad Bucket', vector: Float32Array.from([1, 0]), emailCount: 100 },
+        {
+          categoryId: 'c1',
+          label: 'Broad Bucket',
+          vector: Float32Array.from([1, 0]),
+          emailCount: 100,
+        },
       ],
       getEffectivePrototypeEntries: () => [
         {
@@ -2441,6 +2498,7 @@ describe('redactConfig (M8)', () => {
       multiPrototypeCategories: false,
       clusterRepresentativeSampling: false,
       crossEncoderRerank: false,
+      llmQueryUnderstanding: false,
     });
   });
 

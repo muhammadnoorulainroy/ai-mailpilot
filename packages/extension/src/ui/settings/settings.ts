@@ -338,6 +338,8 @@ async function loadConfigIfAuthed(): Promise<void> {
       cfg.features?.clusterRepresentativeSampling ?? false;
     $<HTMLInputElement>('toggle-cross-encoder-rerank').checked =
       cfg.features?.crossEncoderRerank ?? false;
+    $<HTMLInputElement>('toggle-query-understanding').checked =
+      cfg.features?.llmQueryUnderstanding ?? false;
   } catch (err) {
     setStatus('models-status', err instanceof Error ? err.message : String(err), 'error');
     populateModelSelects(null, null, null);
@@ -492,6 +494,20 @@ function attachHandlers(): void {
     const input = e.target as HTMLInputElement;
     try {
       await coreClient.updateConfig({ features: { crossEncoderRerank: input.checked } });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the experimental toggle: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
+  $<HTMLInputElement>('toggle-query-understanding').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ features: { llmQueryUnderstanding: input.checked } });
     } catch (err) {
       input.checked = !input.checked;
       setStatus(

@@ -58,6 +58,8 @@ export async function registerChatRoutes(app: FastifyInstance, ctx: AppContext):
     snippetChars?: number;
     rerank?: boolean;
     rerankWithLlm?: boolean;
+    analyzeQuery?: boolean;
+    cloud?: boolean;
     thinking?: boolean;
     answerTokens?: number;
   }> {
@@ -76,6 +78,8 @@ export async function registerChatRoutes(app: FastifyInstance, ctx: AppContext):
       // An LLM listwise rerank is trusted only for a strong cloud model; a weak local model can invert
       // the correct order, so local keeps fusion order (unless the cross-encoder sidecar is enabled).
       rerankWithLlm: cloud,
+      analyzeQuery: ctx.config.features.llmQueryUnderstanding,
+      cloud,
       // Engage the <think> splitter only for a local reasoning model (qwen3 etc.); a non-reasoning
       // default like llama3.1 must stream its answer directly, not through the think channel.
       thinking: !cloud && isReasoningModel(answerModel),

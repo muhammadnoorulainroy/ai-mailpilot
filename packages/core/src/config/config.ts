@@ -89,6 +89,7 @@ export function redactConfig(config: AppConfig): SafeConfig {
       multiPrototypeCategories: config.features.multiPrototypeCategories,
       clusterRepresentativeSampling: config.features.clusterRepresentativeSampling,
       crossEncoderRerank: config.features.crossEncoderRerank,
+      llmQueryUnderstanding: config.features.llmQueryUnderstanding,
     },
   };
 }

@@ -37,6 +37,7 @@ describe('config routes: feature flags', () => {
       multiPrototypeCategories: false,
       clusterRepresentativeSampling: false,
       crossEncoderRerank: false,
+      llmQueryUnderstanding: false,
     });
     await app.close();
   });
@@ -97,6 +98,7 @@ describe('config routes: feature flags', () => {
       multiPrototypeCategories: false,
       clusterRepresentativeSampling: false,
       crossEncoderRerank: false,
+      llmQueryUnderstanding: false,
     });
     expect(res.json().autoIndex).toBe(true);
     await app.close();
