@@ -794,6 +794,15 @@ describe('parseTimeScope (time-scoped retrieval)', () => {
     expect(inRange(recent, new Date(2026, 5, 1).getTime())).toBe(true);
   });
 
+  it('does not scope a superlative recency qualifier, leaving it to normal retrieval', () => {
+    // "most recent X" means the newest X, not mail from the last 30 days; version dedup handles it.
+    expect(
+      parseTimeScope('what is the start date of my most recent insurance contract', now),
+    ).toBeNull();
+    expect(parseTimeScope('mon contrat le plus récent', now)).toBeNull();
+    expect(parseTimeScope('my latest bank statement', now)).toBeNull();
+  });
+
   it('requires a preposition for a bare year so codes are not misread', () => {
     expect(parseTimeScope('what happened in 2018?', now)!.label).toBe('2018');
     expect(parseTimeScope('error code 2018 reference', now)).toBeNull();

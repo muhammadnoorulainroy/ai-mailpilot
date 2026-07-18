@@ -56,9 +56,7 @@ export type ChatStreamEvent =
 
 /** A piece of split model output: reasoning, answer text, or a promote signal that prior text was the answer. */
 export type SplitEvent =
-  | { kind: 'think'; text: string }
-  | { kind: 'answer'; text: string }
-  | { kind: 'promote' };
+  { kind: 'think'; text: string } | { kind: 'answer'; text: string } | { kind: 'promote' };
 
 const TOP_K = 8;
 const CANDIDATES = 30;
@@ -73,7 +71,6 @@ const RERANK_POOL = 20;
 const RERANK_POOL_MAX = 30;
 /** Cap on candidates fed to the cross-encoder: bounds per-query CPU latency (~0.3-0.4s each). */
 const RERANK_CE_POOL = 12;
-const RERANK_FLOOR = 3;
 const RERANK_TOKENS = 120;
 const RERANK_TIMEOUT_MS = 60_000;
 const RERANK_SNIPPET = 240;
@@ -99,6 +96,7 @@ How to answer:
 - Be flexible about wording: the user rarely uses the exact course name, code, or phrasing from their emails. If an email or attachment excerpt plausibly matches, answer with facts taken DIRECTLY from it (date, subject, sender, or the attachment's text) and cite it [n]. An attachment excerpt is just as valid a source as an email body.
 - NEVER state a date, name, or fact that is not written in one of the provided emails or attachment excerpts. Do not combine a date from one source with a topic from another. If nothing in the context gives the requested detail, say so. Quote dates, times, time zones, and numbers EXACTLY as written; never convert a time to another time zone or recompute a value.
 - If the SAME detail (for example a meeting time) appears with DIFFERENT values across emails, it was likely rescheduled: say so, give the value from the most recent email, and note the others rather than silently picking one.
+- A price, rate, or offer quoted in a promotional or marketing email is an advertisement, not a record of what the user pays or subscribed to. Do not report an advertised figure as the user's actual subscription, order, or account value; only a receipt, invoice, or confirmation establishes that. If only ads are present, say you found offers but no record of their actual amount.
 - If you are unsure which source the user means, or more than one could match, name the candidate(s) with their dates and let the user confirm rather than guessing.
 - When several similar values, URLs, sites, dates, or names appear, pick the one tied to the user's SPECIFIC requested action. For example, if they ask where to REGISTER, give the registration site, not a different site used for a later account step. Quote the exact value from the source.
 - A source's filename, sender address/domain, and subject are part of its identity. When the user names a document, brand, company, or acronym, treat a source as matching it when that name appears ANYWHERE in the source's filename, sender, subject, or text - even partially, in a different language, or with different spacing/case (e.g. a query about "ADH home insurance" matches a French file "Contrat Habitation ADHE..." from adh-assurances.fr, because "ADH" is in the filename and sender). Only say you could not find the named document when NO source carries any form of that name in any of those fields; then do not answer from unrelated sources or describe a generic process.
@@ -1560,19 +1558,20 @@ export class ChatService {
       });
       const order = parseRerankOrder(stripThinking(raw), items.length);
       if (order.length === 0) return items.slice(0, topK);
-      const picks = order.slice(0, topK);
-      const floor = Math.min(topK, RERANK_FLOOR);
-      if (picks.length < floor) {
-        const chosen = new Set(picks);
-        for (let i = 0; i < items.length && picks.length < floor; i++) {
-          if (!chosen.has(i)) picks.push(i);
-        }
+      // The model lists the most useful first but tends to omit chunks it judges irrelevant; a
+      // specific fact often sits in an omitted chunk of the right document. Keep the model's order,
+      // then append the remaining fusion-order candidates up to topK so a fact-bearing chunk of a
+      // top-ranked document is not dropped.
+      const picks = [...order];
+      const chosen = new Set(picks);
+      for (let i = 0; i < items.length && picks.length < topK; i++) {
+        if (!chosen.has(i)) picks.push(i);
       }
       this.logger.info(
-        { pool: items.length, ranked: order.length, fed: picks.length, topK },
+        { pool: items.length, ranked: order.length, fed: Math.min(picks.length, topK), topK },
         'chat: reranked',
       );
-      return picks.map((i) => items[i]!);
+      return picks.slice(0, topK).map((i) => items[i]!);
     } catch (err) {
       this.logger.warn({ err }, 'chat: rerank failed (kept fusion order)');
       return items.slice(0, topK);
@@ -1608,7 +1607,16 @@ export class ChatService {
     winners.sort(
       (x, y) => (y.a.date ?? 0) - (x.a.date ?? 0) || (x.a.attachmentId < y.a.attachmentId ? -1 : 1),
     );
-    return winners[0]!.a;
+    const winner = winners[0]!;
+    // A match only on the sender's own brand (e.g. "free mobile" from freemobile@free-mobile.fr) has
+    // named the sender, not a specific document, so it would wrongly lock onto whichever of that
+    // sender's files shares the brand. Fall through to content retrieval when every matched token is
+    // in the sender address.
+    const senderNorm = normalizeForMatch(
+      this.emails.findById(winner.a.messageId, accountId)?.fromAddr ?? '',
+    );
+    if (senderNorm && winner.matched.every((t) => senderNorm.includes(t))) return null;
+    return winner.a;
   }
 
   /**

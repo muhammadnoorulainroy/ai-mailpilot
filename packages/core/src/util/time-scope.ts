@@ -166,10 +166,18 @@ export function parseTimeScope(query: string, now: number): TimeScope | null {
     if (hit) return { ...range(), label, matched: hit[0]! };
   }
 
-  m =
-    /\brecent(?:ly)?\b|\blately\b|\br(?:é|e)cemment\b|\br(?:é|e)cents?\b|\b(?:ces\s+)?derniers\s+jours\b/i.exec(
-      query,
-    );
+  // A superlative recency qualifier ("most recent", "latest", "le plus récent") asks for the newest
+  // matching item ("my most recent contract" = the newest contract), a preference version dedup
+  // handles, not for mail received in a recent window; leave it to normal retrieval so the topic is
+  // not hard-filtered to the last 30 days.
+  const superlativeRecent = /\bmost\s+recent\b|\blatest\b|\bplus\s+r(?:é|e)cent(?:e)?\b/i.test(
+    query,
+  );
+  m = superlativeRecent
+    ? null
+    : /\brecent(?:ly)?\b|\blately\b|\br(?:é|e)cemment\b|\br(?:é|e)cents?\b|\b(?:ces\s+)?derniers\s+jours\b/i.exec(
+        query,
+      );
   if (m) {
     return {
       from: startOfDay(dayOffset(N, -RECENT_DAYS)),
