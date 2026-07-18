@@ -63,6 +63,8 @@ import {
   bilingualExpansionTerms,
   withExpansionTerms,
   parseQueryAnalysis,
+  detectDateConflicts,
+  extractDates,
   rankChunksByLexicalOverlap,
   makeThinkSplitter,
   parseRerankOrder,
@@ -445,6 +447,61 @@ describe('F7 cross-lingual retrieval + date detection', () => {
       'home insurance assurance habitation',
     );
     expect(withExpansionTerms('home insurance', [])).toBe('home insurance');
+  });
+});
+
+describe('detectDateConflicts (conflict/temporal surfacing)', () => {
+  const email = (subject: string, body = '', date = 0): RetrievedEmail => ({
+    messageId: subject,
+    subject,
+    fromAddr: 'x@y.z',
+    date,
+    body,
+    bodyFormat: 'text',
+    distance: 0,
+  });
+
+  it('flags a rescheduled event: same topic, different dates', () => {
+    const items = [
+      email('Reminder: Video interview on 2 June 2025 9:05 PM'),
+      email('Reminder: Video interview on 4 June 2025 9:05 PM'),
+      email('Technical Interview with Wizdaa', 'rescheduled to 11 June 2025'),
+    ];
+    const note = detectDateConflicts(items, true);
+    expect(note).toBeTruthy();
+    expect(note).toContain('DIFFERENT dates');
+    expect(note).toContain('rescheduled');
+  });
+
+  it('does not fire when the shared-topic emails agree on the date', () => {
+    const items = [
+      email('Reminder: Video interview on 2 June 2025'),
+      email('Confirmation: Video interview on 02 June 2025'), // same date, re-worded
+    ];
+    expect(detectDateConflicts(items, true)).toBeNull();
+  });
+
+  it('does not fire for a non-date question', () => {
+    const items = [
+      email('Video interview on 2 June 2025'),
+      email('Video interview on 4 June 2025'),
+    ];
+    expect(detectDateConflicts(items, false)).toBeNull();
+  });
+
+  it('does not fire when the emails share no topic (distinct events)', () => {
+    const items = [
+      email('Dentist appointment on 2 June 2025'),
+      email('Rent payment due 4 June 2025'),
+    ];
+    expect(detectDateConflicts(items, true)).toBeNull();
+  });
+
+  it('extractDates parses natural and numeric dates and collapses re-wordings', () => {
+    expect([...extractDates('meeting on 2 June 2025 and 02 June 2025')]).toEqual(['2 june 2025']);
+    const d = extractDates('due 11 juin 2025 or 04/06/2025');
+    expect(d.has('11 juin 2025')).toBe(true);
+    expect(d.has('04/06/2025')).toBe(true);
   });
 });
 
