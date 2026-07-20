@@ -462,6 +462,12 @@ const WANTS_OLD =
  * the most recent. Only fires when 2+ versions of the same document family are present.
  */
 export function dedupeDocumentVersions(items: RetrievedEmail[], query: string): RetrievedEmail[] {
+  // A question after a specific value or clause may be answerable ONLY by an older version: measured on
+  // this corpus, the 2025 housing contract carries the storm-damage franchise table and the 2026 renewal
+  // does not contain it at all, so collapsing to the newest version destroys the only copy of the answer.
+  // Keep every version for such questions; the ask prompt already tells the model to prefer the most
+  // recent value and to name the others when they conflict.
+  if (WANTS_AMOUNT.test(query)) return items;
   const yearInQuery = query.match(/\b(20\d{2})\b/)?.[1];
   const wantsOld = WANTS_OLD.test(query);
   const groups = new Map<string, RetrievedEmail[]>();
@@ -560,6 +566,18 @@ export function matchNamedDocument(
 const WANTS_DATES =
   /\b(date|dates|p[ée]riode|period|validit|valable|valid|coverage|cover|when|quand|schedule[dr]?|horaire|d[ée]but|\bfin\b|start|end|dur[ée]e|duration|garantie|effet|expir|deadline|[ée]ch[ée]ance)\b/i;
 const DATE_PATTERN = /\b\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{2,4}\b/g;
+
+/**
+ * A question after a MONETARY value (a deductible, a ceiling, a premium). The chunk that answers it is
+ * a tariff/guarantee table whose wording shares almost nothing with the question, and across languages
+ * shares nothing at all, so lexical overlap alone never ranks it. The amounts themselves are the
+ * language-neutral signal: "230 €" reads the same in French and English.
+ */
+const WANTS_AMOUNT =
+  /\b(deductible|excess|franchise|amount|montant|limit|plafond|premium|prime|cost|price|prix|tarif|fee|frais|rate|taux|indemnit|reimburse|rembours|covered\s+up\s+to)\w*/i;
+const AMOUNT_PATTERN = /\d[\d\s.,]*\s?(?:€|EUR\b|euros?\b)/gi;
+const AMOUNT_MARKERS =
+  /\b(franchises?|montants?\s+assur|garanties?\s+accord|plafond|par\s+sinistre|indemnit)\w*/i;
 const PERIOD_MARKERS =
   /\b(valable|comprise\s+entre|date\s+d['e ]?effet|date\s+de\s+fin|effet\s+des\s+garanties|garanties?\s+(?:sont\s+)?accord|valid\s+(?:from|until)|p[ée]riode\s+comprise|du\s+\d.*\bau\s+\d)\b/i;
 
@@ -634,6 +652,22 @@ export function detectDateConflicts(items: RetrievedEmail[], wantsDates: boolean
     `rescheduled - use the date from the most recently sent email (compare the Date fields) and say ` +
     `it was rescheduled. If they are DIFFERENT events, list each with its own date. Do not silently ` +
     `pick one date.`
+  );
+}
+
+/**
+ * For an aggregate question, state the SCOPE of a course evaluation summary explicitly. Measured: with
+ * one course's summary in context the model reported that course's "Overall Average: 15.6" as the
+ * SEMESTER GPA. An adjacent note constrains the answer better than a system-prompt rule, the same way
+ * the conflicting-dates note does.
+ */
+export function aggregateScopeNote(wantsAggregate: boolean): string | null {
+  if (!wantsAggregate) return null;
+  // Phrased as a DECLARATIVE fact about the sources, never as an instruction: a weak local model echoes
+  // imperative wording ("report X, otherwise say Y") straight back to the user as part of its answer.
+  return (
+    `NOTE: an "Overall Average" or "Final Grade" appearing inside a single course's evaluation summary ` +
+    `is that course's own figure, not a programme-wide or semester GPA.`
   );
 }
 
@@ -750,8 +784,9 @@ export function parseQueryAnalysis(raw: string): QueryAnalysis | null {
 /**
  * Rank chunks by how many distinct query content-tokens they contain, so the chunk holding the
  * exact fact leads instead of a generic chunk. When the question asks about dates/period/validity,
- * a chunk that actually contains a date or period marker is boosted, since the date values
- * themselves do not lexically match the query. Cross-language terms are expanded. Stable on ties.
+ * or about a monetary value, a chunk that actually contains a date/period marker or an amount is
+ * boosted, since those values do not lexically match the question (and across languages the wording
+ * shares nothing at all). Cross-language terms are expanded. Stable on ties.
  */
 export function rankChunksByLexicalOverlap<T extends { text: string }>(
   chunks: T[],
@@ -767,7 +802,8 @@ export function rankChunksByLexicalOverlap<T extends { text: string }>(
     ),
   ];
   const wantsDates = wantsDatesOverride ?? WANTS_DATES.test(expanded);
-  if (qTokens.length === 0 && !wantsDates) return chunks;
+  const wantsAmount = WANTS_AMOUNT.test(expanded);
+  if (qTokens.length === 0 && !wantsDates && !wantsAmount) return chunks;
   return chunks
     .map((c, i) => {
       const norm = normalizeForMatch(c.text);
@@ -777,6 +813,11 @@ export function rankChunksByLexicalOverlap<T extends { text: string }>(
         const dates = c.text.match(DATE_PATTERN)?.length ?? 0;
         if (dates > 0) score += Math.min(dates, 2) * 3;
         if (PERIOD_MARKERS.test(c.text)) score += 2;
+      }
+      if (wantsAmount) {
+        const amounts = c.text.match(AMOUNT_PATTERN)?.length ?? 0;
+        if (amounts > 0) score += Math.min(amounts, 3) * 3;
+        if (AMOUNT_MARKERS.test(c.text)) score += 2;
       }
       return { c, score, i };
     })
@@ -1052,11 +1093,18 @@ export class ChatService {
 
       yield { type: 'meta', conversationId: convo.id, sources };
 
-      // Surface rescheduled/conflicting dates so the model reconciles them instead of picking one.
-      const conflictNote = detectDateConflicts(
-        retrieved,
-        WANTS_DATES.test(searchQuestion) || WANTS_DATES.test(question),
-      );
+      // Surface rescheduled/conflicting dates so the model reconciles them instead of picking one, and
+      // pin the scope of a course summary so a per-course average is not reported as a semester GPA.
+      const contextNote =
+        [
+          detectDateConflicts(
+            retrieved,
+            WANTS_DATES.test(searchQuestion) || WANTS_DATES.test(question),
+          ),
+          aggregateScopeNote(isAggregateQuery(question)),
+        ]
+          .filter((n): n is string => !!n)
+          .join('\n\n') || null;
       const genQuestion = question;
       const genHistory = intent === 'ask' ? [] : recent;
       const genSummary = intent === 'ask' ? '' : convo.summary;
@@ -1067,7 +1115,7 @@ export class ChatService {
         intent,
         params.snippetChars ?? SNIPPET_CHARS,
         genSummary,
-        conflictNote,
+        contextNote,
       );
       const splitter = (params.thinking ?? true) ? makeThinkSplitter() : null;
       const emit = (event: SplitEvent): ChatStreamEvent =>
@@ -1361,10 +1409,16 @@ export class ChatService {
       });
     }
 
-    if (!scope) items.push(...this.retrieveAttachments(accountId, semanticQuery, qvec, modelId));
-
     const result =
       rerank && items.length > 2 ? await this.applyReranking(query, items, topK, params) : items;
+
+    // Document chunks are APPENDED after the trim rather than merged into the email pool before it.
+    // topK is sized for emails (8 on the local path), and the attachment arm's hits sit at the end of
+    // the pool, so they were always cut locally and the answer-bearing document never reached the
+    // model. They carry the facts, so they ride alongside the trimmed email pool, not against it.
+    if (!scope) {
+      result.push(...this.retrieveAttachments(accountId, semanticQuery, qvec, modelId));
+    }
 
     if (isAggregateQuery(userQuestion)) this.promoteSummaryEmail(items, result);
 
@@ -1461,7 +1515,10 @@ export class ChatService {
     const expanded = new Set<string>();
     const additions: RetrievedEmail[] = [];
     for (const it of items) {
-      if (it.attachmentName) continue;
+      // Expand from a document surfaced as a CHUNK too, not only from a retrieved email. The chunk the
+      // vector search happened to match is usually not the one holding the asked-for value, and on a
+      // cross-lingual question the parent email often is not retrieved at all, so keying expansion on
+      // emails alone left the answer-bearing chunk unreachable.
       if (expanded.has(it.messageId)) continue;
       expanded.add(it.messageId);
       const chunks = this.attachments.loadAllChunksForMessage(

@@ -58,6 +58,7 @@ import {
   isAggregateQuery,
   matchNamedDocument,
   filenameMatchScore,
+  aggregateScopeNote,
   dedupeDocumentVersions,
   expandQueryBilingual,
   bilingualExpansionTerms,
@@ -607,6 +608,48 @@ describe('rankChunksByLexicalOverlap date-range boost', () => {
   });
 });
 
+describe('rankChunksByLexicalOverlap amount boost (cross-lingual value questions)', () => {
+  it('ranks the franchise table above prose when an English question asks for a deductible', () => {
+    // The French table shares no wording with the English question; the amounts are the only signal.
+    const chunks = [
+      { text: 'ADH exerce sous le controle de l ACPR, 4 place de Budapest, 75436 PARIS Cedex 09.' },
+      {
+        text: 'EVENEMENTS CLIMATIQUES Garanties accordees Franchises Montants assures Tempete/grele/neige 230 € non indexes 3 500 € par piece principale assuree',
+      },
+      { text: 'Nous contacter par telephone du lundi au vendredi de 9h a 18h.' },
+    ];
+    const ranked = rankChunksByLexicalOverlap(
+      chunks,
+      'What is the deductible for storm damage in my home insurance?',
+    );
+    expect(ranked[0]!.text).toContain('230 €');
+  });
+
+  it('leaves ranking untouched when the question does not ask for a value', () => {
+    const chunks = [{ text: 'plain chunk without figures' }, { text: 'another 230 € amount here' }];
+    const ranked = rankChunksByLexicalOverlap(chunks, 'who sent this and when did they write');
+    expect(ranked[0]!.text).toBe('plain chunk without figures');
+  });
+});
+
+describe('aggregateScopeNote (per-course average is not a semester GPA)', () => {
+  it('emits a scope note for an aggregate question', () => {
+    const note = aggregateScopeNote(true);
+    expect(note).toMatch(/course's own figure/i);
+    expect(note).toMatch(/not a programme-wide or semester GPA/i);
+  });
+
+  it('states the note declaratively, since a weak model echoes imperative wording to the user', () => {
+    // Regression: an imperative note ("report X, otherwise say Y") was reproduced verbatim in an answer.
+    const note = aggregateScopeNote(true)!;
+    expect(note).not.toMatch(/\breport\b|\botherwise\b|\bsay\b/i);
+  });
+
+  it('emits nothing for a non-aggregate question', () => {
+    expect(aggregateScopeNote(false)).toBeNull();
+  });
+});
+
 describe('dedupeDocumentVersions (collapse old/new document versions)', () => {
   /** Builds an attachment-bearing retrieved-email fixture keyed by filename. */
   const item = (attachmentName: string, date: number): RetrievedEmail => ({
@@ -629,6 +672,17 @@ describe('dedupeDocumentVersions (collapse old/new document versions)', () => {
     );
     expect(out).toContain(adh2026);
     expect(out).not.toContain(adh2025);
+  });
+
+  it('keeps EVERY version when the query asks for a specific value or clause', () => {
+    // Measured on the real corpus: only the 2025 contract carries the storm-damage franchise table;
+    // the 2026 renewal does not contain it at all, so collapsing would destroy the only answer.
+    const out = dedupeDocumentVersions(
+      [adh2025, adh2026],
+      'What is the deductible for storm damage in my home insurance?',
+    );
+    expect(out).toContain(adh2025);
+    expect(out).toContain(adh2026);
   });
 
   it('keeps the version whose filename matches a year named in the query', () => {
