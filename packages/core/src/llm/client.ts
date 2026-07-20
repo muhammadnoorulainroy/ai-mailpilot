@@ -108,6 +108,8 @@ export interface LlmClient {
   chatStream(opts: ChatCompletionOptions): AsyncIterable<string>;
 }
 
+/** Closing tag synthesized between a reasoning stream and the answer, so the chat splitter can split them. */
+const THINK_CLOSE = '</think>';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const HEALTH_TIMEOUT_MS = 5_000;
 const MAX_ERROR_TEXT = 2_000;
@@ -347,16 +349,39 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
         }
         if (!res.body) throw new Error('LLM API /chat/completions: no stream body');
 
-        /** Parse one SSE line into a done flag or a content delta, ignoring non-data and unparseable lines. */
+        // A reasoning model on Ollama's OpenAI-compatible stream does NOT inline <think>...</think> in
+        // the content: it streams the chain of thought in a separate `reasoning` field while `content`
+        // stays empty, then streams the answer in `content`. Reading only `content` therefore discarded
+        // the reasoning and left the answer with no </think> marker, so the splitter downstream labelled
+        // the whole answer as thinking. Forward the reasoning and synthesize the closing tag on the first
+        // real content, which is exactly the shape the splitter expects.
+        let sawReasoning = false;
+        let closedThink = false;
+
+        /** Parse one SSE line into a done flag or a text delta, ignoring non-data and unparseable lines. */
         const parseSse = (line: string): { done?: boolean; delta?: string } => {
           const t = line.trim();
           if (!t.startsWith('data:')) return {};
           const data = t.slice(5).trim();
           if (data === '[DONE]') return { done: true };
           try {
-            const json = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
-            const d = json.choices?.[0]?.delta?.content;
-            if (typeof d === 'string' && d.length > 0) return { delta: d };
+            const json = JSON.parse(data) as {
+              choices?: Array<{ delta?: { content?: string; reasoning?: string } }>;
+            };
+            const delta = json.choices?.[0]?.delta;
+            const reasoning = delta?.reasoning;
+            if (typeof reasoning === 'string' && reasoning.length > 0) {
+              sawReasoning = true;
+              return { delta: reasoning };
+            }
+            const content = delta?.content;
+            if (typeof content === 'string' && content.length > 0) {
+              if (sawReasoning && !closedThink) {
+                closedThink = true;
+                return { delta: `${THINK_CLOSE}${content}` };
+              }
+              return { delta: content };
+            }
           } catch {}
           return {};
         };

@@ -2464,6 +2464,71 @@ describe('LlmClient think:false native routing', () => {
   });
 });
 
+describe('LlmClient chatStream reasoning capture', () => {
+  it('forwards a separate reasoning stream and closes it before the answer', async () => {
+    // Ollama's OpenAI-compatible stream puts a reasoning model's chain of thought in `reasoning`
+    // while `content` stays empty; the client must forward it and synthesize </think> so the chat
+    // splitter can separate thinking from the answer instead of labelling the whole answer as think.
+    const body =
+      [
+        'data: {"choices":[{"delta":{"content":"","reasoning":"Think"}}]}',
+        'data: {"choices":[{"delta":{"content":"","reasoning":"ing"}}]}',
+        'data: {"choices":[{"delta":{"content":"Answer"}}]}',
+        'data: {"choices":[{"delta":{"content":" text"}}]}',
+        'data: [DONE]',
+      ].join('\n') + '\n';
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const client = createLlmClient(
+        () =>
+          ({
+            baseUrl: 'http://local/v1',
+            embeddingModel: 'bge-m3',
+            generationModel: 'qwen3:8b',
+            embeddingDimensions: 1024,
+            chatRerank: true,
+            categorizeUseChatProvider: false,
+          }) as never,
+      );
+      let out = '';
+      for await (const d of client.chatStream({ messages: [{ role: 'user', content: 'hi' }] })) {
+        out += d;
+      }
+      expect(out).toBe('Thinking</think>Answer text');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('leaves a non-reasoning stream untouched (no synthesized tag)', async () => {
+    const body =
+      ['data: {"choices":[{"delta":{"content":"Plain"}}]}', 'data: [DONE]'].join('\n') + '\n';
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const client = createLlmClient(
+        () =>
+          ({
+            baseUrl: 'http://local/v1',
+            embeddingModel: 'bge-m3',
+            generationModel: 'llama3.1',
+            embeddingDimensions: 1024,
+            chatRerank: true,
+            categorizeUseChatProvider: false,
+          }) as never,
+      );
+      let out = '';
+      for await (const d of client.chatStream({ messages: [{ role: 'user', content: 'hi' }] })) {
+        out += d;
+      }
+      expect(out).toBe('Plain');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe('config PATCH llm merge', () => {
   it('a partial llm patch preserves keys the caller did not send', () => {
     const stored = LlmConfigSchema.parse({
