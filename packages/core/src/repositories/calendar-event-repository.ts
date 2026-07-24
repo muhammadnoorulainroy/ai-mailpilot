@@ -5,6 +5,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { Database, Statement } from 'better-sqlite3';
+import { sanitizeFtsQuery } from '../util/text.js';
 
 /** A calendar event to persist, already resolved to absolute epoch-ms times. */
 export interface CapturedEventInput {
@@ -75,6 +76,10 @@ function toEventRow(r: RawEventRow): EventRow {
 
 const SELECT_COLUMNS = `id, account_id, source_message_id, title, start_at, end_at, all_day,
   location, organizer, description, rrule, status, source, created_at`;
+/** Same columns qualified with the `e` alias, for queries that join the FTS index. */
+const SELECT_COLUMNS_E = SELECT_COLUMNS.split(',')
+  .map((c) => `e.${c.trim()}`)
+  .join(', ');
 
 /** Stores and queries calendar events. */
 export class CalendarEventRepository {
@@ -164,5 +169,22 @@ export class CalendarEventRepository {
     return (this.stmts.listInRange.all(accountId, from, to, limit) as RawEventRow[]).map(
       toEventRow,
     );
+  }
+
+  /** BM25 keyword search over event title, location, and description. Best match first. */
+  keywordSearchEvents(accountId: string, query: string, limit = 6): EventRow[] {
+    const match = sanitizeFtsQuery(query);
+    if (!match) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT ${SELECT_COLUMNS_E}
+           FROM event_fts
+           JOIN events e ON e.rowid = event_fts.rowid
+          WHERE event_fts MATCH ? AND e.account_id = ?
+          ORDER BY event_fts.rank
+          LIMIT ?`,
+      )
+      .all(match, accountId, limit) as RawEventRow[];
+    return rows.map(toEventRow);
   }
 }

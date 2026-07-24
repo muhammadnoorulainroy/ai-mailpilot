@@ -12,10 +12,19 @@ import type {
 import type { EmailRepository } from '../repositories/email-repository.js';
 import type { EmbeddingRepository } from '../repositories/embedding-repository.js';
 import type { AttachmentRepository } from '../repositories/attachment-repository.js';
+import type {
+  CalendarEventRepository,
+  EventRow,
+} from '../repositories/calendar-event-repository.js';
 import type { RerankerClient } from './reranker-client.js';
 import { cosineFromL2Distance, l2Distance } from '../util/vector.js';
 import { preprocessForEmbedding, normalizeForMatch, normalizeFilename } from '../util/text.js';
-import { parseTimeScope, stripTimeScope, hasTopicTerms } from '../util/time-scope.js';
+import {
+  parseTimeScope,
+  stripTimeScope,
+  hasTopicTerms,
+  type TimeScope,
+} from '../util/time-scope.js';
 
 /** One turn of a chat conversation, from the user or the assistant. */
 export interface ChatTurn {
@@ -78,6 +87,11 @@ const SNIPPET_CHARS = 700;
 const CONDENSE_TOKENS = 400;
 const CONDENSE_TIMEOUT_MS = 60_000;
 const CONDENSE_MAX_CHARS = 300;
+const EVENT_TOP = 6;
+const EVENT_RANGE_LIMIT = 20;
+/** Marks a query as calendar-oriented, so a captured event's date window is worth surfacing. */
+const CALENDAR_INTENT =
+  /\b(meeting|meetings|event|events|calendar|schedule|scheduled|agenda|appointment|appointments|deadline|deadlines|reminder|rendez-?vous|r(?:é|e)union|free|busy|available|availability|libre|occup(?:é|e)|disponible|when\s+is|whats?\s+on)\b/i;
 const NO_THINK = '/no_think';
 const MAX_HISTORY = 8;
 const HISTORY_CHAR_BUDGET = 4000;
@@ -1044,6 +1058,7 @@ export class ChatService {
     private attachments: AttachmentRepository,
     private logger: Logger,
     private reranker?: RerankerClient,
+    private events?: CalendarEventRepository,
   ) {}
 
   /**
@@ -1426,7 +1441,52 @@ export class ChatService {
 
     if (!scope) this.expandWithEmailAttachments(accountId, result, userQuestion, wantsDates);
 
-    return dedupeDocumentVersions(result, userQuestion);
+    const deduped = dedupeDocumentVersions(result, userQuestion);
+    // Calendar events ride alongside the trimmed email pool, appended after dedup so a scheduling
+    // question ("what's on Friday", "meetings about the Mines project") is answered from the
+    // captured event even when no email ranked. The date arm fires only for calendar-intent or
+    // pure-time queries, so a topical scoped query is not polluted with unrelated events.
+    if (this.events) {
+      const present = new Set(deduped.map((r) => r.messageId));
+      deduped.push(...this.retrieveCalendarEvents(accountId, semanticQuery, query, scope, present));
+    }
+    return deduped;
+  }
+
+  /**
+   * Retrieves captured calendar events relevant to the query: those inside a parsed date window
+   * (for calendar-intent or pure-time queries) and those whose title/location match the keywords.
+   * Each becomes a grounding item; events already represented by a retrieved email are skipped.
+   */
+  private retrieveCalendarEvents(
+    accountId: string,
+    semanticQuery: string,
+    rawQuery: string,
+    scope: TimeScope | null,
+    present: Set<string>,
+  ): RetrievedEmail[] {
+    if (!this.events) return [];
+    const picked = new Map<string, EventRow>();
+
+    const wantsRange = scope && (CALENDAR_INTENT.test(rawQuery) || !hasTopicTerms(semanticQuery));
+    if (wantsRange) {
+      for (const e of this.events.listInRange(accountId, scope.from, scope.to, EVENT_RANGE_LIMIT)) {
+        picked.set(e.id, e);
+      }
+    }
+    if (hasTopicTerms(semanticQuery)) {
+      for (const e of this.events.keywordSearchEvents(accountId, semanticQuery, EVENT_TOP)) {
+        if (!picked.has(e.id)) picked.set(e.id, e);
+      }
+    }
+
+    const items: RetrievedEmail[] = [];
+    for (const e of picked.values()) {
+      if (items.length >= EVENT_TOP) break;
+      if (e.sourceMessageId && present.has(e.sourceMessageId)) continue;
+      items.push(eventToItem(e));
+    }
+    return items;
   }
 
   /**
@@ -1774,6 +1834,43 @@ function rerankText(e: RetrievedEmail): string {
     ? preprocessForEmbedding(e.body, { format: e.bodyFormat, maxChars: RERANK_SNIPPET })
     : '';
   return `${head}\n${snip}`.trim();
+}
+
+/** Pads an hour or minute to two digits for local-time formatting. */
+function padTime(n: number): string {
+  return String(n).padStart(2, '0');
+}
+/** Formats an epoch as local-time "YYYY-MM-DD HH:MM". */
+function localDateTime(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${padTime(d.getMonth() + 1)}-${padTime(d.getDate())} ${padTime(d.getHours())}:${padTime(d.getMinutes())}`;
+}
+/** Describes an event's time window in local time: all-day, a start, or a start-to-end range. */
+function formatEventWhen(e: EventRow): string {
+  if (e.allDay) {
+    const d = new Date(e.startAt);
+    return `${d.getFullYear()}-${padTime(d.getMonth() + 1)}-${padTime(d.getDate())} (all day)`;
+  }
+  const start = localDateTime(e.startAt);
+  if (e.endAt) {
+    const d = new Date(e.endAt);
+    return `${start} to ${padTime(d.getHours())}:${padTime(d.getMinutes())}`;
+  }
+  return start;
+}
+
+/** Maps a captured calendar event into a grounding item so chat can answer scheduling questions. */
+function eventToItem(e: EventRow): RetrievedEmail {
+  const where = e.location ? `\nWhere: ${e.location}` : '';
+  return {
+    messageId: e.sourceMessageId ?? `event:${e.id}`,
+    subject: e.title,
+    fromAddr: e.location ?? 'Calendar',
+    date: e.startAt,
+    body: `Calendar event: ${e.title}\nWhen: ${formatEventWhen(e)}${where}`,
+    bodyFormat: 'text',
+    distance: 0,
+  };
 }
 
 /** Reduce a retrieved item to a citable source, converting its L2 distance to a cosine score. */

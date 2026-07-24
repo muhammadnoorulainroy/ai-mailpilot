@@ -274,6 +274,7 @@ export function buildContext(): AppContext {
       repos.attachments,
       logger,
       reranker,
+      repos.events,
     ),
     attachment: new AttachmentService(llm, repos.attachments, repos.emails, logger),
   };

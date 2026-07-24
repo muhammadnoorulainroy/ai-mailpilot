@@ -128,6 +128,24 @@ describe('CalendarEventRepository', () => {
     expect(inRange.map((e) => e.title)).toEqual(['Inside']);
   });
 
+  it('finds an event by keyword over title and location via FTS', () => {
+    const accountId = seed();
+    events.captureFromEmail({
+      accountId,
+      sourceMessageId: 'm1',
+      title: 'Soutenance de stage',
+      startAt: Date.now(),
+      endAt: null,
+      allDay: false,
+      location: 'Salle B12',
+    });
+    expect(events.keywordSearchEvents(accountId, 'soutenance', 6).map((e) => e.title)).toContain(
+      'Soutenance de stage',
+    );
+    expect(events.keywordSearchEvents(accountId, 'B12', 6)).toHaveLength(1);
+    expect(events.keywordSearchEvents(accountId, 'invoice', 6)).toHaveLength(0);
+  });
+
   it('cascades event removal when the source email is deleted', () => {
     const accountId = seed();
     events.captureFromEmail({

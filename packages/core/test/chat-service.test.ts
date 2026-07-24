@@ -11,8 +11,12 @@ import { openDatabase } from '../src/db/database.js';
 import { AccountRepository } from '../src/repositories/account-repository.js';
 import { EmailRepository } from '../src/repositories/email-repository.js';
 import { EmbeddingRepository } from '../src/repositories/embedding-repository.js';
-import { ConversationRepository, type StoredChatTurn } from '../src/repositories/conversation-repository.js';
+import {
+  ConversationRepository,
+  type StoredChatTurn,
+} from '../src/repositories/conversation-repository.js';
 import { AttachmentRepository } from '../src/repositories/attachment-repository.js';
+import { CalendarEventRepository } from '../src/repositories/calendar-event-repository.js';
 import { ChatService, type ChatParams } from '../src/services/chat-service.js';
 import { EMBEDDING_DIM } from '../src/db/schema.js';
 import type { LlmClient, ChatCompletionOptions } from '../src/llm/client.js';
@@ -102,7 +106,12 @@ describe('ChatService summary-buffer memory', () => {
   };
 
   /** Runs askStream and concatenates the delta text into the final answer. */
-  const drain = async (svc: ChatService, acctId: string, q: string, convoId: string): Promise<string> => {
+  const drain = async (
+    svc: ChatService,
+    acctId: string,
+    q: string,
+    convoId: string,
+  ): Promise<string> => {
     let answer = '';
     for await (const e of svc.askStream(acctId, q, convoId, params)) {
       if (e.type === 'delta') answer += e.text;
@@ -115,7 +124,14 @@ describe('ChatService summary-buffer memory', () => {
     const convo = conversations.create(acct.id);
     seed(convo.id, 10);
 
-    const svc = new ChatService(fakeLlm('Rolling summary of earlier turns.'), embeddings, emails, conversations, attachments, logger);
+    const svc = new ChatService(
+      fakeLlm('Rolling summary of earlier turns.'),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+    );
     const answer = await drain(svc, acct.id, 'write a longer reply', convo.id);
 
     const after = conversations.get(convo.id)!;
@@ -123,6 +139,46 @@ describe('ChatService summary-buffer memory', () => {
     expect(after.summary).toBe('Rolling summary of earlier turns.');
     expect(after.turns).toHaveLength(12);
     expect(answer).toContain('answer');
+  });
+
+  it('surfaces a captured calendar event as a source for a scheduling query', async () => {
+    const acct = accounts.create({ address: 'cal@x.y', kind: 'work' });
+    const convo = conversations.create(acct.id);
+    emails.upsertBatch([
+      { messageId: 'm1', accountId: acct.id, folder: 'INBOX', subject: 'Hello' },
+    ]);
+    const events = new CalendarEventRepository(db);
+    events.captureFromEmail({
+      accountId: acct.id,
+      sourceMessageId: 'm1',
+      title: 'Soutenance de stage',
+      startAt: Date.now() + 3 * 86_400_000,
+      endAt: null,
+      allDay: false,
+      location: 'Salle B12',
+    });
+
+    const svc = new ChatService(
+      fakeLlm(),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+      undefined,
+      events,
+    );
+
+    let sources: Array<{ subject: string | null }> = [];
+    for await (const e of svc.askStream(
+      acct.id,
+      'when is my soutenance de stage',
+      convo.id,
+      params,
+    )) {
+      if (e.type === 'meta') sources = e.sources;
+    }
+    expect(sources.some((s) => s.subject === 'Soutenance de stage')).toBe(true);
   });
 
   it('does not summarize a short conversation', async () => {
@@ -143,7 +199,14 @@ describe('ChatService summary-buffer memory', () => {
     const convo = conversations.create(acct.id);
     seed(convo.id, 8);
 
-    const svc = new ChatService(fakeLlm('should not be used'), embeddings, emails, conversations, attachments, logger);
+    const svc = new ChatService(
+      fakeLlm('should not be used'),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+    );
     await drain(svc, acct.id, 'write a reply', convo.id);
 
     const after = conversations.get(convo.id)!;
@@ -168,15 +231,30 @@ describe('ChatService summary-buffer memory', () => {
       { messageId: 'm2', accountId: acct.id, folder: 'INBOX', subject: 'gamma', body: 'ccc' },
     ]);
     embeddings.saveEmbedding({ messageId: 'm0', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'm1', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.1));
-    embeddings.saveEmbedding({ messageId: 'm2', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.2));
+    embeddings.saveEmbedding(
+      { messageId: 'm1', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.1),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'm2', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.2),
+    );
     return acct.id;
   }
 
   /** Runs askStream with topK 2 and returns the cited source message ids. */
-  const sourcesFor = async (svc: ChatService, acctId: string, rerank: boolean): Promise<string[]> => {
+  const sourcesFor = async (
+    svc: ChatService,
+    acctId: string,
+    rerank: boolean,
+  ): Promise<string[]> => {
     let ids: string[] = [];
-    for await (const e of svc.askStream(acctId, 'please tell me everything relevant to this topic here', conversations.create(acctId).id, { ...params, topK: 2, rerank })) {
+    for await (const e of svc.askStream(
+      acctId,
+      'please tell me everything relevant to this topic here',
+      conversations.create(acctId).id,
+      { ...params, topK: 2, rerank },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     return ids;
@@ -184,21 +262,47 @@ describe('ChatService summary-buffer memory', () => {
 
   it('reorders the pool by the model order when rerank is on', async () => {
     const acctId = seedRankable('rr@x.y');
-    const svc = new ChatService(fakeLlm('2, 0'), embeddings, emails, conversations, attachments, logger);
+    const svc = new ChatService(
+      fakeLlm('2, 0'),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+    );
     expect(await sourcesFor(svc, acctId, true)).toEqual(['m2', 'm0']);
   });
 
   it('falls back to the fusion order when the reranker output is unusable', async () => {
     const acctId = seedRankable('rr2@x.y');
-    const svc = new ChatService(fakeLlm('I cannot rank these'), embeddings, emails, conversations, attachments, logger);
+    const svc = new ChatService(
+      fakeLlm('I cannot rank these'),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+    );
     expect(await sourcesFor(svc, acctId, true)).toEqual(['m0', 'm1']);
   });
 
   it('feeds only the reranker-judged relevant items, not padded back up to topK', async () => {
     const acctId = seedRankable('rr-prune@x.y');
-    const svc = new ChatService(fakeLlm('2'), embeddings, emails, conversations, attachments, logger);
+    const svc = new ChatService(
+      fakeLlm('2'),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+    );
     let ids: string[] = [];
-    for await (const e of svc.askStream(acctId, 'please tell me everything relevant to this topic here', conversations.create(acctId).id, { ...params, topK: 10, rerank: true })) {
+    for await (const e of svc.askStream(
+      acctId,
+      'please tell me everything relevant to this topic here',
+      conversations.create(acctId).id,
+      { ...params, topK: 10, rerank: true },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids[0]).toBe('m2');
@@ -207,7 +311,14 @@ describe('ChatService summary-buffer memory', () => {
 
   it('does not rerank when rerank is off', async () => {
     const acctId = seedRankable('rr3@x.y');
-    const svc = new ChatService(fakeLlm('2, 0'), embeddings, emails, conversations, attachments, logger);
+    const svc = new ChatService(
+      fakeLlm('2, 0'),
+      embeddings,
+      emails,
+      conversations,
+      attachments,
+      logger,
+    );
     expect(await sourcesFor(svc, acctId, false)).toEqual(['m0', 'm1']);
   });
 
@@ -239,16 +350,36 @@ describe('ChatService summary-buffer memory', () => {
 
   it('surfaces a relevant attachment chunk as a cited source, none when unrelated', async () => {
     const acct = accounts.create({ address: 'att@x.y', kind: 'work' });
-    emails.upsertBatch([{ messageId: 'm1', accountId: acct.id, folder: 'INBOX', subject: 'Plan', body: 'see attached' }]);
-    const { id } = attachments.upsertAttachment({ messageId: 'm1', accountId: acct.id, filename: 'memo.pdf', partName: '1.2' });
-    const rowids = attachments.replaceChunks(id, 'm1', acct.id, ['the project codename is BLUEFOX']);
+    emails.upsertBatch([
+      {
+        messageId: 'm1',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'Plan',
+        body: 'see attached',
+      },
+    ]);
+    const { id } = attachments.upsertAttachment({
+      messageId: 'm1',
+      accountId: acct.id,
+      filename: 'memo.pdf',
+      partName: '1.2',
+    });
+    const rowids = attachments.replaceChunks(id, 'm1', acct.id, [
+      'the project codename is BLUEFOX',
+    ]);
     attachments.saveChunkEmbedding(rowids[0]!, acct.id, 'bge-m3', unitVector());
     attachments.setStatus(id, 'extracted', 30);
 
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let sources: { attachmentName?: string }[] = [];
-    for await (const ev of svc.askStream(acct.id, 'what is the project codename', conversations.create(acct.id).id, params)) {
+    for await (const ev of svc.askStream(
+      acct.id,
+      'what is the project codename',
+      conversations.create(acct.id).id,
+      params,
+    )) {
       if (ev.type === 'meta') sources = ev.sources;
     }
     expect(sources.some((s) => s.attachmentName === 'memo.pdf')).toBe(true);
@@ -256,7 +387,13 @@ describe('ChatService summary-buffer memory', () => {
 
   const localParams: ChatParams = { ...params, thinking: true };
   /** Consumes the full askStream without inspecting events, to drive side effects. */
-  const drainAll = async (svc: ChatService, acctId: string, q: string, convoId: string, p = localParams): Promise<void> => {
+  const drainAll = async (
+    svc: ChatService,
+    acctId: string,
+    q: string,
+    convoId: string,
+    p = localParams,
+  ): Promise<void> => {
     for await (const _ of svc.askStream(acctId, q, convoId, p)) {
     }
   };
@@ -267,18 +404,45 @@ describe('ChatService summary-buffer memory', () => {
     const day = 86_400_000;
     const nowMs = Date.now();
     emails.upsertBatch([
-      { messageId: 'old', accountId: acct.id, folder: 'INBOX', subject: 'ADH 2025', body: 'voir la piece jointe', date: nowMs - 300 * day },
-      { messageId: 'new', accountId: acct.id, folder: 'INBOX', subject: 'ADH 2026', body: 'voir la piece jointe', date: nowMs - 5 * day },
+      {
+        messageId: 'old',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'ADH 2025',
+        body: 'voir la piece jointe',
+        date: nowMs - 300 * day,
+      },
+      {
+        messageId: 'new',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'ADH 2026',
+        body: 'voir la piece jointe',
+        date: nowMs - 5 * day,
+      },
     ]);
     embeddings.saveEmbedding({ messageId: 'old', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'new', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.05));
-    const a1 = attachments.upsertAttachment({ messageId: 'old', accountId: acct.id, filename: 'Contrat Habitation ADHE-20250808-2731.pdf', partName: '1.2' });
+    embeddings.saveEmbedding(
+      { messageId: 'new', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.05),
+    );
+    const a1 = attachments.upsertAttachment({
+      messageId: 'old',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-20250808-2731.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a1.id, 'old', acct.id, [
       'Informations generales sur le contrat et les garanties incluses au dossier.',
       'La presente attestation est valable pour la periode comprise entre le 08/08/2025 et le 31/08/2026.',
     ]);
     attachments.setStatus(a1.id, 'extracted', 200);
-    const a2 = attachments.upsertAttachment({ messageId: 'new', accountId: acct.id, filename: 'Contrat Habitation ADHE-20260603-bba7c844.pdf', partName: '1.2' });
+    const a2 = attachments.upsertAttachment({
+      messageId: 'new',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-20260603-bba7c844.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a2.id, 'new', acct.id, [
       'Informations generales sur le contrat et les garanties incluses au dossier.',
       'La presente attestation est valable pour la periode comprise entre le 03/06/2026 et le 31/08/2027.',
@@ -291,7 +455,11 @@ describe('ChatService summary-buffer memory', () => {
   const genContextFor = async (acctId: string, question: string): Promise<string> => {
     const llm = fakeLlm();
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
-    for await (const e of svc.askStream(acctId, question, conversations.create(acctId).id, { ...params, topK: 8, rerank: false })) {
+    for await (const e of svc.askStream(acctId, question, conversations.create(acctId).id, {
+      ...params,
+      topK: 8,
+      rerank: false,
+    })) {
       void e;
     }
     return (llm.streamOpts.at(-1)?.messages ?? []).map((m) => m.content).join('\n');
@@ -299,7 +467,10 @@ describe('ChatService summary-buffer memory', () => {
 
   it('surfaces the current contract date chunk for a dates question, not a non-date chunk', async () => {
     const acctId = seedAdhContracts('adh-cur@x.y');
-    const ctx = await genContextFor(acctId, 'what are the start and end dates of my current habitation insurance contract?');
+    const ctx = await genContextFor(
+      acctId,
+      'what are the start and end dates of my current habitation insurance contract?',
+    );
     expect(ctx).toContain('03/06/2026');
     expect(ctx).toContain('31/08/2027');
     expect(ctx).not.toContain('08/08/2025');
@@ -307,16 +478,33 @@ describe('ChatService summary-buffer memory', () => {
 
   it('surfaces the PREVIOUS contract date chunk when the user asks for the previous one', async () => {
     const acctId = seedAdhContracts('adh-prev@x.y');
-    const ctx = await genContextFor(acctId, 'what are the dates of my previous habitation insurance contract?');
+    const ctx = await genContextFor(
+      acctId,
+      'what are the dates of my previous habitation insurance contract?',
+    );
     expect(ctx).toContain('08/08/2025');
     expect(ctx).not.toContain('03/06/2026');
   });
 
   it('feeds the FULL date-range chunk, not a truncated one, when the period is split across chunks', async () => {
     const acct = accounts.create({ address: 'adhsplit@x.y', kind: 'work' });
-    emails.upsertBatch([{ messageId: 'm', accountId: acct.id, folder: 'INBOX', subject: 'Assurance habitation', body: 'voir la piece jointe', date: Date.now() }]);
+    emails.upsertBatch([
+      {
+        messageId: 'm',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'Assurance habitation',
+        body: 'voir la piece jointe',
+        date: Date.now(),
+      },
+    ]);
     embeddings.saveEmbedding({ messageId: 'm', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    const a = attachments.upsertAttachment({ messageId: 'm', accountId: acct.id, filename: 'Contrat Habitation ADHE-20260603.pdf', partName: '1.2' });
+    const a = attachments.upsertAttachment({
+      messageId: 'm',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-20260603.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a.id, 'm', acct.id, [
       'La presente attestation est valable pour la periode comprise entre le 01/01/2026 et le 31/08',
       'Le present contrat valable, periode comprise entre les parties, signe le 02/02/2026 et le 31/08',
@@ -324,22 +512,45 @@ describe('ChatService summary-buffer memory', () => {
       'DUREE DU CONTRAT les garanties sont accordees pour la periode du 03/06/2026 au 31/08/2027 sans tacite',
     ]);
     attachments.setStatus(a.id, 'extracted', 400);
-    const ctx = await genContextFor(acct.id, 'what are the start and end dates of my current habitation insurance contract?');
+    const ctx = await genContextFor(
+      acct.id,
+      'what are the start and end dates of my current habitation insurance contract?',
+    );
     expect(ctx).toContain('31/08/2027');
   });
 
   it('retrieves an English-titled document for a French query via bilingual expansion', async () => {
     const acct = accounts.create({ address: 'biling@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'es', accountId: acct.id, folder: 'INBOX', subject: 'Technical Foundations - Evaluation Summary', body: 'MCQ average 18.5. ABS means unjustified absence counted as 0.' },
-      { messageId: 'other', accountId: acct.id, folder: 'INBOX', subject: 'random newsletter', body: 'unrelated marketing content here' },
+      {
+        messageId: 'es',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'Technical Foundations - Evaluation Summary',
+        body: 'MCQ average 18.5. ABS means unjustified absence counted as 0.',
+      },
+      {
+        messageId: 'other',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'random newsletter',
+        body: 'unrelated marketing content here',
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'other', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
+    embeddings.saveEmbedding(
+      { messageId: 'other', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
     embeddings.saveEmbedding({ messageId: 'es', accountId: acct.id, modelId: 'bge-m3' }, evVec(1));
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'Dans le resume d evaluation TFSD, que signifie ABS ?', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'Dans le resume d evaluation TFSD, que signifie ABS ?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids).toContain('es');
@@ -350,7 +561,20 @@ describe('ChatService summary-buffer memory', () => {
     const convo = conversations.create(acct.id);
     conversations.append(convo.id, [
       { role: 'user', content: 'what is the latest insurance doc?', at: Date.now() },
-      { role: 'assistant', content: 'Health insurance info.', at: Date.now(), sources: [{ messageId: 'health', subject: 'Health insurance info', fromAddr: 'cps2@x.y', date: Date.now(), score: 0.9 }] },
+      {
+        role: 'assistant',
+        content: 'Health insurance info.',
+        at: Date.now(),
+        sources: [
+          {
+            messageId: 'health',
+            subject: 'Health insurance info',
+            fromAddr: 'cps2@x.y',
+            date: Date.now(),
+            score: 0.9,
+          },
+        ],
+      },
     ]);
     const llm = fakeLlm('ADH home insurance contract');
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
@@ -367,12 +591,16 @@ describe('ChatService summary-buffer memory', () => {
       { role: 'user', content: 'What was my TODO average?', at: Date.now() },
       { role: 'assistant', content: 'It was 20/20.', at: Date.now() },
     ]);
-    const llm = fakeLlm('<think>\nOkay, the user is asking about the ABS average, let me find which email');
+    const llm = fakeLlm(
+      '<think>\nOkay, the user is asking about the ABS average, let me find which email',
+    );
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
 
     await drainAll(svc, acct.id, 'and the ABS one?', convo.id);
 
-    expect(llm.chatOpts.some((o) => /\/no_think$/.test(o.messages.at(-1)?.content ?? ''))).toBe(true);
+    expect(llm.chatOpts.some((o) => /\/no_think$/.test(o.messages.at(-1)?.content ?? ''))).toBe(
+      true,
+    );
     expect(llm.embedInputs).toContain('and the ABS one?');
     expect(llm.embedInputs.some((t) => /Okay, the user/.test(t))).toBe(false);
   });
@@ -382,7 +610,9 @@ describe('ChatService summary-buffer memory', () => {
     const convo = conversations.create(acct.id);
     seed(convo.id, 10);
     conversations.updateSummary(convo.id, 'Good prior summary.', 0);
-    const llm = fakeLlm('<think>\nLet me summarize the discussion about deadlines and the viva and');
+    const llm = fakeLlm(
+      '<think>\nLet me summarize the discussion about deadlines and the viva and',
+    );
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
 
     await drainAll(svc, acct.id, 'write a longer reply', convo.id);
@@ -428,8 +658,7 @@ describe('ChatService summary-buffer memory', () => {
     try {
       for await (const _ of svc.askStream(acct.id, 'q2', convo.id, params)) {
       }
-    } catch {
-    }
+    } catch {}
     const after = conversations.get(convo.id);
     expect(after).not.toBeNull();
     expect(after!.turns).toHaveLength(1);
@@ -440,21 +669,76 @@ describe('ChatService summary-buffer memory', () => {
     const day = 86_400_000;
     const nowMs = Date.now();
     emails.upsertBatch([
-      { messageId: 'cps2-1', accountId: acct.id, folder: 'INBOX', subject: 'CPS2 defense schedule', body: 'CPS2 defense', date: nowMs - 5 * day },
-      { messageId: 'cps2-2', accountId: acct.id, folder: 'INBOX', subject: 'CPS2 defense rooms', body: 'CPS2 defense', date: nowMs - 8 * day },
-      { messageId: 'yt-0', accountId: acct.id, folder: 'INBOX', subject: 'YouTube digest', body: 'videos', date: nowMs - 1 * day },
-      { messageId: 'yt-1', accountId: acct.id, folder: 'INBOX', subject: 'GitHub notice', body: 'pull request', date: nowMs - 1 * day },
-      { messageId: 'yt-2', accountId: acct.id, folder: 'INBOX', subject: 'Sale newsletter', body: 'discount', date: nowMs - 2 * day },
+      {
+        messageId: 'cps2-1',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'CPS2 defense schedule',
+        body: 'CPS2 defense',
+        date: nowMs - 5 * day,
+      },
+      {
+        messageId: 'cps2-2',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'CPS2 defense rooms',
+        body: 'CPS2 defense',
+        date: nowMs - 8 * day,
+      },
+      {
+        messageId: 'yt-0',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'YouTube digest',
+        body: 'videos',
+        date: nowMs - 1 * day,
+      },
+      {
+        messageId: 'yt-1',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'GitHub notice',
+        body: 'pull request',
+        date: nowMs - 1 * day,
+      },
+      {
+        messageId: 'yt-2',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'Sale newsletter',
+        body: 'discount',
+        date: nowMs - 2 * day,
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'cps2-1', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'cps2-2', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.05));
-    embeddings.saveEmbedding({ messageId: 'yt-0', accountId: acct.id, modelId: 'bge-m3' }, evVec(2));
-    embeddings.saveEmbedding({ messageId: 'yt-1', accountId: acct.id, modelId: 'bge-m3' }, evVec(2.1));
-    embeddings.saveEmbedding({ messageId: 'yt-2', accountId: acct.id, modelId: 'bge-m3' }, evVec(2.2));
+    embeddings.saveEmbedding(
+      { messageId: 'cps2-1', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'cps2-2', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.05),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'yt-0', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(2),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'yt-1', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(2.1),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'yt-2', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(2.2),
+    );
 
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'Summarize my recent emails about CPS2 defenses', conversations.create(acct.id).id, { ...params, topK: 3, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'Summarize my recent emails about CPS2 defenses',
+      conversations.create(acct.id).id,
+      { ...params, topK: 3, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids.slice(0, 2).sort()).toEqual(['cps2-1', 'cps2-2']);
@@ -465,9 +749,30 @@ describe('ChatService summary-buffer memory', () => {
     const day = 86_400_000;
     const nowMs = Date.now();
     emails.upsertBatch([
-      { messageId: 'old', accountId: acct.id, folder: 'INBOX', subject: 'older', body: 'x', date: nowMs - 10 * day },
-      { messageId: 'mid', accountId: acct.id, folder: 'INBOX', subject: 'middle', body: 'y', date: nowMs - 5 * day },
-      { messageId: 'new', accountId: acct.id, folder: 'INBOX', subject: 'newest', body: 'z', date: nowMs - 1 * day },
+      {
+        messageId: 'old',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'older',
+        body: 'x',
+        date: nowMs - 10 * day,
+      },
+      {
+        messageId: 'mid',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'middle',
+        body: 'y',
+        date: nowMs - 5 * day,
+      },
+      {
+        messageId: 'new',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'newest',
+        body: 'z',
+        date: nowMs - 1 * day,
+      },
     ]);
     embeddings.saveEmbedding({ messageId: 'old', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
     embeddings.saveEmbedding({ messageId: 'mid', accountId: acct.id, modelId: 'bge-m3' }, evVec(1));
@@ -475,7 +780,12 @@ describe('ChatService summary-buffer memory', () => {
 
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'show my recent emails', conversations.create(acct.id).id, { ...params, topK: 3, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'show my recent emails',
+      conversations.create(acct.id).id,
+      { ...params, topK: 3, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids).toEqual(['new', 'mid', 'old']);
@@ -493,16 +803,31 @@ describe('ChatService summary-buffer memory', () => {
       body: 'noise',
       date: nowMs - 1 * day,
     }));
-    batch.push({ messageId: 'rel', accountId: acct.id, folder: 'INBOX', subject: 'CPS2 defense', body: 'CPS2 defense', date: nowMs - 20 * day });
+    batch.push({
+      messageId: 'rel',
+      accountId: acct.id,
+      folder: 'INBOX',
+      subject: 'CPS2 defense',
+      body: 'CPS2 defense',
+      date: nowMs - 20 * day,
+    });
     emails.upsertBatch(batch);
     for (let i = 0; i < 50; i++) {
-      embeddings.saveEmbedding({ messageId: `f${i}`, accountId: acct.id, modelId: 'bge-m3' }, evVec(2));
+      embeddings.saveEmbedding(
+        { messageId: `f${i}`, accountId: acct.id, modelId: 'bge-m3' },
+        evVec(2),
+      );
     }
     embeddings.saveEmbedding({ messageId: 'rel', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
 
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'recent emails about CPS2 defenses', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'recent emails about CPS2 defenses',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids).toContain('rel');
@@ -529,15 +854,38 @@ describe('ChatService summary-buffer memory', () => {
   it('promotes the evaluation-summary email to the front for an aggregate question', async () => {
     const acct = accounts.create({ address: 'agg@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'mcq2', accountId: acct.id, folder: 'INBOX', subject: 'TFSD Lecture 2 MCQ test results', body: 'average 14.32' },
-      { messageId: 'summary', accountId: acct.id, folder: 'INBOX', subject: 'TFSD - Evaluation Summary', body: 'Your evaluation results are as follows: average MCQ 18.5, TODO 20' },
+      {
+        messageId: 'mcq2',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'TFSD Lecture 2 MCQ test results',
+        body: 'average 14.32',
+      },
+      {
+        messageId: 'summary',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'TFSD - Evaluation Summary',
+        body: 'Your evaluation results are as follows: average MCQ 18.5, TODO 20',
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'mcq2', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'summary', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.3));
+    embeddings.saveEmbedding(
+      { messageId: 'mcq2', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'summary', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.3),
+    );
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'What was my overall average across all MCQ tests?', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'What was my overall average across all MCQ tests?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids[0]).toBe('summary');
@@ -546,15 +894,38 @@ describe('ChatService summary-buffer memory', () => {
   it('does not promote a summary email for a specific non-aggregate question', async () => {
     const acct = accounts.create({ address: 'spec@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'mcq2', accountId: acct.id, folder: 'INBOX', subject: 'TFSD Lecture 2 MCQ test results', body: 'your mark 17' },
-      { messageId: 'summary', accountId: acct.id, folder: 'INBOX', subject: 'TFSD - Evaluation Summary', body: 'evaluation results as follows: average MCQ 18.5' },
+      {
+        messageId: 'mcq2',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'TFSD Lecture 2 MCQ test results',
+        body: 'your mark 17',
+      },
+      {
+        messageId: 'summary',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'TFSD - Evaluation Summary',
+        body: 'evaluation results as follows: average MCQ 18.5',
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'mcq2', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'summary', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.3));
+    embeddings.saveEmbedding(
+      { messageId: 'mcq2', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'summary', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.3),
+    );
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'In TFSD Lecture 2 MCQ test how many marks did I get on it?', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'In TFSD Lecture 2 MCQ test how many marks did I get on it?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids[0]).toBe('mcq2');
@@ -563,15 +934,38 @@ describe('ChatService summary-buffer memory', () => {
   it('does not falsely promote an individual email that merely mentions "final grade" in prose', async () => {
     const acct = accounts.create({ address: 'fp@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'close', accountId: acct.id, folder: 'INBOX', subject: 'Lecture 3 result', body: 'your mark 15' },
-      { messageId: 'fg', accountId: acct.id, folder: 'INBOX', subject: 'TFSD final exam', body: 'your final grade contribution from this exam is 12' },
+      {
+        messageId: 'close',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'Lecture 3 result',
+        body: 'your mark 15',
+      },
+      {
+        messageId: 'fg',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'TFSD final exam',
+        body: 'your final grade contribution from this exam is 12',
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'close', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'fg', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.5));
+    embeddings.saveEmbedding(
+      { messageId: 'close', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
+    embeddings.saveEmbedding(
+      { messageId: 'fg', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.5),
+    );
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'what was my cumulative result across the whole course?', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'what was my cumulative result across the whole course?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids[0]).toBe('close');
@@ -582,7 +976,9 @@ describe('ChatService summary-buffer memory', () => {
     const convo = conversations.create(acct.id);
     seed(convo.id, 10);
     conversations.updateSummary(convo.id, 'Good prior summary.', 0);
-    const llm = fakeLlm('We are updating the summary with the new exchanges. New exchanges: the user asked about grades.');
+    const llm = fakeLlm(
+      'We are updating the summary with the new exchanges. New exchanges: the user asked about grades.',
+    );
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
 
     await drainAll(svc, acct.id, 'write a longer reply', convo.id);
@@ -595,12 +991,32 @@ describe('ChatService summary-buffer memory', () => {
   it('answers from a named filename-targeted document, not a higher-ranked unrelated email', async () => {
     const acct = accounts.create({ address: 'fn@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'doc', accountId: acct.id, folder: 'INBOX', subject: 'Stage a l etranger', body: 'voir la piece jointe' },
-      { messageId: 'noise', accountId: acct.id, folder: 'INBOX', subject: 'unrelated', body: 'closest embedding but irrelevant' },
+      {
+        messageId: 'doc',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'Stage a l etranger',
+        body: 'voir la piece jointe',
+      },
+      {
+        messageId: 'noise',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'unrelated',
+        body: 'closest embedding but irrelevant',
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'noise', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
+    embeddings.saveEmbedding(
+      { messageId: 'noise', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
     embeddings.saveEmbedding({ messageId: 'doc', accountId: acct.id, modelId: 'bge-m3' }, evVec(2));
-    const att = attachments.upsertAttachment({ messageId: 'doc', accountId: acct.id, filename: 'StagesEtranger-1.pdf', partName: '1.2' });
+    const att = attachments.upsertAttachment({
+      messageId: 'doc',
+      accountId: acct.id,
+      filename: 'StagesEtranger-1.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(att.id, 'doc', acct.id, [
       'Informations generales sur le stage a l etranger et les demarches.',
       "Ordre de signature de la convention de stage: 1 Etudiant, 2 Organisme d'accueil, 3 Responsable de la formation, 4 Directeur.",
@@ -609,7 +1025,12 @@ describe('ChatService summary-buffer memory', () => {
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let sources: Array<{ messageId: string; attachmentName?: string }> = [];
-    for await (const e of svc.askStream(acct.id, "Dans le fichier StagesEtranger-1.pdf, quel est l'ordre exact de signature de la convention ?", conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      "Dans le fichier StagesEtranger-1.pdf, quel est l'ordre exact de signature de la convention ?",
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') sources = e.sources;
     }
     expect(sources[0]?.attachmentName).toBe('StagesEtranger-1.pdf');
@@ -621,18 +1042,36 @@ describe('ChatService summary-buffer memory', () => {
     const acct = accounts.create({ address: 'anchor@x.y', kind: 'work' });
     const convo = conversations.create(acct.id);
     conversations.append(convo.id, [
-      { role: 'user', content: 'Avant quelle date completer le Dossier Social Etudiant ?', at: Date.now() },
+      {
+        role: 'user',
+        content: 'Avant quelle date completer le Dossier Social Etudiant ?',
+        at: Date.now(),
+      },
       {
         role: 'assistant',
         content: 'Avant le 31 mai 2026.',
         at: Date.now(),
-        sources: [{ messageId: 'crous', subject: 'Communication Ecole pour CROUS 2026-2027', fromAddr: 'ecole@x.y', date: Date.now(), score: 0.9 }],
+        sources: [
+          {
+            messageId: 'crous',
+            subject: 'Communication Ecole pour CROUS 2026-2027',
+            fromAddr: 'ecole@x.y',
+            date: Date.now(),
+            score: 0.9,
+          },
+        ],
       },
     ]);
     const llm = fakeLlm('A qui envoyer la notification conditionnelle ?');
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
 
-    await drainAll(svc, acct.id, 'Et a qui dois-je envoyer la notification conditionnelle ?', convo.id, params);
+    await drainAll(
+      svc,
+      acct.id,
+      'Et a qui dois-je envoyer la notification conditionnelle ?',
+      convo.id,
+      params,
+    );
 
     expect(llm.embedInputs.some((t) => /Communication Ecole pour CROUS/.test(t))).toBe(true);
   });
@@ -642,19 +1081,48 @@ describe('ChatService summary-buffer memory', () => {
     const day = 86_400_000;
     const nowMs = Date.now();
     emails.upsertBatch([
-      { messageId: 'old', accountId: acct.id, folder: 'INBOX', subject: 'old contract', body: 'see attached', date: nowMs - 300 * day },
-      { messageId: 'new', accountId: acct.id, folder: 'INBOX', subject: 'new contract', body: 'see attached', date: nowMs - 5 * day },
+      {
+        messageId: 'old',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'old contract',
+        body: 'see attached',
+        date: nowMs - 300 * day,
+      },
+      {
+        messageId: 'new',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'new contract',
+        body: 'see attached',
+        date: nowMs - 5 * day,
+      },
     ]);
-    const a1 = attachments.upsertAttachment({ messageId: 'old', accountId: acct.id, filename: 'Contrat Habitation ADHE-2025.pdf', partName: '1.2' });
+    const a1 = attachments.upsertAttachment({
+      messageId: 'old',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-2025.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a1.id, 'old', acct.id, ['valable entre 2025 et 2026']);
     attachments.setStatus(a1.id, 'extracted', 30);
-    const a2 = attachments.upsertAttachment({ messageId: 'new', accountId: acct.id, filename: 'Contrat Habitation ADHE-2026.pdf', partName: '1.2' });
+    const a2 = attachments.upsertAttachment({
+      messageId: 'new',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-2026.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a2.id, 'new', acct.id, ['valable entre 2026 et 2027']);
     attachments.setStatus(a2.id, 'extracted', 30);
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'dans le document contrat habitation, quelle est la periode de validite ?', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'dans le document contrat habitation, quelle est la periode de validite ?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids.length).toBeGreaterThan(0);
@@ -663,17 +1131,44 @@ describe('ChatService summary-buffer memory', () => {
 
   it('feeds only the named attachment chunks, not sibling attachments of the same email', async () => {
     const acct = accounts.create({ address: 'multi@x.y', kind: 'work' });
-    emails.upsertBatch([{ messageId: 'm', accountId: acct.id, folder: 'INBOX', subject: 'insurance', body: 'see attached' }]);
-    const a1 = attachments.upsertAttachment({ messageId: 'm', accountId: acct.id, filename: 'Attestation de Droits.pdf', partName: '1.2' });
-    attachments.replaceChunks(a1.id, 'm', acct.id, ['Je m inscris depuis le site etudiant-etranger.ameli.fr']);
+    emails.upsertBatch([
+      {
+        messageId: 'm',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'insurance',
+        body: 'see attached',
+      },
+    ]);
+    const a1 = attachments.upsertAttachment({
+      messageId: 'm',
+      accountId: acct.id,
+      filename: 'Attestation de Droits.pdf',
+      partName: '1.2',
+    });
+    attachments.replaceChunks(a1.id, 'm', acct.id, [
+      'Je m inscris depuis le site etudiant-etranger.ameli.fr',
+    ]);
     attachments.setStatus(a1.id, 'extracted', 30);
-    const a2 = attachments.upsertAttachment({ messageId: 'm', accountId: acct.id, filename: 'VALIDATION VLS-TS.pdf', partName: '1.3' });
-    attachments.replaceChunks(a2.id, 'm', acct.id, ['Validation visa long sejour, sibling content only']);
+    const a2 = attachments.upsertAttachment({
+      messageId: 'm',
+      accountId: acct.id,
+      filename: 'VALIDATION VLS-TS.pdf',
+      partName: '1.3',
+    });
+    attachments.replaceChunks(a2.id, 'm', acct.id, [
+      'Validation visa long sejour, sibling content only',
+    ]);
     attachments.setStatus(a2.id, 'extracted', 30);
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let names: Array<string | undefined> = [];
-    for await (const e of svc.askStream(acct.id, "Dans le document Attestation de Droits, sur quel site faut-il s'inscrire ?", conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      "Dans le document Attestation de Droits, sur quel site faut-il s'inscrire ?",
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') names = e.sources.map((s) => s.attachmentName);
     }
     expect(names).toContain('Attestation de Droits.pdf');
@@ -683,20 +1178,47 @@ describe('ChatService summary-buffer memory', () => {
   it('deterministically force-includes the prior source document on a follow-up the new search misses', async () => {
     const acct = accounts.create({ address: 'fi@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'crous', accountId: acct.id, folder: 'INBOX', subject: 'CROUS', body: 'Contactez carole.claudinon@mines-stetienne.fr.' },
-      { messageId: 'noise', accountId: acct.id, folder: 'INBOX', subject: 'unrelated', body: 'random closest content' },
+      {
+        messageId: 'crous',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'CROUS',
+        body: 'Contactez carole.claudinon@mines-stetienne.fr.',
+      },
+      {
+        messageId: 'noise',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'unrelated',
+        body: 'random closest content',
+      },
     ]);
-    embeddings.saveEmbedding({ messageId: 'noise', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
+    embeddings.saveEmbedding(
+      { messageId: 'noise', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0),
+    );
     const convo = conversations.create(acct.id);
     conversations.append(convo.id, [
       { role: 'user', content: 'avant quelle date ?', at: Date.now() },
-      { role: 'assistant', content: 'avant le 31 mai 2026', at: Date.now(), sources: [{ messageId: 'crous', subject: null, fromAddr: 'e@x.y', date: Date.now(), score: 0.9 }] },
+      {
+        role: 'assistant',
+        content: 'avant le 31 mai 2026',
+        at: Date.now(),
+        sources: [
+          { messageId: 'crous', subject: null, fromAddr: 'e@x.y', date: Date.now(), score: 0.9 },
+        ],
+      },
     ]);
     const llm = fakeLlm('a qui dois je transmettre le dossier ?');
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'Et a qui dois-je transmettre le dossier ?', convo.id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'Et a qui dois-je transmettre le dossier ?',
+      convo.id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     expect(ids).toContain('crous');
@@ -705,21 +1227,53 @@ describe('ChatService summary-buffer memory', () => {
   it('does not hijack into one file when several distinct documents share a token, so it goes hybrid', async () => {
     const acct = accounts.create({ address: 'amb@x.y', kind: 'work' });
     emails.upsertBatch([
-      { messageId: 'a', accountId: acct.id, folder: 'INBOX', subject: 'offer', body: 'see attached' },
-      { messageId: 'b', accountId: acct.id, folder: 'INBOX', subject: 'convention', body: 'see attached' },
+      {
+        messageId: 'a',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'offer',
+        body: 'see attached',
+      },
+      {
+        messageId: 'b',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'convention',
+        body: 'see attached',
+      },
     ]);
     embeddings.saveEmbedding({ messageId: 'a', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'b', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.05));
-    const aa = attachments.upsertAttachment({ messageId: 'a', accountId: acct.id, filename: 'internship offer TechCorp.pdf', partName: '1.2' });
-    attachments.replaceChunks(aa.id, 'a', acct.id, ['offer details for the internship at TechCorp']);
+    embeddings.saveEmbedding(
+      { messageId: 'b', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.05),
+    );
+    const aa = attachments.upsertAttachment({
+      messageId: 'a',
+      accountId: acct.id,
+      filename: 'internship offer TechCorp.pdf',
+      partName: '1.2',
+    });
+    attachments.replaceChunks(aa.id, 'a', acct.id, [
+      'offer details for the internship at TechCorp',
+    ]);
     attachments.setStatus(aa.id, 'extracted', 30);
-    const bb = attachments.upsertAttachment({ messageId: 'b', accountId: acct.id, filename: 'internship report MinesStE.pdf', partName: '1.2' });
+    const bb = attachments.upsertAttachment({
+      messageId: 'b',
+      accountId: acct.id,
+      filename: 'internship report MinesStE.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(bb.id, 'b', acct.id, ['report content for the internship at Mines']);
     attachments.setStatus(bb.id, 'extracted', 30);
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let ids: string[] = [];
-    for await (const e of svc.askStream(acct.id, 'que dit le document internship sur les dates exactes ?', conversations.create(acct.id).id, { ...params, topK: 5, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'que dit le document internship sur les dates exactes ?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 5, rerank: false },
+    )) {
       if (e.type === 'meta') ids = e.sources.map((s) => s.messageId);
     }
     const seen = new Set(ids);
@@ -730,7 +1284,9 @@ describe('ChatService summary-buffer memory', () => {
     const acct = accounts.create({ address: 'sumok@x.y', kind: 'work' });
     const convo = conversations.create(acct.id);
     seed(convo.id, 10);
-    const llm = fakeLlm('The user asked Marie about the previous summary report and noted the May 31 deadline.');
+    const llm = fakeLlm(
+      'The user asked Marie about the previous summary report and noted the May 31 deadline.',
+    );
     const svc = new ChatService(llm, embeddings, emails, conversations, attachments, logger);
 
     await drainAll(svc, acct.id, 'write a longer reply', convo.id);
@@ -745,21 +1301,53 @@ describe('ChatService summary-buffer memory', () => {
     const day = 86_400_000;
     const nowMs = Date.now();
     emails.upsertBatch([
-      { messageId: 'old', accountId: acct.id, folder: 'INBOX', subject: 'contract 2025', body: 'see attached', date: nowMs - 300 * day },
-      { messageId: 'new', accountId: acct.id, folder: 'INBOX', subject: 'contract 2026', body: 'see attached', date: nowMs - 5 * day },
+      {
+        messageId: 'old',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'contract 2025',
+        body: 'see attached',
+        date: nowMs - 300 * day,
+      },
+      {
+        messageId: 'new',
+        accountId: acct.id,
+        folder: 'INBOX',
+        subject: 'contract 2026',
+        body: 'see attached',
+        date: nowMs - 5 * day,
+      },
     ]);
     embeddings.saveEmbedding({ messageId: 'old', accountId: acct.id, modelId: 'bge-m3' }, evVec(0));
-    embeddings.saveEmbedding({ messageId: 'new', accountId: acct.id, modelId: 'bge-m3' }, evVec(0.05));
-    const a1 = attachments.upsertAttachment({ messageId: 'old', accountId: acct.id, filename: 'Contrat Habitation ADHE-20250808-2731.pdf', partName: '1.2' });
+    embeddings.saveEmbedding(
+      { messageId: 'new', accountId: acct.id, modelId: 'bge-m3' },
+      evVec(0.05),
+    );
+    const a1 = attachments.upsertAttachment({
+      messageId: 'old',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-20250808-2731.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a1.id, 'old', acct.id, ['valable du 08/08/2025 au 31/08/2026']);
     attachments.setStatus(a1.id, 'extracted', 30);
-    const a2 = attachments.upsertAttachment({ messageId: 'new', accountId: acct.id, filename: 'Contrat Habitation ADHE-20260603-bba7c844.pdf', partName: '1.2' });
+    const a2 = attachments.upsertAttachment({
+      messageId: 'new',
+      accountId: acct.id,
+      filename: 'Contrat Habitation ADHE-20260603-bba7c844.pdf',
+      partName: '1.2',
+    });
     attachments.replaceChunks(a2.id, 'new', acct.id, ['valable du 03/06/2026 au 31/08/2027']);
     attachments.setStatus(a2.id, 'extracted', 30);
     const svc = new ChatService(fakeLlm(), embeddings, emails, conversations, attachments, logger);
 
     let names: Array<string | undefined> = [];
-    for await (const e of svc.askStream(acct.id, 'what are the dates of my current habitation insurance contract?', conversations.create(acct.id).id, { ...params, topK: 8, rerank: false })) {
+    for await (const e of svc.askStream(
+      acct.id,
+      'what are the dates of my current habitation insurance contract?',
+      conversations.create(acct.id).id,
+      { ...params, topK: 8, rerank: false },
+    )) {
       if (e.type === 'meta') names = e.sources.map((s) => s.attachmentName).filter(Boolean);
     }
     expect(names).toContain('Contrat Habitation ADHE-20260603-bba7c844.pdf');

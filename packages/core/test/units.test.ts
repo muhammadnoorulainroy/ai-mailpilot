@@ -868,6 +868,36 @@ describe('parseTimeScope (time-scoped retrieval)', () => {
     const pure = parseTimeScope('this week', now)!;
     expect(stripTimeScope('this week', pure)).toBe('this week');
   });
+
+  it('scopes future expressions for calendar queries (EN + FR)', () => {
+    const startOfToday = new Date(2026, 5, 17, 0, 0, 0).getTime();
+
+    const tomorrow = parseTimeScope('am I free tomorrow?', now)!;
+    expect(tomorrow.label).toBe('tomorrow');
+    expect(inRange(tomorrow, new Date(2026, 5, 18, 10).getTime())).toBe(true);
+    expect(inRange(tomorrow, now)).toBe(false);
+
+    const nextWeek = parseTimeScope("what's on next week", now)!;
+    expect(nextWeek.label).toBe('next week');
+    expect(nextWeek.from).toBeGreaterThan(now);
+
+    const nextMonth = parseTimeScope('meetings next month', now)!;
+    expect(new Date(nextMonth.from).getMonth()).toBe(6);
+    expect(new Date(nextMonth.from).getFullYear()).toBe(2026);
+
+    const friday = parseTimeScope('am I free friday?', now)!;
+    expect(new Date(friday.from).getDay()).toBe(5);
+    expect(friday.from).toBeGreaterThanOrEqual(startOfToday);
+
+    const vendredi = parseTimeScope('suis-je libre vendredi', now)!;
+    expect(new Date(vendredi.from).getDay()).toBe(5);
+
+    const semaineProchaine = parseTimeScope('mes rendez-vous la semaine prochaine', now)!;
+    expect(semaineProchaine.label).toBe('next week');
+
+    const weekend = parseTimeScope("what's happening this weekend", now)!;
+    expect(new Date(weekend.from).getDay()).toBe(6);
+  });
 });
 
 describe('hasTopicTerms (time scope: rank by recency vs filter to window)', () => {
