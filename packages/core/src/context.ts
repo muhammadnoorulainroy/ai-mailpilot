@@ -10,6 +10,7 @@ import { openDatabase } from './db/database.js';
 import { createLlmClient, type LlmClient } from './llm/client.js';
 import { AccountRepository } from './repositories/account-repository.js';
 import { AttachmentRepository } from './repositories/attachment-repository.js';
+import { CalendarEventRepository } from './repositories/calendar-event-repository.js';
 import { CategoryRepository } from './repositories/category-repository.js';
 import { CategoryAliasRepository } from './repositories/category-alias-repository.js';
 import { CategoryProposalRepository } from './repositories/category-proposal-repository.js';
@@ -64,6 +65,7 @@ export interface Repositories {
   categorizeJobs: CategorizeJobRepository;
   emailAssistant: EmailAssistantRepository;
   emailUserLabels: EmailUserLabelRepository;
+  events: CalendarEventRepository;
 }
 
 /**
@@ -124,6 +126,7 @@ export function buildContext(): AppContext {
     categorizeJobs: new CategorizeJobRepository(db),
     emailAssistant: new EmailAssistantRepository(db),
     emailUserLabels: new EmailUserLabelRepository(db),
+    events: new CalendarEventRepository(db),
   };
 
   const triageService = new TriageService(llm, logger);
@@ -169,7 +172,13 @@ export function buildContext(): AppContext {
       repos.failures,
       logger,
     ),
-    triage: new TriageOrchestrator(triageService, repos.triage, repos.failures, logger),
+    triage: new TriageOrchestrator(
+      triageService,
+      repos.triage,
+      repos.failures,
+      logger,
+      repos.events,
+    ),
     topicDiscovery: new TopicDiscoveryService(
       llm,
       repos.emails,

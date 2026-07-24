@@ -822,4 +822,88 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 26,
+    name: 'calendar_events',
+    up: (db) => {
+      // Calendar events, captured from mail by the triage pass (source='email') and, later, ingested
+      // from a real calendar (ics/caldav). Each event carries a dense vector and an FTS row so chat can
+      // retrieve it alongside emails. Mirrors the attachments store: content table + vec0 pair + FTS +
+      // an AFTER DELETE trigger, since vec0 tables never FK-cascade.
+      db.exec(`
+        CREATE TABLE events (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          source_message_id TEXT,
+          title TEXT NOT NULL,
+          start_at INTEGER NOT NULL,
+          end_at INTEGER,
+          all_day INTEGER NOT NULL DEFAULT 0,
+          location TEXT,
+          organizer TEXT,
+          attendees TEXT,
+          description TEXT,
+          rrule TEXT,
+          status TEXT NOT NULL DEFAULT 'captured'
+            CHECK (status IN ('captured', 'confirmed', 'dismissed')),
+          source TEXT NOT NULL DEFAULT 'email'
+            CHECK (source IN ('email', 'ics', 'caldav', 'manual')),
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY (source_message_id, account_id) REFERENCES emails(message_id, account_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_events_account_start ON events(account_id, start_at);
+        CREATE INDEX idx_events_message ON events(source_message_id, account_id);
+
+        CREATE VIRTUAL TABLE event_embeddings USING vec0(embedding FLOAT[${EMBEDDING_DIM}]);
+
+        CREATE TABLE event_embedding_index (
+          rowid INTEGER PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (event_id, model_id)
+        );
+        CREATE INDEX idx_event_emb_lookup ON event_embedding_index(event_id, model_id);
+
+        CREATE VIRTUAL TABLE event_fts USING fts5(
+          title, location, description,
+          content='events',
+          content_rowid='rowid',
+          tokenize='unicode61 remove_diacritics 2'
+        );
+
+        -- vec0 tables do not FK-cascade; drop the vector when its index row goes.
+        CREATE TRIGGER trg_event_emb_delete
+        AFTER DELETE ON event_embedding_index BEGIN
+          DELETE FROM event_embeddings WHERE rowid = OLD.rowid;
+        END;
+
+        -- An event deletion cascades to its embedding index rows and its FTS entry.
+        CREATE TRIGGER trg_events_delete
+        AFTER DELETE ON events BEGIN
+          DELETE FROM event_embedding_index WHERE event_id = OLD.id;
+          INSERT INTO event_fts(event_fts, rowid, title, location, description)
+          VALUES ('delete', OLD.rowid, OLD.title, OLD.location, OLD.description);
+        END;
+
+        CREATE TRIGGER trg_events_insert
+        AFTER INSERT ON events BEGIN
+          INSERT INTO event_fts(rowid, title, location, description)
+          VALUES (new.rowid, new.title, new.location, new.description);
+        END;
+
+        CREATE TRIGGER trg_events_update
+        AFTER UPDATE ON events
+        WHEN old.title IS NOT new.title OR old.location IS NOT new.location
+          OR old.description IS NOT new.description
+        BEGIN
+          INSERT INTO event_fts(event_fts, rowid, title, location, description)
+          VALUES ('delete', OLD.rowid, OLD.title, OLD.location, OLD.description);
+          INSERT INTO event_fts(rowid, title, location, description)
+          VALUES (new.rowid, new.title, new.location, new.description);
+        END;
+      `);
+    },
+  },
 ];

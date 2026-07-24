@@ -4,7 +4,7 @@
  */
 import { z } from 'zod';
 import type { Logger } from 'pino';
-import type { TriageMetadata } from '@ai-mailpilot/shared';
+import type { CapturedEvent, TriageMetadata } from '@ai-mailpilot/shared';
 import type { LlmClient } from '../llm/client.js';
 import type { TriageBucket } from '../repositories/triage-repository.js';
 import { preprocessForEmbedding } from '../util/text.js';
@@ -12,16 +12,19 @@ import { LlmJsonParseError, parseLlmJson } from '../util/json-llm.js';
 
 const BucketSchema = z.enum(['urgent', 'summarize', 'spam', 'personal']);
 
-/** Outcome of triaging an email: its bucket, a short reasoning line, and derived metadata. */
+/** Outcome of triaging an email: its bucket, a short reasoning line, derived metadata, and any captured event. */
 export interface TriageResult {
   bucket: TriageBucket;
   reasoning: string;
   metadata: TriageMetadata;
+  event?: CapturedEvent | null;
 }
 
 const REASONING_MAX = 200;
 const ACTION_MAX = 140;
 const SUMMARY_MAX = 200;
+const EVENT_TITLE_MAX = 140;
+const EVENT_LOCATION_MAX = 140;
 const SINGLE_BODY_CHARS = 2000;
 const BATCH_BODY_CHARS = 900;
 const BATCH_TOKENS_PER_EMAIL = 180;
@@ -97,6 +100,54 @@ function toMetadata(
   };
 }
 
+/** Parses an "HH:MM" clock string into hour and minute, or null when malformed or out of range. */
+function parseClock(v: unknown): { h: number; m: number } | null {
+  if (typeof v !== 'string') return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(v.trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return { h, m: min };
+}
+
+/**
+ * Resolves an optional LLM `event` object into a CapturedEvent with absolute local-time
+ * timestamps, or null when the model gave no concrete, plausible date. Never invents a date.
+ */
+function parseEvent(ev: Record<string, unknown> | null, now: number): CapturedEvent | null {
+  if (!ev) return null;
+  const title = asText(ev.title, EVENT_TITLE_MAX);
+  if (!title) return null;
+
+  const dateStr = typeof ev.date === 'string' ? ev.date.trim() : '';
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
+  if (!dm) return null;
+  const year = Number(dm[1]);
+  const month = Number(dm[2]);
+  const day = Number(dm[3]);
+  const nowYear = new Date(now).getFullYear();
+  if (year < nowYear - 1 || year > nowYear + 5) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  const start = parseClock(ev.start);
+  const end = parseClock(ev.end);
+  const allDay = asBool(ev.allDay) || start === null;
+
+  const startAt = allDay
+    ? new Date(year, month - 1, day, 0, 0, 0, 0).getTime()
+    : new Date(year, month - 1, day, start!.h, start!.m, 0, 0).getTime();
+  if (!Number.isFinite(startAt)) return null;
+
+  let endAt: number | null = null;
+  if (!allDay && end) {
+    const e = new Date(year, month - 1, day, end.h, end.m, 0, 0).getTime();
+    endAt = Number.isFinite(e) && e > startAt ? e : null;
+  }
+
+  return { title, startAt, endAt, allDay, location: asText(ev.location, EVENT_LOCATION_MAX) };
+}
+
 /** Produces fallback metadata for a bucket when the LLM provided no usable fields. */
 function defaultMetadata(bucket: TriageBucket): TriageMetadata {
   return {
@@ -139,6 +190,7 @@ Then set these fields (they are INDEPENDENT of the bucket):
 - suggestedAction (short string or null): e.g. "Reply to confirm", "Verify the login", "Pay the invoice". Null if none.
 - shortSummary (short string or null): one terse line of what it is.
 - reasoning (short string, under 200 chars): one terse sentence.
+- event (object or null): if the email describes ONE concrete dated meeting, appointment, exam, deadline, call, or booking, extract it; otherwise null. Shape: {"title":"...","date":"YYYY-MM-DD","start":"HH:MM" or null,"end":"HH:MM" or null,"allDay":true or false,"location":"..." or null}. Resolve relative dates ("tomorrow","vendredi","le 12 mars","next Tuesday") using the email sent time and the current time above. If no concrete calendar date can be determined, event MUST be null. Never invent a date.
 
 Rules:
 - A no-reply / notification / mailer address is almost never urgent (exception: a security alert about the user's OWN account can be urgent).
@@ -150,7 +202,7 @@ Rules:
 - Interpret relative deadlines using the email sent time and the current time below. If an old email says "tomorrow" but that date is already past, deadlineHours MUST be null.
 
 OUTPUT (only this JSON, no prose, no code fences):
-{"bucket":"summarize","actionRequired":false,"needsReply":false,"deadlineHours":null,"importanceScore":35,"suggestedAction":null,"shortSummary":"...","reasoning":"..."}
+{"bucket":"summarize","actionRequired":false,"needsReply":false,"deadlineHours":null,"importanceScore":35,"suggestedAction":null,"shortSummary":"...","reasoning":"...","event":null}
 
 Examples:
 "Due tomorrow: submit project report" from no-reply+classroom
@@ -162,7 +214,9 @@ Examples:
 "Security alert: new sign-in on Windows" from Google
 -> {"bucket":"urgent","actionRequired":true,"needsReply":false,"deadlineHours":null,"importanceScore":85,"suggestedAction":"Verify the sign-in","shortSummary":"New sign-in to verify.","reasoning":"Account security event."}
 "Are you free for lunch Saturday?" from a friend
--> {"bucket":"personal","actionRequired":true,"needsReply":true,"deadlineHours":null,"importanceScore":60,"suggestedAction":"Reply about Saturday","shortSummary":"Friend asking about lunch.","reasoning":"Personal message expecting a reply."}`;
+-> {"bucket":"personal","actionRequired":true,"needsReply":true,"deadlineHours":null,"importanceScore":60,"suggestedAction":"Reply about Saturday","shortSummary":"Friend asking about lunch.","reasoning":"Personal message expecting a reply.","event":null}
+"Votre soutenance de stage est fixee au 12 mars 2026 de 14h a 15h30, salle B12" sent 2026-02-20
+-> {"bucket":"urgent","actionRequired":true,"needsReply":false,"deadlineHours":null,"importanceScore":88,"suggestedAction":"Prepare the defense","shortSummary":"Internship defense scheduled.","reasoning":"Scheduled defense with a fixed date, time, and room.","event":{"title":"Soutenance de stage","date":"2026-03-12","start":"14:00","end":"15:30","allDay":false,"location":"Salle B12"}}`;
 
 const BATCH_SYSTEM_PROMPT = `${SYSTEM_PROMPT.replace(
   'You triage ONE email for a daily focus view. Output ONLY a JSON object, nothing else.',
@@ -171,7 +225,7 @@ const BATCH_SYSTEM_PROMPT = `${SYSTEM_PROMPT.replace(
 
 Batch mode:
 - You will receive a JSON array of emails.
-- Return ONLY this JSON shape: {"results":[{"messageId":"...","bucket":"summarize","actionRequired":false,"needsReply":false,"deadlineHours":null,"importanceScore":35,"suggestedAction":null,"shortSummary":"...","reasoning":"..."}]}
+- Return ONLY this JSON shape: {"results":[{"messageId":"...","bucket":"summarize","actionRequired":false,"needsReply":false,"deadlineHours":null,"importanceScore":35,"suggestedAction":null,"shortSummary":"...","reasoning":"...","event":null}]}
 - Include exactly one result for every input messageId.
 - Do not add markdown, comments, or fields outside the JSON object.`;
 
@@ -334,35 +388,42 @@ function parseTriageObject(
   body: string,
   now: number,
 ): TriageResult {
+  const event = parseEvent(asRecord(obj.event), now);
   const bucketResult = BucketSchema.safeParse(obj.bucket);
   if (!bucketResult.success) {
     const salvaged = salvageBucket(raw);
     if (salvaged) {
-      return normalizeTriage(
-        email,
-        body,
-        {
-          bucket: salvaged,
-          reasoning: asText(obj.reasoning, REASONING_MAX) ?? '',
-          metadata: toMetadata(obj, salvaged, now),
-        },
-        now,
-      );
+      return {
+        ...normalizeTriage(
+          email,
+          body,
+          {
+            bucket: salvaged,
+            reasoning: asText(obj.reasoning, REASONING_MAX) ?? '',
+            metadata: toMetadata(obj, salvaged, now),
+          },
+          now,
+        ),
+        event,
+      };
     }
     throw new Error('triage response did not include a valid bucket');
   }
 
   const bucket = bucketResult.data;
-  return normalizeTriage(
-    email,
-    body,
-    {
-      bucket,
-      reasoning: asText(obj.reasoning, REASONING_MAX) ?? '',
-      metadata: toMetadata(obj, bucket, now),
-    },
-    now,
-  );
+  return {
+    ...normalizeTriage(
+      email,
+      body,
+      {
+        bucket,
+        reasoning: asText(obj.reasoning, REASONING_MAX) ?? '',
+        metadata: toMetadata(obj, bucket, now),
+      },
+      now,
+    ),
+    event,
+  };
 }
 
 /** Extracts per-message triage objects from a batch LLM response keyed by message id, tolerating array or map shapes. */

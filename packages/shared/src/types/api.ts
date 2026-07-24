@@ -211,6 +211,18 @@ export interface TriageMetadata {
   confidence?: number | null;
 }
 
+/**
+ * A calendar event captured from an email by the triage pass. Times are absolute epoch
+ * milliseconds resolved in the server's local timezone from the date and clock the model read.
+ */
+export interface CapturedEvent {
+  title: string;
+  startAt: number;
+  endAt: number | null;
+  allDay: boolean;
+  location: string | null;
+}
+
 /** Time range for the priority "Today's Focus" view. */
 export type PriorityRange = 'today' | 'week' | 'all';
 
