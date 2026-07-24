@@ -178,6 +178,7 @@ export function buildContext(): AppContext {
       repos.failures,
       logger,
       repos.events,
+      () => config.calendarEvents,
     ),
     topicDiscovery: new TopicDiscoveryService(
       llm,
@@ -257,7 +258,7 @@ export function buildContext(): AppContext {
       repos.categories,
       repos.emailUserLabels,
     ),
-    priority: new PriorityService(repos.triage),
+    priority: new PriorityService(repos.triage, repos.events),
     emailAssistant: new EmailAssistantService(
       llm,
       repos.accounts,

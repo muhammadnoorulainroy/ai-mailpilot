@@ -79,6 +79,7 @@ export interface ServerConfig {
   locale: 'en' | 'fr';
   autoIndex: boolean;
   autoTriage: boolean;
+  calendarEvents: boolean;
   indexedFolders: string[];
   llm: {
     baseUrl: string;
@@ -110,6 +111,7 @@ export interface UpdateConfigRequest {
   locale?: 'en' | 'fr';
   autoIndex?: boolean;
   autoTriage?: boolean;
+  calendarEvents?: boolean;
   indexedFolders?: string[];
   llm?: Partial<ServerConfig['llm']>;
   features?: Partial<NonNullable<ServerConfig['features']>>;

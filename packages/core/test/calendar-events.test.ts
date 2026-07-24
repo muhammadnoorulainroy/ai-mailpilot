@@ -146,6 +146,34 @@ describe('CalendarEventRepository', () => {
     expect(events.keywordSearchEvents(accountId, 'invoice', 6)).toHaveLength(0);
   });
 
+  it('maps the earliest event per message for a set of messages', () => {
+    const accountId = seed();
+    emails.upsertBatch([{ messageId: 'm2', accountId, folder: 'INBOX', subject: 'X' }]);
+    events.captureFromEmail({
+      accountId,
+      sourceMessageId: 'm1',
+      title: 'A',
+      startAt: 1000,
+      endAt: null,
+      allDay: false,
+      location: null,
+    });
+    events.captureFromEmail({
+      accountId,
+      sourceMessageId: 'm2',
+      title: 'B',
+      startAt: 2000,
+      endAt: null,
+      allDay: false,
+      location: 'Room',
+    });
+
+    const map = events.mapByMessages(accountId, ['m1', 'm2', 'mX']);
+    expect(map.get('m1')!.title).toBe('A');
+    expect(map.get('m2')!.location).toBe('Room');
+    expect(map.has('mX')).toBe(false);
+  });
+
   it('cascades event removal when the source email is deleted', () => {
     const accountId = seed();
     events.captureFromEmail({

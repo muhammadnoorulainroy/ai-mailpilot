@@ -5,6 +5,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { Database, Statement } from 'better-sqlite3';
+import type { CapturedEvent } from '@ai-mailpilot/shared';
 import { sanitizeFtsQuery } from '../util/text.js';
 
 /** A calendar event to persist, already resolved to absolute epoch-ms times. */
@@ -169,6 +170,33 @@ export class CalendarEventRepository {
     return (this.stmts.listInRange.all(accountId, from, to, limit) as RawEventRow[]).map(
       toEventRow,
     );
+  }
+
+  /** Returns the earliest captured event per message for the given message ids. */
+  mapByMessages(accountId: string, messageIds: string[]): Map<string, CapturedEvent> {
+    const out = new Map<string, CapturedEvent>();
+    if (messageIds.length === 0) return out;
+    const placeholders = messageIds.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(
+        `SELECT ${SELECT_COLUMNS} FROM events
+          WHERE account_id = ? AND source_message_id IN (${placeholders})
+          ORDER BY start_at ASC`,
+      )
+      .all(accountId, ...messageIds) as RawEventRow[];
+    for (const r of rows) {
+      const mid = r.source_message_id;
+      if (mid && !out.has(mid)) {
+        out.set(mid, {
+          title: r.title,
+          startAt: r.start_at,
+          endAt: r.end_at,
+          allDay: r.all_day === 1,
+          location: r.location,
+        });
+      }
+    }
+    return out;
   }
 
   /** BM25 keyword search over event title, location, and description. Best match first. */

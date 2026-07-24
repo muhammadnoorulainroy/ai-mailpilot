@@ -54,6 +54,7 @@ export const AppConfigSchema = z.object({
   autoIndex: z.boolean().default(false),
   /** After auto-indexing new mail, also run a triage/priority pass so the briefing stays current. */
   autoTriage: z.boolean().default(true),
+  calendarEvents: z.boolean().default(true),
   indexedFolders: z.array(z.string()).default([]),
   llm: LlmConfigSchema.default(() => LlmConfigSchema.parse({})),
   features: FeaturesConfigSchema.default(() => FeaturesConfigSchema.parse({})),

@@ -32,8 +32,10 @@ import type {
   PriorityRange,
   PriorityResponse,
   PriorityEmailDto,
+  CapturedEvent,
   TriageResolution,
 } from '@ai-mailpilot/shared';
+import { buildIcs, slugify } from './ics.js';
 import { MailboxSnapshot } from '../../thunderbird/mailbox.js';
 import { applyTagsForAccount } from '../../thunderbird/tags.js';
 import {
@@ -290,6 +292,8 @@ const ICON_CLIP =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 12-8.5 8.5a5 5 0 0 1-7-7L14 5a3 3 0 0 1 4 4l-8.5 8.5a1 1 0 0 1-1.5-1.5L15 9"/></svg>';
 const ICON_SPARK =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13H11l-1 9 8.5-11H12l1-9z"/></svg>';
+const ICON_CAL =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M12 14v4M10 16h4"/></svg>';
 
 const RESOLVE_META: Record<'done' | 'snooze' | 'dismiss', { title: string; icon: string }> = {
   done: { title: 'Mark done', icon: ICON_CHECK },
@@ -456,6 +460,17 @@ function priorityRow(email: PriorityEmailDto, severity: RowSeverity): HTMLElemen
     a.appendChild(document.createTextNode(email.suggestedAction));
     body.appendChild(a);
   }
+  if (email.event) {
+    const cal = document.createElement('button');
+    cal.className = 'pr-cal';
+    cal.type = 'button';
+    cal.title = 'Download an .ics to add this to your calendar';
+    cal.innerHTML = ICON_CAL;
+    cal.appendChild(document.createTextNode('Add to calendar'));
+    const captured = email.event;
+    cal.addEventListener('click', () => downloadIcs(captured, email.messageId));
+    body.appendChild(cal);
+  }
   row.appendChild(body);
 
   const rail = document.createElement('div');
@@ -543,6 +558,20 @@ function flagIcon(kind: 'reply' | 'clip', title: string): HTMLElement {
   span.title = title;
   span.innerHTML = kind === 'reply' ? ICON_REPLY : ICON_CLIP;
   return span;
+}
+
+/** Generates an .ics for a captured event and triggers its download so it can be added to a calendar. */
+function downloadIcs(event: CapturedEvent, messageId: string): void {
+  const uid = `${messageId}-${event.startAt}@ai-mailpilot`;
+  const blob = new Blob([buildIcs(event, uid)], { type: 'text/calendar;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${slugify(event.title)}.ics`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 /** Builds an icon button that resolves a triaged email to the given resolution when clicked. */

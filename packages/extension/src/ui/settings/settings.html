@@ -54,6 +54,15 @@
             current without a manual run. Uses one AI pass per new email; turn off to spare a local
             model the extra work. Requires auto-index.</span
           >
+          <label class="check-inline" style="margin-top: var(--space-3)">
+            <input type="checkbox" id="toggle-calendar-events" />
+            <span>Capture calendar events from mail</span>
+          </label>
+          <span class="hint"
+            >When the priority pass reads a mail that names a dated meeting, appointment, or
+            deadline, capture it as a calendar event you can add to your calendar and ask about in
+            chat. No extra AI pass; it rides along with triage.</span
+          >
         </div>
 
         <div class="sync-banner" id="sync-banner" hidden>

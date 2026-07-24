@@ -61,13 +61,14 @@ export class TriageOrchestrator {
   private progress: TriageProgress = this.idle();
   private running = false;
 
-  /** Creates the orchestrator with the triage service, repositories, and logger. Events, when supplied, receive any calendar event captured during triage. */
+  /** Creates the orchestrator with the triage service, repositories, and logger. Events, when supplied and enabled, receive any calendar event captured during triage. */
   constructor(
     private service: TriageService,
     private triage: TriageRepository,
     private failures: FailureRepository,
     private logger: Logger,
     private events?: CalendarEventRepository,
+    private captureEventsEnabled: () => boolean = () => true,
   ) {}
 
   /**
@@ -352,7 +353,7 @@ export class TriageOrchestrator {
    * re-triage no longer finds it. A capture failure is logged but never fails the triage result.
    */
   private captureEvent(email: UnclassifiedEmail, accountId: string, result: TriageResult): void {
-    if (!this.events) return;
+    if (!this.events || !this.captureEventsEnabled()) return;
     try {
       if (result.event) {
         this.events.captureFromEmail({

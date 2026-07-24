@@ -250,6 +250,7 @@ export interface PriorityEmailDto {
   importanceScore: number;
   suggestedAction: string | null;
   shortSummary: string | null;
+  event?: CapturedEvent | null;
 }
 
 /** The priority view payload with counts and rendered sections. */
