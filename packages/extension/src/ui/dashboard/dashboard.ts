@@ -232,9 +232,9 @@ function localDayStartMs(): number {
 }
 
 const RANGE_SUBTITLE: Record<PriorityRange, string> = {
-  today: 'What needs your attention today.',
-  week: 'Action and updates from the last 7 days.',
-  all: 'Everything triaged so far.',
+  today: 'today',
+  week: 'last 7 days',
+  all: 'all triaged mail',
 };
 
 const BUCKET_LABEL: Record<PriorityEmailDto['bucket'], string> = {
@@ -263,16 +263,49 @@ async function loadPriority(): Promise<void> {
   }
 }
 
-/** Renders the priority view metrics, the unclassified hint, and each priority bucket list. */
+type RowSeverity = 'urgent' | 'review' | 'fyi';
+
+const AVATAR_COLORS = [
+  '#7c3aed',
+  '#0891b2',
+  '#d97706',
+  '#475569',
+  '#059669',
+  '#e11d48',
+  '#4f46e5',
+  '#0d9488',
+];
+
+const ICON_CHECK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const ICON_X =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+const ICON_SNOOZE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg>';
+const ICON_CLOCK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
+const ICON_REPLY =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17 4 12l5-5"/><path d="M4 12h11a5 5 0 0 1 5 5v1"/></svg>';
+const ICON_CLIP =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 12-8.5 8.5a5 5 0 0 1-7-7L14 5a3 3 0 0 1 4 4l-8.5 8.5a1 1 0 0 1-1.5-1.5L15 9"/></svg>';
+const ICON_SPARK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13H11l-1 9 8.5-11H12l1-9z"/></svg>';
+
+const RESOLVE_META: Record<'done' | 'snooze' | 'dismiss', { title: string; icon: string }> = {
+  done: { title: 'Mark done', icon: ICON_CHECK },
+  snooze: { title: 'Snooze until tomorrow', icon: ICON_SNOOZE },
+  dismiss: { title: 'Dismiss', icon: ICON_X },
+};
+
+/** Renders the priority briefing sentence, per-section counts, the unclassified hint, and each bucket list. */
 function renderPriority(): void {
   const p = state.priority;
   if (!p) return;
 
-  $('focus-sub').textContent = RANGE_SUBTITLE[p.range];
-  $('metric-needs-action').textContent = p.counts.needsAction.toLocaleString();
-  $('metric-urgent').textContent = p.counts.urgent.toLocaleString();
-  $('metric-important').textContent = p.counts.important.toLocaleString();
-  $('metric-low').textContent = p.counts.lowPriority.toLocaleString();
+  $('focus-sub').textContent = buildBriefing(p.counts);
+  const updated = $('priority-updated');
+  updated.hidden = false;
+  updated.textContent = `Updated ${relativeTime(p.generatedAt)} · ${RANGE_SUBTITLE[p.range]}`;
 
   const unclassified = $('priority-unclassified');
   if (p.counts.unclassified > 0) {
@@ -285,115 +318,245 @@ function renderPriority(): void {
   }
 
   const needsEmpty =
-    p.range === 'today' ? 'No urgent email today.' : 'Nothing needs action in this range.';
-  renderPriorityList('needs-action-list', p.needsAction, needsEmpty);
-  renderPriorityList('important-list', p.important, 'No important updates.');
-  renderPriorityList('summaries-list', p.summaries, 'No summaries or digests.');
-  renderPriorityList('low-list', p.lowPriority, 'Nothing low priority.');
+    p.range === 'today'
+      ? "You're clear, nothing needs action today."
+      : 'Nothing needs action in this range.';
+  renderPriorityList('needs-action-list', p.needsAction, needsEmpty, 'urgent');
+  renderPriorityList('important-list', p.important, 'No important updates.', 'review');
+  renderPriorityList('summaries-list', p.summaries, 'No summaries or digests.', 'review');
+  renderPriorityList('low-list', p.lowPriority, 'Nothing low priority.', 'fyi');
+
+  setSectionCount('needs-action-count', p.counts.needsAction);
+  setSectionCount('important-count', p.counts.important);
+  setSectionCount('summaries-count', p.counts.summaries);
+  setSectionCount('low-count', p.counts.lowPriority);
 
   const carrySection = $('section-carryover');
   if (p.carryover.length > 0) {
     carrySection.hidden = false;
-    renderPriorityList('carryover-list', p.carryover, 'No carryover.');
+    renderPriorityList('carryover-list', p.carryover, 'No carryover.', 'fyi');
+    setSectionCount('carryover-count', p.carryover.length);
   } else {
     carrySection.hidden = true;
   }
-
-  $('low-count').textContent = p.counts.lowPriority > 0 ? `(${p.counts.lowPriority})` : '';
 }
 
-/** Renders a list of priority emails into a container, showing emptyText when there are none. */
+/** Composes the one-line briefing sentence shown under the Priority heading. */
+function buildBriefing(c: PriorityResponse['counts']): string {
+  const review = c.important + c.summaries;
+  if (c.needsAction === 0 && review === 0) {
+    return c.unclassified > 0
+      ? 'Nothing triaged in this range yet. Run the priority pass to see what needs you.'
+      : "You're all caught up. Nothing needs your attention right now.";
+  }
+  const parts: string[] = [];
+  if (c.needsAction > 0) {
+    parts.push(
+      `${c.needsAction} ${c.needsAction === 1 ? 'thing needs' : 'things need'} your action`,
+    );
+  }
+  if (review > 0) parts.push(`${review} worth a look`);
+  let sentence = `${parts.join(' and ')}.`;
+  if (c.needsAction > 0 && c.urgent === 0) sentence += ' Nothing is urgent.';
+  return sentence;
+}
+
+/** Sets a section count badge, hiding it when the count is zero. */
+function setSectionCount(id: string, n: number): void {
+  const el = $(id);
+  el.textContent = n > 0 ? n.toLocaleString() : '';
+  el.hidden = n === 0;
+}
+
+/** Formats a past timestamp as a short relative label like "just now" or "5m ago". */
+function relativeTime(ms: number): string {
+  if (!ms) return 'just now';
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return 'just now';
+  const minutes = Math.round(diff / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+/** Renders a list of priority emails into a container, showing a caught-up card when there are none. */
 function renderPriorityList(
   containerId: string,
   emails: PriorityEmailDto[],
   emptyText: string,
+  severity: RowSeverity,
 ): void {
   const container = $(containerId);
   container.innerHTML = '';
   if (emails.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-row';
-    empty.textContent = emptyText;
-    container.appendChild(empty);
+    container.appendChild(emptyCard(emptyText));
     return;
   }
-  for (const email of emails) container.appendChild(priorityRow(email));
+  for (const email of emails) container.appendChild(priorityRow(email, severity));
 }
 
-/** Builds a single priority email row with its subject, bucket tag, summary, and resolve actions. */
-function priorityRow(email: PriorityEmailDto): HTMLElement {
-  const row = document.createElement('div');
-  row.className = 'email-row priority-row';
+/** Builds the caught-up placeholder shown when a priority section has no emails. */
+function emptyCard(text: string): HTMLElement {
+  const el = document.createElement('div');
+  el.className = 'pr-empty';
+  el.innerHTML = ICON_CHECK;
+  el.appendChild(document.createTextNode(text));
+  return el;
+}
+
+/** Builds a priority row: severity rail, sender avatar, subject and chips, summary, suggested action, and hover resolve controls. */
+function priorityRow(email: PriorityEmailDto, severity: RowSeverity): HTMLElement {
+  const sev: RowSeverity = email.bucket === 'urgent' ? 'urgent' : severity;
+  const row = document.createElement('article');
+  row.className = `pr-row sev-${sev}`;
+
+  const av = avatarFor(email.fromAddr);
+  const avatar = document.createElement('div');
+  avatar.className = 'pr-avatar';
+  avatar.style.background = av.color;
+  avatar.textContent = av.initials;
+  avatar.setAttribute('aria-hidden', 'true');
+  row.appendChild(avatar);
+
+  const body = document.createElement('div');
+  body.className = 'pr-body';
+
+  const line1 = document.createElement('div');
+  line1.className = 'pr-line1';
+  const subject = document.createElement('span');
+  subject.className = 'pr-subject';
+  subject.textContent = email.subject ?? '(no subject)';
+  line1.appendChild(subject);
+  const chip = document.createElement('span');
+  chip.className = `pr-chip chip-${sev}`;
+  chip.textContent =
+    email.actionRequired && email.bucket !== 'summarize' ? 'Action' : BUCKET_LABEL[email.bucket];
+  line1.appendChild(chip);
+  if (email.needsReply) line1.appendChild(flagIcon('reply', 'Needs a reply'));
+  if (email.hasAttachments) line1.appendChild(flagIcon('clip', 'Has attachments'));
+  body.appendChild(line1);
 
   const meta = document.createElement('div');
-  meta.className = 'email-meta';
-
-  const head = document.createElement('div');
-  head.className = 'priority-head';
-  const subject = document.createElement('span');
-  subject.className = 'email-subject';
-  subject.textContent = email.subject ?? '(no subject)';
-  head.appendChild(subject);
-  const tag = document.createElement('span');
-  tag.className = `priority-tag tag-${email.bucket}`;
-  tag.textContent = BUCKET_LABEL[email.bucket];
-  head.appendChild(tag);
-  if (email.deadlineAt) {
-    const dl = document.createElement('span');
-    dl.className = 'priority-deadline';
-    dl.textContent = `due ${formatTime(email.deadlineAt)}`;
-    head.appendChild(dl);
-  }
-  meta.appendChild(head);
-
-  const from = document.createElement('div');
-  from.className = 'email-from';
-  from.textContent = email.fromAddr ?? '(unknown sender)';
-  meta.appendChild(from);
+  meta.className = 'pr-meta';
+  meta.textContent = senderLabel(email.fromAddr);
+  body.appendChild(meta);
 
   const summary = email.shortSummary ?? email.reasoning;
   if (summary) {
     const s = document.createElement('div');
-    s.className = 'email-reasoning';
+    s.className = 'pr-say';
     s.textContent = summary;
-    meta.appendChild(s);
+    body.appendChild(s);
   }
   if (email.suggestedAction) {
     const a = document.createElement('div');
-    a.className = 'priority-action';
-    a.textContent = email.suggestedAction;
-    meta.appendChild(a);
+    a.className = 'pr-action';
+    a.innerHTML = ICON_SPARK;
+    a.appendChild(document.createTextNode(email.suggestedAction));
+    body.appendChild(a);
   }
+  row.appendChild(body);
 
-  const side = document.createElement('div');
-  side.className = 'priority-side';
-  const date = document.createElement('div');
-  date.className = 'email-date';
-  date.textContent = email.date ? formatTime(email.date) : '';
-  side.appendChild(date);
+  const rail = document.createElement('div');
+  rail.className = 'pr-rail';
+  if (email.deadlineAt) {
+    rail.appendChild(duePill(email.deadlineAt));
+  } else if (email.date) {
+    const when = document.createElement('span');
+    when.className = 'pr-when';
+    when.textContent = formatTime(email.date);
+    rail.appendChild(when);
+  }
+  const resolve = document.createElement('div');
+  resolve.className = 'pr-resolve';
+  resolve.appendChild(resolveButton('done', email.messageId));
+  resolve.appendChild(resolveButton('snooze', email.messageId));
+  resolve.appendChild(resolveButton('dismiss', email.messageId));
+  rail.appendChild(resolve);
+  row.appendChild(rail);
 
-  const actions = document.createElement('div');
-  actions.className = 'priority-resolve';
-  actions.appendChild(resolveButton('Done', 'done', email.messageId));
-  actions.appendChild(resolveButton('Snooze', 'snooze', email.messageId));
-  actions.appendChild(resolveButton('Dismiss', 'dismiss', email.messageId));
-  side.appendChild(actions);
-
-  row.appendChild(meta);
-  row.appendChild(side);
   return row;
 }
 
-/** Builds a button that resolves a triaged email to the given resolution when clicked. */
+/** Builds the deadline pill, colored by how soon the deadline falls. */
+function duePill(ms: number): HTMLElement {
+  const { text, cls } = dueLabel(ms);
+  const pill = document.createElement('span');
+  pill.className = `pr-due due-${cls}`;
+  pill.innerHTML = ICON_CLOCK;
+  pill.appendChild(document.createTextNode(text));
+  return pill;
+}
+
+/** Describes a deadline relative to now: overdue, hours away, days away, or a date. */
+function dueLabel(ms: number): { text: string; cls: 'now' | 'soon' | 'later' } {
+  const diff = ms - Date.now();
+  if (diff <= 0) {
+    const days = Math.ceil(-diff / 86_400_000);
+    return { text: days <= 1 ? 'overdue' : `overdue ${days}d`, cls: 'now' };
+  }
+  const hours = diff / 3_600_000;
+  if (hours < 24) return { text: `due in ${Math.max(1, Math.round(hours))}h`, cls: 'now' };
+  const days = Math.round(hours / 24);
+  if (days <= 3) return { text: `due in ${days}d`, cls: 'soon' };
+  return { text: `due ${formatTime(ms)}`, cls: 'later' };
+}
+
+/** Derives up-to-two initials and a stable color for a sender's avatar. */
+function avatarFor(from: string | null): { initials: string; color: string } {
+  const raw = (from ?? '').trim();
+  const name =
+    raw
+      .replace(/<[^>]*>/g, '')
+      .replace(/["']/g, '')
+      .trim() ||
+    raw ||
+    '?';
+  const words = name.split(/[\s@._-]+/).filter(Boolean);
+  const first = words[0]?.[0] ?? '?';
+  const second = words.length > 1 ? (words[words.length - 1]?.[0] ?? '') : '';
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) hash = (hash * 31 + raw.charCodeAt(i)) >>> 0;
+  return {
+    initials: (first + second).toUpperCase(),
+    color: AVATAR_COLORS[hash % AVATAR_COLORS.length] ?? AVATAR_COLORS[0]!,
+  };
+}
+
+/** Formats the sender for the row meta line as "Name · address" when both are present. */
+function senderLabel(from: string | null): string {
+  if (!from) return '(unknown sender)';
+  const match = from.match(/^\s*"?([^"<]+?)"?\s*<([^>]+)>\s*$/);
+  if (match) {
+    const name = match[1]!.trim();
+    const addr = match[2]!.trim();
+    return name && name !== addr ? `${name} · ${addr}` : addr;
+  }
+  return from.trim();
+}
+
+/** Builds a small monochrome flag icon (reply-needed or attachment) for a row. */
+function flagIcon(kind: 'reply' | 'clip', title: string): HTMLElement {
+  const span = document.createElement('span');
+  span.className = 'pr-flag';
+  span.title = title;
+  span.innerHTML = kind === 'reply' ? ICON_REPLY : ICON_CLIP;
+  return span;
+}
+
+/** Builds an icon button that resolves a triaged email to the given resolution when clicked. */
 function resolveButton(
-  label: string,
-  resolution: TriageResolution,
+  resolution: 'done' | 'snooze' | 'dismiss',
   messageId: string,
 ): HTMLButtonElement {
+  const meta = RESOLVE_META[resolution];
   const btn = document.createElement('button');
-  btn.className = 'btn btn-ghost btn-xs';
+  btn.className = `pr-rbtn pr-${resolution}`;
   btn.type = 'button';
-  btn.textContent = label;
+  btn.title = meta.title;
+  btn.setAttribute('aria-label', meta.title);
+  btn.innerHTML = meta.icon;
   btn.addEventListener('click', () => void resolvePriority(messageId, resolution));
   return btn;
 }

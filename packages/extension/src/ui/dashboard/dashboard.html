@@ -236,10 +236,11 @@
           </section>
 
           <section class="tab-panel" id="panel-priority" role="tabpanel" hidden>
-            <div class="focus-header">
-              <div>
-                <h2 class="focus-title">Today's Focus</h2>
-                <p class="focus-sub" id="focus-sub">What needs your attention today.</p>
+            <header class="brief">
+              <div class="brief-lead">
+                <h2 class="brief-title">Priority</h2>
+                <p class="brief-say" id="focus-sub">Loading your briefing.</p>
+                <p class="brief-updated" id="priority-updated" hidden></p>
               </div>
               <div class="focus-actions">
                 <div class="segmented" id="priority-range" role="group" aria-label="Range">
@@ -251,52 +252,47 @@
                   Run priority pass
                 </button>
               </div>
-            </div>
-
-            <div class="metric-grid">
-              <div class="metric metric-action">
-                <div class="metric-label">Needs Action</div>
-                <div class="metric-value" id="metric-needs-action">0</div>
-              </div>
-              <div class="metric metric-urgent">
-                <div class="metric-label">Urgent</div>
-                <div class="metric-value" id="metric-urgent">0</div>
-              </div>
-              <div class="metric metric-important">
-                <div class="metric-label">Important FYI</div>
-                <div class="metric-value" id="metric-important">0</div>
-              </div>
-              <div class="metric metric-low">
-                <div class="metric-label">Low / Spam</div>
-                <div class="metric-value" id="metric-low">0</div>
-              </div>
-            </div>
+            </header>
 
             <p class="focus-note" id="priority-unclassified" hidden></p>
 
-            <div class="focus-section" id="section-needs-action">
-              <div class="section-title">Needs action</div>
-              <div class="list" id="needs-action-list"></div>
-            </div>
-            <div class="focus-section" id="section-carryover" hidden>
-              <div class="section-title">
-                Carryover <span class="section-hint">unresolved from earlier</span>
+            <section class="pr-section pr-urgent" id="section-needs-action">
+              <div class="pr-head">
+                <span class="pr-h">Needs action</span>
+                <span class="pr-cnt" id="needs-action-count"></span>
+                <span class="pr-hint">deadline-driven, most urgent first</span>
               </div>
-              <div class="list" id="carryover-list"></div>
-            </div>
-            <div class="focus-section" id="section-important">
-              <div class="section-title">Important updates</div>
-              <div class="list" id="important-list"></div>
-            </div>
-            <div class="focus-section" id="section-summaries">
-              <div class="section-title">Summaries &amp; digests</div>
-              <div class="list" id="summaries-list"></div>
-            </div>
-            <details class="focus-section" id="section-low">
-              <summary class="section-title section-summary">
-                Low priority &amp; spam <span class="section-hint" id="low-count"></span>
+              <div class="pr-list" id="needs-action-list"></div>
+            </section>
+            <section class="pr-section" id="section-carryover" hidden>
+              <div class="pr-head">
+                <span class="pr-h">Carryover</span>
+                <span class="pr-cnt" id="carryover-count"></span>
+                <span class="pr-hint">unresolved from earlier</span>
+              </div>
+              <div class="pr-list" id="carryover-list"></div>
+            </section>
+            <section class="pr-section" id="section-important">
+              <div class="pr-head">
+                <span class="pr-h">Important updates</span>
+                <span class="pr-cnt" id="important-count"></span>
+              </div>
+              <div class="pr-list" id="important-list"></div>
+            </section>
+            <section class="pr-section" id="section-summaries">
+              <div class="pr-head">
+                <span class="pr-h">Summaries &amp; digests</span>
+                <span class="pr-cnt" id="summaries-count"></span>
+              </div>
+              <div class="pr-list" id="summaries-list"></div>
+            </section>
+            <details class="pr-section pr-details" id="section-low">
+              <summary class="pr-head pr-summary">
+                <span class="pr-h">Low priority &amp; spam</span>
+                <span class="pr-cnt" id="low-count"></span>
+                <span class="pr-hint">tap to expand</span>
               </summary>
-              <div class="list" id="low-list"></div>
+              <div class="pr-list" id="low-list"></div>
             </details>
           </section>
 
