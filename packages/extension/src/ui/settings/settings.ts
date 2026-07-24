@@ -332,6 +332,7 @@ async function loadConfigIfAuthed(): Promise<void> {
     applyChatProvider(provider);
 
     $<HTMLInputElement>('toggle-auto-index').checked = cfg.autoIndex;
+    $<HTMLInputElement>('toggle-auto-triage').checked = cfg.autoTriage ?? true;
     $<HTMLInputElement>('toggle-multi-prototype').checked =
       cfg.features?.multiPrototypeCategories ?? false;
     $<HTMLInputElement>('toggle-cluster-sampling').checked =
@@ -457,6 +458,20 @@ function attachHandlers(): void {
       setStatus(
         'models-status',
         `Could not save auto-index: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
+  $<HTMLInputElement>('toggle-auto-triage').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ autoTriage: input.checked });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the priority setting: ${err instanceof Error ? err.message : String(err)}`,
         'error',
       );
     }

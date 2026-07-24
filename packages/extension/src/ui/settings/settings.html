@@ -45,6 +45,15 @@
             AI to categorize it. Everything stays on your machine; the local model reads the new
             emails' content to file them.</span
           >
+          <label class="check-inline" style="margin-top: var(--space-3)">
+            <input type="checkbox" id="toggle-auto-triage" />
+            <span>Keep the priority briefing up to date</span>
+          </label>
+          <span class="hint"
+            >After new mail is indexed, also sort it by urgency so the Priority tab is always
+            current without a manual run. Uses one AI pass per new email; turn off to spare a local
+            model the extra work. Requires auto-index.</span
+          >
         </div>
 
         <div class="sync-banner" id="sync-banner" hidden>

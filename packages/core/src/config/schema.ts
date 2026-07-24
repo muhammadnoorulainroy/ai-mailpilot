@@ -52,6 +52,8 @@ export const AppConfigSchema = z.object({
   version: z.number().int().default(1),
   locale: z.enum(['en', 'fr']).default('en'),
   autoIndex: z.boolean().default(false),
+  /** After auto-indexing new mail, also run a triage/priority pass so the briefing stays current. */
+  autoTriage: z.boolean().default(true),
   indexedFolders: z.array(z.string()).default([]),
   llm: LlmConfigSchema.default(() => LlmConfigSchema.parse({})),
   features: FeaturesConfigSchema.default(() => FeaturesConfigSchema.parse({})),

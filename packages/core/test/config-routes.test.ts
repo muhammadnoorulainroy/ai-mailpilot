@@ -42,6 +42,20 @@ describe('config routes: feature flags', () => {
     await app.close();
   });
 
+  it('defaults autoTriage to true and lets PATCH turn it off', async () => {
+    const { app, ctx } = await buildApp();
+    expect(app.inject && ctx.config.autoTriage).toBe(true);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/config',
+      payload: { autoTriage: false },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().autoTriage).toBe(false);
+    expect(ctx.config.autoTriage).toBe(false);
+    await app.close();
+  });
+
   it('PATCH /config updates features.multiPrototypeCategories and persists it on the context', async () => {
     const { app, ctx } = await buildApp();
     const res = await app.inject({

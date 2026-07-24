@@ -496,8 +496,7 @@ async function processAssistantSummaryPrefetchQueue(): Promise<void> {
   try {
     while (pendingAssistantSummaries.size > 0) {
       const next = pendingAssistantSummaries.entries().next().value as
-        | [string, AssistantSummaryQueueItem]
-        | undefined;
+        [string, AssistantSummaryQueueItem] | undefined;
       if (!next) return;
 
       const [key, item] = next;
@@ -584,8 +583,11 @@ function scheduleAutoSyncRetry(): void {
 async function runAutoSync(): Promise<void> {
   if (pendingNewMail.size === 0) return;
   let enabled = false;
+  let autoTriage = false;
   try {
-    enabled = (await coreClient.getConfig()).autoIndex === true;
+    const cfg = await coreClient.getConfig();
+    enabled = cfg.autoIndex === true;
+    autoTriage = cfg.autoTriage !== false;
   } catch {
     scheduleAutoSyncRetry();
     return;
@@ -630,8 +632,77 @@ async function runAutoSync(): Promise<void> {
     await triggerCategorize(accountId, messageIds);
   }
 
+  // Keep the priority briefing current without a manual click. Triage classifies only PENDING
+  // (untriaged) mail, so this is naturally incremental: the first pass clears any backlog, then each
+  // sync triages only the just-indexed messages. Opt-out via the autoTriage setting for users who
+  // want to spare a local model the per-email cost.
+  if (autoTriage) {
+    for (const accountId of categorizeByAccount.keys()) {
+      await triggerTriage(accountId);
+    }
+  }
+
   if (anyFailed) scheduleAutoSyncRetry();
   else autoSyncRetries = 0;
+}
+
+const pendingTriage = new Set<string>();
+let triageRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let triageRetryRounds = 0;
+const TRIAGE_RETRY_MS = 30_000;
+const MAX_TRIAGE_RETRY_ROUNDS = 5;
+
+/** Queues an account for a later triage retry and arms the retry timer. */
+function queueTriageRetry(accountId: string): void {
+  pendingTriage.add(accountId);
+  if (!triageRetryTimer) {
+    triageRetryTimer = setTimeout(() => {
+      triageRetryTimer = null;
+      void flushPendingTriage();
+    }, TRIAGE_RETRY_MS);
+  }
+}
+
+/** Asks Core to triage the account's pending mail, queueing a retry if Core is busy or fails. */
+async function triggerTriage(accountId: string): Promise<void> {
+  try {
+    const res = await coreClient.runTriage({ accountId });
+    if (res.status === 'already_running') queueTriageRetry(accountId);
+    else pendingTriage.delete(accountId);
+  } catch (err) {
+    console.warn('[MailPilot] auto-triage trigger failed; will retry:', err);
+    queueTriageRetry(accountId);
+  }
+}
+
+/** Retries queued triage runs, giving up after the max retry rounds. */
+async function flushPendingTriage(): Promise<void> {
+  if (pendingTriage.size === 0) return;
+  const accounts = [...pendingTriage];
+  pendingTriage.clear();
+  let busy = false;
+  for (const accountId of accounts) {
+    try {
+      const res = await coreClient.runTriage({ accountId });
+      if (res.status === 'already_running') {
+        pendingTriage.add(accountId);
+        busy = true;
+      }
+    } catch {
+      pendingTriage.add(accountId);
+      busy = true;
+    }
+  }
+  if (busy && triageRetryRounds < MAX_TRIAGE_RETRY_ROUNDS) {
+    triageRetryRounds += 1;
+    triageRetryTimer = setTimeout(() => {
+      triageRetryTimer = null;
+      void flushPendingTriage();
+    }, TRIAGE_RETRY_MS);
+  } else {
+    triageRetryRounds = 0;
+    pendingTriage.clear();
+  }
 }
 
 const pendingCategorize = new Map<string, Set<string>>();

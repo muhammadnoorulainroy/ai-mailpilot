@@ -54,6 +54,7 @@ export interface SafeConfig {
   version: number;
   locale: AppConfig['locale'];
   autoIndex: boolean;
+  autoTriage: boolean;
   indexedFolders: string[];
   llm: Omit<AppConfig['llm'], 'apiKey' | 'chatApiKey'> & { chatApiKeySet: boolean };
   features: AppConfig['features'];
@@ -68,6 +69,7 @@ export function redactConfig(config: AppConfig): SafeConfig {
     version: config.version,
     locale: config.locale,
     autoIndex: config.autoIndex,
+    autoTriage: config.autoTriage,
     indexedFolders: config.indexedFolders,
     llm: {
       baseUrl: config.llm.baseUrl,
