@@ -249,8 +249,7 @@ export class EmailRepository {
     let bodyChanged = false;
     if (body !== null) {
       const prior = this.stmts.getBody.get(item.messageId, item.accountId) as
-        | { body: string | null }
-        | undefined;
+        { body: string | null } | undefined;
       if (prior && prior.body !== body) bodyChanged = true;
     }
 

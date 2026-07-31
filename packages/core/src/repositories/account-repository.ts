@@ -148,8 +148,7 @@ export class AccountRepository {
   /** Whether discovery may run for this account. Personal accounts can opt in explicitly. */
   isDiscoveryEligible(id: string): boolean {
     const row = this.stmts.selectEligibility.get(id) as
-      | { kind: AccountKind; exclude_from_discovery: number }
-      | undefined;
+      { kind: AccountKind; exclude_from_discovery: number } | undefined;
     if (!row) return false;
     return row.exclude_from_discovery === 0;
   }

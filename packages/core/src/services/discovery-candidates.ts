@@ -112,10 +112,7 @@ const OVERBROAD_TOKENS = new Set(['work', 'personal', 'todo', 'todos']);
 
 /** What the model proposed for a cluster. Identity (canonical key) is assigned later, not by the model. */
 export type CandidateAction =
-  | 'new_category'
-  | 'expand_existing'
-  | 'merge_suggestion'
-  | 'leave_uncategorized';
+  'new_category' | 'expand_existing' | 'merge_suggestion' | 'leave_uncategorized';
 
 /** A model-named candidate tied to a source cluster. */
 export interface NamedCandidate {

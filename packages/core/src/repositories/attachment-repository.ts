@@ -193,8 +193,7 @@ export class AttachmentRepository {
     const buf = vectorToBuffer(vector instanceof Float32Array ? vector : Float32Array.from(vector));
     const tx = this.db.transaction(() => {
       const existing = this.stmts.findEmbRow.get(chunkRowid, model) as
-        | { rowid: number }
-        | undefined;
+        { rowid: number } | undefined;
       if (existing) {
         this.stmts.updateVec.run(buf, existing.rowid);
         return;
