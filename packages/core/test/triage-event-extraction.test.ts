@@ -115,4 +115,26 @@ describe('triage event extraction', () => {
     });
     expect((await serviceReturning(raw).classify(email)).event).toBeNull();
   });
+
+  it('rejects a day that does not exist in its month instead of rolling it forward', async () => {
+    const year = new Date().getFullYear() + 1;
+    for (const date of [`${year}-02-31`, `${year}-04-31`, `${year}-02-30`, `${year}-06-31`]) {
+      const raw = JSON.stringify({
+        bucket: 'summarize',
+        event: { title: 'Impossible', date, start: '10:00' },
+      });
+      expect((await serviceReturning(raw).classify(email)).event).toBeNull();
+    }
+  });
+
+  it('keeps the last valid day of a short month', async () => {
+    const year = new Date().getFullYear() + 1;
+    const raw = JSON.stringify({
+      bucket: 'summarize',
+      event: { title: 'Month end', date: `${year}-02-28`, start: '10:00' },
+    });
+    const ev = (await serviceReturning(raw).classify(email)).event!;
+    expect(new Date(ev.startAt).getMonth()).toBe(1);
+    expect(new Date(ev.startAt).getDate()).toBe(28);
+  });
 });

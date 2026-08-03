@@ -134,9 +134,25 @@ function parseEvent(ev: Record<string, unknown> | null, now: number): CapturedEv
   const end = parseClock(ev.end);
   const allDay = asBool(ev.allDay) || start === null;
 
-  const startAt = allDay
-    ? new Date(year, month - 1, day, 0, 0, 0, 0).getTime()
-    : new Date(year, month - 1, day, start!.h, start!.m, 0, 0).getTime();
+  const startDate = new Date(
+    year,
+    month - 1,
+    day,
+    allDay ? 0 : start!.h,
+    allDay ? 0 : start!.m,
+    0,
+    0,
+  );
+  // Date rolls an impossible day into the next month, so 2026-02-31 would silently become 3 March.
+  // Reject anything that did not survive the round trip rather than store a confident wrong date.
+  if (
+    startDate.getFullYear() !== year ||
+    startDate.getMonth() !== month - 1 ||
+    startDate.getDate() !== day
+  ) {
+    return null;
+  }
+  const startAt = startDate.getTime();
   if (!Number.isFinite(startAt)) return null;
 
   let endAt: number | null = null;
