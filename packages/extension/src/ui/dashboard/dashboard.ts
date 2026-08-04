@@ -1345,7 +1345,17 @@ async function runTriage(): Promise<void> {
   let finalLabel = original;
 
   try {
-    const result = await coreClient.runTriage({ accountId });
+    let result = await coreClient.runTriage({ accountId, force: false });
+    // Mail triaged before a pass gained new outputs, calendar capture in particular, is counted as
+    // up to date and never revisited. Offer the rescan here, which is the only moment it is obvious.
+    if (result.status === 'up_to_date') {
+      const rescan = await confirmDialog(
+        'Rescan every email?',
+        'Priority found nothing new to triage. Rescanning re-runs the pass over every email, which also captures calendar events from mail triaged before event capture was added. This takes as long as the first run. Continue?',
+        'Rescan all',
+      );
+      if (rescan) result = await coreClient.runTriage({ accountId, force: true });
+    }
     if (result.status === 'up_to_date') {
       setStatus('Priority already up to date.');
       finalLabel = 'Already up to date';
