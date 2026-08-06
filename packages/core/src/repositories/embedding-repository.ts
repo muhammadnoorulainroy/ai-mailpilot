@@ -107,8 +107,7 @@ export class EmbeddingRepository {
 
     const tx = this.db.transaction(() => {
       const existing = this.stmts.findRowId.get(ref.messageId, ref.accountId, modelId) as
-        | { rowid: number }
-        | undefined;
+        { rowid: number } | undefined;
 
       if (existing) {
         this.stmts.updateVec.run(buf, existing.rowid);
@@ -127,8 +126,7 @@ export class EmbeddingRepository {
   getEmbedding(ref: EmbeddingRef): Float32Array | null {
     const modelId = canonicalizeModelId(ref.modelId);
     const row = this.stmts.getEmbedding.get(ref.messageId, ref.accountId, modelId) as
-      | { embedding: Buffer }
-      | undefined;
+      { embedding: Buffer } | undefined;
     return row ? bufferToVector(row.embedding) : null;
   }
 

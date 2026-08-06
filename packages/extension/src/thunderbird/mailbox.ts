@@ -2,10 +2,32 @@
  * Reads accounts, folders, and messages from Thunderbird and turns them into the push items Core
  * indexes, plus helpers for fetching attachments and mapping Message-IDs back to Thunderbird ids.
  */
-import type { PushEmailItem, PushAttachmentItem, AccountKind } from '@ai-mailpilot/shared';
+import type {
+  PushEmailItem,
+  PushEmailTag,
+  PushAttachmentItem,
+  SyncUserLabelsItem,
+  AccountKind,
+} from '@ai-mailpilot/shared';
 import { pathHasExcludedSegment } from '../settings/sync-prefs.js';
+import { KEY_PREFIX } from './tags.js';
 
 const MAX_BODY_CHARS = 24_000;
+/** Batch size for the body-less label-only backfill of already-synced messages. */
+const LABEL_BATCH = 500;
+
+/**
+ * Build a resolver that maps a message header's tag keys to the user's own tags with visible labels,
+ * dropping MailPilot-managed tags. Reads the account's tag list once per sync pass.
+ */
+export async function loadUserTagResolver(): Promise<(tagKeys: string[]) => PushEmailTag[]> {
+  const all = await browser.messages.tags.list();
+  const labelByKey = new Map(all.map((t) => [t.key, t.tag]));
+  return (tagKeys) =>
+    (tagKeys ?? [])
+      .filter((key) => !key.startsWith(KEY_PREFIX))
+      .map((key) => ({ key, label: labelByKey.get(key) ?? key }));
+}
 const BATCH_BYTE_BUDGET = 4 * 1024 * 1024;
 
 /** Truncate a body to max chars without splitting a surrogate pair at the boundary. */
@@ -170,6 +192,7 @@ export class MailboxSnapshot {
     const items: PushEmailItem[] = [];
     const attachmentMsgs: AttachmentMsg[] = [];
     const seen = new Set<number>();
+    const resolveUserTags = await loadUserTagResolver();
     for (const header of headers) {
       if (!header.headerMessageId || seen.has(header.id)) continue;
       seen.add(header.id);
@@ -184,6 +207,7 @@ export class MailboxSnapshot {
         body: capBody(body, MAX_BODY_CHARS),
         bodyFormat: format,
         bodyFetched: fetchOk,
+        tags: resolveUserTags(header.tags),
       });
       if (hasAttachments && fetchOk) {
         attachmentMsgs.push({ tbId: header.id, messageId: header.headerMessageId });
@@ -253,6 +277,7 @@ export class MailboxSnapshot {
     opts: {
       selectIds?: (messageIds: string[]) => Promise<Set<string>>;
       onProgress?: (examinedDelta: number) => void;
+      onLabelsOnly?: (items: SyncUserLabelsItem[]) => Promise<void>;
     } = {},
   ): Promise<{
     fetched: number;
@@ -273,7 +298,16 @@ export class MailboxSnapshot {
     const attachmentMsgs: AttachmentMsg[] = [];
     let batch: PushEmailItem[] = [];
     let batchBytes = 0;
+    let labelBatch: SyncUserLabelsItem[] = [];
+    const resolveUserTags = await loadUserTagResolver();
     let page = await browser.messages.list(folder);
+
+    const flushLabels = async (): Promise<void> => {
+      if (opts.onLabelsOnly && labelBatch.length > 0) {
+        await opts.onLabelsOnly(labelBatch);
+        labelBatch = [];
+      }
+    };
 
     while (true) {
       const withId = page.messages.filter((h) => h.headerMessageId);
@@ -286,6 +320,16 @@ export class MailboxSnapshot {
       for (const header of withId) {
         if (toFetch && !toFetch.has(header.headerMessageId)) {
           upToDate += 1;
+          // Already-synced message: still capture its current tags/folder without re-fetching the
+          // body, so an existing mailbox's organization is backfilled on a normal (non-force) sync.
+          if (opts.onLabelsOnly) {
+            labelBatch.push({
+              messageId: header.headerMessageId,
+              folder: folderPath,
+              tags: resolveUserTags(header.tags),
+            });
+            if (labelBatch.length >= LABEL_BATCH) await flushLabels();
+          }
           continue;
         }
 
@@ -301,6 +345,7 @@ export class MailboxSnapshot {
           body: cappedBody,
           bodyFormat: format,
           bodyFetched: fetchOk,
+          tags: resolveUserTags(header.tags),
         });
         if (hasAttachments && fetchOk) {
           attachmentMsgs.push({ tbId: header.id, messageId: header.headerMessageId });
@@ -327,6 +372,7 @@ export class MailboxSnapshot {
     }
 
     if (batch.length > 0) await onBatch(batch);
+    await flushLabels();
     return { fetched, skipped, upToDate, attachmentMsgs };
   }
 }

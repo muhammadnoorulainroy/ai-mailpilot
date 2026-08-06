@@ -33,7 +33,26 @@ describe('config routes: feature flags', () => {
     const { app } = await buildApp();
     const res = await app.inject({ method: 'GET', url: '/config' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().features).toEqual({ multiPrototypeCategories: false });
+    expect(res.json().features).toEqual({
+      multiPrototypeCategories: false,
+      clusterRepresentativeSampling: false,
+      crossEncoderRerank: false,
+      llmQueryUnderstanding: false,
+    });
+    await app.close();
+  });
+
+  it('defaults autoTriage to true and lets PATCH turn it off', async () => {
+    const { app, ctx } = await buildApp();
+    expect(app.inject && ctx.config.autoTriage).toBe(true);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/config',
+      payload: { autoTriage: false },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().autoTriage).toBe(false);
+    expect(ctx.config.autoTriage).toBe(false);
     await app.close();
   });
 
@@ -89,7 +108,12 @@ describe('config routes: feature flags', () => {
     });
     const res = await app.inject({ method: 'GET', url: '/config' });
     expect(res.statusCode).toBe(200);
-    expect(res.json().features).toEqual({ multiPrototypeCategories: false });
+    expect(res.json().features).toEqual({
+      multiPrototypeCategories: false,
+      clusterRepresentativeSampling: false,
+      crossEncoderRerank: false,
+      llmQueryUnderstanding: false,
+    });
     expect(res.json().autoIndex).toBe(true);
     await app.close();
   });

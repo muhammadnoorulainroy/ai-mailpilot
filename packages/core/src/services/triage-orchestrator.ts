@@ -5,6 +5,7 @@
 import type { Logger } from 'pino';
 import type { TriageRepository, UnclassifiedEmail } from '../repositories/triage-repository.js';
 import type { FailureRepository } from '../repositories/failure-repository.js';
+import type { CalendarEventRepository } from '../repositories/calendar-event-repository.js';
 import type { TriageProvider, TriageResult, TriageService } from './triage-service.js';
 
 /**
@@ -60,12 +61,14 @@ export class TriageOrchestrator {
   private progress: TriageProgress = this.idle();
   private running = false;
 
-  /** Creates the orchestrator with the triage service, repositories, and logger. */
+  /** Creates the orchestrator with the triage service, repositories, and logger. Events, when supplied and enabled, receive any calendar event captured during triage. */
   constructor(
     private service: TriageService,
     private triage: TriageRepository,
     private failures: FailureRepository,
     private logger: Logger,
+    private events?: CalendarEventRepository,
+    private captureEventsEnabled: () => boolean = () => true,
   ) {}
 
   /**
@@ -339,9 +342,35 @@ export class TriageOrchestrator {
       reasoning: result.reasoning,
       metadata: result.metadata,
     });
+    this.captureEvent(email, accountId, result);
     this.failures.clearFailure(email.messageId, accountId, 'triage', modelId);
     this.progress.processed += 1;
     this.progress.buckets[result.bucket] += 1;
+  }
+
+  /**
+   * Persists any event the triage pass captured from the email, or clears a stale one when a
+   * re-triage no longer finds it. A capture failure is logged but never fails the triage result.
+   */
+  private captureEvent(email: UnclassifiedEmail, accountId: string, result: TriageResult): void {
+    if (!this.events || !this.captureEventsEnabled()) return;
+    try {
+      if (result.event) {
+        this.events.captureFromEmail({
+          accountId,
+          sourceMessageId: email.messageId,
+          title: result.event.title,
+          startAt: result.event.startAt,
+          endAt: result.event.endAt,
+          allDay: result.event.allDay,
+          location: result.event.location,
+        });
+      } else {
+        this.events.clearForMessage(accountId, email.messageId);
+      }
+    } catch (err) {
+      this.logger.warn({ err, messageId: email.messageId }, 'failed to persist captured event');
+    }
   }
 
   /**

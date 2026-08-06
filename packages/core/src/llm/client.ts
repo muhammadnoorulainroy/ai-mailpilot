@@ -4,6 +4,7 @@
  */
 import { z } from 'zod';
 import type { LlmConfig } from '../config/schema.js';
+import { withEmbeddingInstruction, type EmbeddingKind } from '../util/text.js';
 
 /** LLM HTTP error carrying the response status so callers can separate a transient hiccup from a permanent misconfiguration. */
 export class LlmApiError extends Error {
@@ -72,6 +73,11 @@ const ChatCompletionSchema = z.object({
     .optional(),
 });
 
+/** Ollama native /api/chat response, where a suppressed reasoning block leaves content in message.content. */
+const OllamaChatSchema = z.object({
+  message: z.object({ content: z.string() }),
+});
+
 /** A single chat message with its role and text content. */
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
@@ -84,7 +90,10 @@ export interface ChatCompletionOptions {
   maxTokens?: number;
   /** Override the request timeout. Bulk callers pass a larger value for slow local models under load. */
   timeoutMs?: number;
-  /** Ollama reasoning toggle. False asks a thinking model to answer directly, ignored by servers that lack it. */
+  /**
+   * Ollama reasoning toggle. False routes the call through Ollama's native /api/chat, the only endpoint
+   * where a reasoning model actually skips its hidden think block; the OpenAI-compatible path ignores it.
+   */
   think?: boolean;
   /** Which endpoint to call. 'chat' prefers the cloud chat provider when configured, 'main' uses the local baseUrl. Defaults to 'chat'. */
   provider?: 'main' | 'chat';
@@ -93,12 +102,14 @@ export interface ChatCompletionOptions {
 /** Client for embedding and chat completion calls against an OpenAI-compatible LLM endpoint. */
 export interface LlmClient {
   health(): Promise<{ ok: boolean; models: string[] }>;
-  embed(text: string, model?: string): Promise<number[]>;
-  embedBatch(texts: string[], model?: string): Promise<number[][]>;
+  embed(text: string, model?: string, kind?: EmbeddingKind): Promise<number[]>;
+  embedBatch(texts: string[], model?: string, kind?: EmbeddingKind): Promise<number[][]>;
   chat(opts: ChatCompletionOptions): Promise<string>;
   chatStream(opts: ChatCompletionOptions): AsyncIterable<string>;
 }
 
+/** Closing tag synthesized between a reasoning stream and the answer, so the chat splitter can split them. */
+const THINK_CLOSE = '</think>';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const HEALTH_TIMEOUT_MS = 5_000;
 const MAX_ERROR_TEXT = 2_000;
@@ -188,6 +199,58 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
     }
   }
 
+  /**
+   * Call Ollama's native /api/chat with think disabled. Unlike the OpenAI-compatible endpoint, this one
+   * honors think:false, so a reasoning model answers directly instead of spending the token budget inside
+   * a think block and returning empty content. format:json keeps structured callers on strict JSON.
+   */
+  async function nativeChatCompletion(opts: ChatCompletionOptions): Promise<string> {
+    const { baseUrl, headers } = endpointFor(opts.provider ?? 'chat');
+    const url = `${baseUrl.replace(/\/v1$/, '')}/api/chat`;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const isAbort = (err: unknown): boolean => err instanceof Error && err.name === 'AbortError';
+    try {
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            model: opts.model ?? getConfig().generationModel,
+            messages: opts.messages,
+            stream: false,
+            think: false,
+            ...(opts.responseFormat === 'json_object' ? { format: 'json' } : {}),
+            options: {
+              temperature: opts.temperature ?? 0.2,
+              ...(opts.maxTokens ? { num_predict: opts.maxTokens } : {}),
+            },
+          }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (isAbort(err)) throw new Error(`LLM API /api/chat: timed out after ${timeoutMs}ms`);
+        throw err;
+      }
+      if (!res.ok) {
+        const text = (await res.text()).slice(0, MAX_ERROR_TEXT);
+        throw new LlmApiError(res.status, '/api/chat', text);
+      }
+      let json: unknown;
+      try {
+        json = await res.json();
+      } catch (err) {
+        if (isAbort(err)) throw new Error(`LLM API /api/chat: timed out after ${timeoutMs}ms`);
+        throw new Error('LLM API /api/chat: response was not valid JSON');
+      }
+      return OllamaChatSchema.parse(json).message.content;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   return {
     /** Probe the endpoint, returning ok plus available model ids, or ok false on any failure. */
     async health() {
@@ -200,10 +263,11 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
     },
 
     /** Return the embedding vector for a single text, defaulting to the configured embedding model. */
-    async embed(text, model) {
+    async embed(text, model, kind) {
+      const resolved = model ?? getConfig().embeddingModel;
       const result = await request(
         '/embeddings',
-        { input: text, model: model ?? getConfig().embeddingModel },
+        { input: withEmbeddingInstruction(text, resolved, kind), model: resolved },
         EmbeddingsSchema,
       );
       const first = result.data[0];
@@ -212,10 +276,14 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
     },
 
     /** Embed many texts at once, reordering results by their returned index so output aligns with the input order. */
-    async embedBatch(texts, model) {
+    async embedBatch(texts, model, kind) {
+      const resolved = model ?? getConfig().embeddingModel;
       const result = await request(
         '/embeddings',
-        { input: texts, model: model ?? getConfig().embeddingModel },
+        {
+          input: texts.map((t) => withEmbeddingInstruction(t, resolved, kind)),
+          model: resolved,
+        },
         EmbeddingsSchema,
       );
       const ordered = result.data.every((d) => typeof d.index === 'number')
@@ -226,6 +294,14 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
 
     /** Run a non-streaming chat completion and return the first choice's content. */
     async chat(opts) {
+      if (opts.think === false) {
+        try {
+          return await nativeChatCompletion(opts);
+        } catch (err) {
+          // A local server without Ollama's native endpoint returns 404; fall back to the OpenAI path.
+          if (!(err instanceof LlmApiError && err.status === 404)) throw err;
+        }
+      }
       const result = await request(
         '/chat/completions',
         {
@@ -273,16 +349,39 @@ export function createLlmClient(getConfig: () => LlmConfig): LlmClient {
         }
         if (!res.body) throw new Error('LLM API /chat/completions: no stream body');
 
-        /** Parse one SSE line into a done flag or a content delta, ignoring non-data and unparseable lines. */
+        // A reasoning model on Ollama's OpenAI-compatible stream does NOT inline <think>...</think> in
+        // the content: it streams the chain of thought in a separate `reasoning` field while `content`
+        // stays empty, then streams the answer in `content`. Reading only `content` therefore discarded
+        // the reasoning and left the answer with no </think> marker, so the splitter downstream labelled
+        // the whole answer as thinking. Forward the reasoning and synthesize the closing tag on the first
+        // real content, which is exactly the shape the splitter expects.
+        let sawReasoning = false;
+        let closedThink = false;
+
+        /** Parse one SSE line into a done flag or a text delta, ignoring non-data and unparseable lines. */
         const parseSse = (line: string): { done?: boolean; delta?: string } => {
           const t = line.trim();
           if (!t.startsWith('data:')) return {};
           const data = t.slice(5).trim();
           if (data === '[DONE]') return { done: true };
           try {
-            const json = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
-            const d = json.choices?.[0]?.delta?.content;
-            if (typeof d === 'string' && d.length > 0) return { delta: d };
+            const json = JSON.parse(data) as {
+              choices?: Array<{ delta?: { content?: string; reasoning?: string } }>;
+            };
+            const delta = json.choices?.[0]?.delta;
+            const reasoning = delta?.reasoning;
+            if (typeof reasoning === 'string' && reasoning.length > 0) {
+              sawReasoning = true;
+              return { delta: reasoning };
+            }
+            const content = delta?.content;
+            if (typeof content === 'string' && content.length > 0) {
+              if (sawReasoning && !closedThink) {
+                closedThink = true;
+                return { delta: `${THINK_CLOSE}${content}` };
+              }
+              return { delta: content };
+            }
           } catch {}
           return {};
         };

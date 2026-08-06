@@ -66,6 +66,12 @@ export interface FolderListResponse {
   folders: FolderInfo[];
 }
 
+/** A user-owned Thunderbird tag on a pushed email: its stable key and current visible label. */
+export interface PushEmailTag {
+  key: string;
+  label: string;
+}
+
 /** A single email pushed from the extension to Core. */
 export interface PushEmailItem {
   messageId: string;
@@ -77,6 +83,11 @@ export interface PushEmailItem {
   bodyFormat?: 'text' | 'html';
   hasAttachments?: boolean;
   bodyFetched?: boolean;
+  /**
+   * The message's current user-owned Thunderbird tags (MailPilot-managed tags excluded by the
+   * client). Send an empty array when the message has none so a removed tag is cleared on Core.
+   */
+  tags?: PushEmailTag[];
 }
 
 /** Request to push a batch of emails for an account. */
@@ -89,6 +100,27 @@ export interface PushEmailsRequest {
 export interface PushEmailsResponse {
   inserted: number;
   total: number;
+}
+
+/** One message's current folder and user tags, for a body-less label-only sync. */
+export interface SyncUserLabelsItem {
+  messageId: string;
+  folder: string;
+  tags?: PushEmailTag[];
+}
+
+/**
+ * Request to sync only the user-owned labels (tags/folder) of already-indexed messages, without
+ * touching their bodies. Lets an existing mailbox's organization be captured without a re-fetch.
+ */
+export interface SyncUserLabelsRequest {
+  accountId: string;
+  items: SyncUserLabelsItem[];
+}
+
+/** Result of a label-only sync: how many messages had their labels updated. */
+export interface SyncUserLabelsResponse {
+  updated: number;
 }
 
 /** Request to reconcile the mailbox state by message ids. */
@@ -179,6 +211,18 @@ export interface TriageMetadata {
   confidence?: number | null;
 }
 
+/**
+ * A calendar event captured from an email by the triage pass. Times are absolute epoch
+ * milliseconds resolved in the server's local timezone from the date and clock the model read.
+ */
+export interface CapturedEvent {
+  title: string;
+  startAt: number;
+  endAt: number | null;
+  allDay: boolean;
+  location: string | null;
+}
+
 /** Time range for the priority "Today's Focus" view. */
 export type PriorityRange = 'today' | 'week' | 'all';
 
@@ -206,6 +250,7 @@ export interface PriorityEmailDto {
   importanceScore: number;
   suggestedAction: string | null;
   shortSummary: string | null;
+  event?: CapturedEvent | null;
 }
 
 /** The priority view payload with counts and rendered sections. */
@@ -304,6 +349,8 @@ export interface CategoryDto {
   id: string;
   accountId: string;
   label: string;
+  /** Stable per-account key derived from the label, frozen at creation. Survives id churn. */
+  canonicalKey: string;
   description: string | null;
   source: CategorySource;
   emailCount: number;
@@ -706,6 +753,42 @@ export interface DashboardCategorySummaryDto {
   emailCount: number;
 }
 
+/** One aggregated user-owned label (a Thunderbird tag or a meaningful folder) and its usage. */
+export interface UserLabelStatDto {
+  source: 'thunderbird_tag' | 'folder';
+  key: string;
+  label: string;
+  count: number;
+}
+
+/**
+ * The user's own organization detected in Thunderbird, kept separate from MailPilot AI categories.
+ * These are read-only signals surfaced for context; they are never AI categories.
+ */
+export interface UserOrganizationDto {
+  tagCount: number;
+  folderCount: number;
+  topTags: UserLabelStatDto[];
+  topFolders: UserLabelStatDto[];
+}
+
+/** A user-owned label proposed as a possible AI category seed (import-prep only, never applied). */
+export interface UserLabelSuggestionDto {
+  source: 'thunderbird_tag' | 'folder';
+  key: string;
+  label: string;
+  count: number;
+  coherence: number | null;
+  representativeSubjects: string[];
+  suggestedCategoryLabel: string;
+}
+
+/** Response listing user-label category-seed suggestions for an account. */
+export interface UserLabelSuggestionsResponse {
+  accountId: string;
+  suggestions: UserLabelSuggestionDto[];
+}
+
 /** The dashboard payload with email counts, triage buckets, and categories. */
 export interface DashboardResponse {
   accountId: string;
@@ -723,6 +806,7 @@ export interface DashboardResponse {
   recent: DashboardEmailDto[];
   categoryCount: number;
   categories: DashboardCategorySummaryDto[];
+  userOrganization: UserOrganizationDto;
 }
 
 /** A single turn in a chat conversation. */

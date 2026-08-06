@@ -14,6 +14,8 @@ import type {
   IngestAttachmentsRequest,
   IngestAttachmentsResponse,
   SyncStateRequest,
+  SyncUserLabelsRequest,
+  SyncUserLabelsResponse,
   SyncStateResponse,
   EmbedRunRequest,
   EmbedRunResponse,
@@ -49,6 +51,7 @@ import type {
   ApplyImprovementsResponse,
   CategoryDto,
   CategoryListResponse,
+  UserLabelSuggestionsResponse,
   CategoryUpdateRequest,
   CategoryMergeRequest,
   CategoryMergeResponse,
@@ -75,6 +78,8 @@ export interface ServerConfig {
   version: number;
   locale: 'en' | 'fr';
   autoIndex: boolean;
+  autoTriage: boolean;
+  calendarEvents: boolean;
   indexedFolders: string[];
   llm: {
     baseUrl: string;
@@ -95,6 +100,9 @@ export interface ServerConfig {
   };
   features?: {
     multiPrototypeCategories?: boolean;
+    clusterRepresentativeSampling?: boolean;
+    crossEncoderRerank?: boolean;
+    llmQueryUnderstanding?: boolean;
   };
 }
 
@@ -102,6 +110,8 @@ export interface ServerConfig {
 export interface UpdateConfigRequest {
   locale?: 'en' | 'fr';
   autoIndex?: boolean;
+  autoTriage?: boolean;
+  calendarEvents?: boolean;
   indexedFolders?: string[];
   llm?: Partial<ServerConfig['llm']>;
   features?: Partial<NonNullable<ServerConfig['features']>>;
@@ -246,6 +256,11 @@ export class CoreClient {
   /** Report which of the given message ids still need a body fetched, so resync can skip complete emails. */
   syncState(req: SyncStateRequest): Promise<SyncStateResponse> {
     return this.request('/emails/sync-state', { method: 'POST', body: JSON.stringify(req) });
+  }
+
+  /** Capture the user's tags/folder for already-indexed messages without re-fetching bodies. */
+  syncUserLabels(req: SyncUserLabelsRequest): Promise<SyncUserLabelsResponse> {
+    return this.request('/emails/user-labels', { method: 'POST', body: JSON.stringify(req) });
   }
 
   /** Start an embedding run. */
@@ -489,6 +504,16 @@ export class CoreClient {
   listCategories(accountId: string): Promise<CategoryListResponse> {
     const qs = new URLSearchParams({ accountId });
     return this.request(`/categories?${qs.toString()}`);
+  }
+
+  /** Import-prep suggestions: user tags/folders that could seed AI categories. Applies nothing. */
+  userLabelSuggestions(
+    accountId: string,
+    embeddingModelId?: string,
+  ): Promise<UserLabelSuggestionsResponse> {
+    const qs = new URLSearchParams({ accountId });
+    if (embeddingModelId) qs.set('embeddingModelId', embeddingModelId);
+    return this.request(`/categories/user-label-suggestions?${qs.toString()}`);
   }
 
   /** Fetch the proposed folder plan for an account. */

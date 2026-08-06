@@ -1,0 +1,11 @@
+# Optional dependencies for the cross-encoder reranking sidecar (ml/rerank_server.py). Install ONLY
+# when features.crossEncoderRerank is enabled; the default RAG path does not need these.
+#
+# sentence-transformers pulls in torch + transformers. torch is large: install the CPU build unless
+# you have CUDA set up, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r ml/requirements-rerank.txt
+#
+# The default model BAAI/bge-reranker-v2-m3 (~2.2 GB) downloads from Hugging Face on first run and is
+# cached locally; after that the sidecar makes no network calls. Override with MAILPILOT_RERANK_MODEL.
+sentence-transformers>=3.3,<4

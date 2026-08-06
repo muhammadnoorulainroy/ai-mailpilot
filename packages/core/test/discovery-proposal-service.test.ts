@@ -222,6 +222,67 @@ describe('DiscoveryProposalService', () => {
     expect(reasons).toContain('model_left_uncategorized');
   });
 
+  it('names clusters in batches instead of one giant prompt, and merges the results', async () => {
+    // Eight well-separated blobs -> eight residual clusters, more than one naming batch.
+    const db = openDatabase(':memory:');
+    const accounts = new AccountRepository(db);
+    const categories = new CategoryRepository(db);
+    const emails = new EmailRepository(db);
+    const embeddings = new EmbeddingRepository(db);
+    const acc = accounts.create({ address: 'w@x.com', kind: 'work' });
+    const LABELS = [
+      'Banking Statements', 'Flight Bookings', 'Job Alerts', 'Course Grades',
+      'Security Codes', 'Shipping Updates', 'Newsletter Digests', 'Payment Receipts',
+    ];
+    for (let b = 0; b < 8; b++) {
+      const rows = Array.from({ length: 6 }, (_, i) => ({
+        messageId: `b${b}-${i}`, accountId: acc.id, folder: 'INBOX',
+        subject: `${LABELS[b]} ${i}`, fromAddr: `s${b}@x.com`,
+      }));
+      emails.upsertBatch(rows);
+      for (const r of rows) {
+        embeddings.saveEmbedding({ messageId: r.messageId, accountId: acc.id, modelId: MODEL }, axis(b));
+      }
+    }
+
+    let calls = 0;
+    const clustersPerCall: number[] = [];
+    // A model that names exactly the clusters present in each batch's prompt (by "Cluster N").
+    const llm = {
+      async chat(opts: { messages: Array<{ content: string }> }) {
+        calls += 1;
+        const idxs = [...opts.messages[1]!.content.matchAll(/Cluster (\d+)/g)].map((m) => Number(m[1]));
+        clustersPerCall.push(idxs.length);
+        return JSON.stringify({
+          clusters: idxs.map((i) => ({
+            clusterIndex: i, action: 'new_category',
+            label: LABELS[i] ?? `Group ${i}`,
+            description: `Emails about ${LABELS[i] ?? i} for review.`,
+            suggestedKey: `k.g${i}`,
+          })),
+        });
+      },
+      async embed() { return []; },
+      async embedBatch() { return []; },
+      async health() { return { ok: true, models: [] }; },
+      chatStream() { return (async function* () {})(); },
+    } as unknown as LlmClient;
+
+    const residual = new ResidualDiscoveryService(embeddings, categories);
+    const svc = new DiscoveryProposalService(
+      residual, emails, categories, llm,
+      () => ({ allowCloudDiscovery: false }) as unknown as LlmConfig, silentLogger,
+    );
+    const result = await svc.propose(acc.id, MODEL, 'gen');
+
+    expect(result.clusterCount).toBe(8);
+    expect(calls).toBeGreaterThan(1); // batched into multiple calls, not one overloaded prompt
+    expect(Math.max(...clustersPerCall)).toBeLessThanOrEqual(6); // each batch stays bounded
+    // Every cluster was named across the batches (each verdict lands in accepted or rejected).
+    expect(result.accepted.length + result.rejected.length).toBe(8);
+    db.close();
+  });
+
   it('returns an empty result when there is no residual to cluster', async () => {
     const h = harness();
     // Mark every email user-assigned to a category so nothing is residual.

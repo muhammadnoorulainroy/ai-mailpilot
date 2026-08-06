@@ -514,8 +514,7 @@ export class CategoryRepository {
   /** Look up a category by its frozen canonical key, or null if none exists. */
   findByCanonicalKey(accountId: string, canonicalKey: string): CategoryRow | null {
     const row = this.stmts.findByCanonicalKey.get(accountId, canonicalKey) as
-      | CategoryDbRow
-      | undefined;
+      CategoryDbRow | undefined;
     return row ? this.fromRow(row) : null;
   }
 
@@ -933,8 +932,7 @@ export class CategoryRepository {
   ): { vector: Float32Array; emailCount: number } | null {
     const canonical = canonicalizeModelId(modelId);
     const row = this.stmts.getCentroidByCategory.get(categoryId, canonical) as
-      | { embedding: Buffer; email_count: number }
-      | undefined;
+      { embedding: Buffer; email_count: number } | undefined;
     if (!row) return null;
     return { vector: bufferToVector(row.embedding), emailCount: row.email_count };
   }
@@ -1096,8 +1094,7 @@ export class CategoryRepository {
 
     const tx = this.db.transaction(() => {
       const existing = this.stmts.findCentroidRowId.get(categoryId, canonical, prototypeIndex) as
-        | { rowid: number }
-        | undefined;
+        { rowid: number } | undefined;
 
       if (existing) {
         this.stmts.updateCentroidVec.run(buf, existing.rowid);

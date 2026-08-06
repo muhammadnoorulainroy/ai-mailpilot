@@ -749,4 +749,161 @@ export const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 24,
+    name: 'email_user_labels',
+    up: (db) => {
+      // User-owned mail organization captured from Thunderbird: the user's own tags and their
+      // meaningful folder. Kept separate from MailPilot AI categories: these are signals, never
+      // AI-owned categories. Cascades with the email so it never outlives its message.
+      db.exec(`
+        CREATE TABLE email_user_labels (
+          account_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          source TEXT NOT NULL CHECK (source IN ('thunderbird_tag', 'folder')),
+          key TEXT NOT NULL,
+          label TEXT NOT NULL,
+          synced_at INTEGER NOT NULL,
+          PRIMARY KEY (account_id, message_id, source, key),
+          FOREIGN KEY (message_id, account_id) REFERENCES emails(message_id, account_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_email_user_labels_account ON email_user_labels(account_id, source, key);
+      `);
+    },
+  },
+  {
+    version: 25,
+    name: 'attachment_chunk_context',
+    up: (db) => {
+      // Contextual retrieval for attachment chunks. A chunk lifted out of a PDF carried no trace of
+      // the document it came from, so neither its vector nor its FTS row could be reached by a
+      // question naming the file, sender, or date. `context` holds that header; the FTS index is
+      // rebuilt over (text, context) so a bare MATCH searches both. The update trigger keeps the
+      // external-content index in sync when a backfill fills context in on existing rows.
+      db.exec(`
+        ALTER TABLE attachment_chunks ADD COLUMN context TEXT;
+
+        DROP TRIGGER trg_attachment_chunks_insert;
+        DROP TRIGGER trg_attachment_chunks_delete;
+        DROP TABLE attachment_fts;
+
+        CREATE VIRTUAL TABLE attachment_fts USING fts5(
+          text, context,
+          content='attachment_chunks',
+          content_rowid='rowid',
+          tokenize='unicode61 remove_diacritics 2'
+        );
+
+        INSERT INTO attachment_fts(rowid, text, context)
+          SELECT rowid, text, context FROM attachment_chunks;
+
+        CREATE TRIGGER trg_attachment_chunks_insert
+        AFTER INSERT ON attachment_chunks BEGIN
+          INSERT INTO attachment_fts(rowid, text, context)
+          VALUES (new.rowid, new.text, new.context);
+        END;
+
+        CREATE TRIGGER trg_attachment_chunks_delete
+        AFTER DELETE ON attachment_chunks BEGIN
+          DELETE FROM attachment_chunk_embedding_index WHERE chunk_rowid = OLD.rowid;
+          INSERT INTO attachment_fts(attachment_fts, rowid, text, context)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.context);
+        END;
+
+        CREATE TRIGGER trg_attachment_chunks_update
+        AFTER UPDATE ON attachment_chunks
+        WHEN old.text IS NOT new.text OR old.context IS NOT new.context
+        BEGIN
+          INSERT INTO attachment_fts(attachment_fts, rowid, text, context)
+          VALUES ('delete', OLD.rowid, OLD.text, OLD.context);
+          INSERT INTO attachment_fts(rowid, text, context)
+          VALUES (new.rowid, new.text, new.context);
+        END;
+      `);
+    },
+  },
+  {
+    version: 26,
+    name: 'calendar_events',
+    up: (db) => {
+      // Calendar events, captured from mail by the triage pass (source='email') and, later, ingested
+      // from a real calendar (ics/caldav). Each event carries a dense vector and an FTS row so chat can
+      // retrieve it alongside emails. Mirrors the attachments store: content table + vec0 pair + FTS +
+      // an AFTER DELETE trigger, since vec0 tables never FK-cascade.
+      db.exec(`
+        CREATE TABLE events (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          source_message_id TEXT,
+          title TEXT NOT NULL,
+          start_at INTEGER NOT NULL,
+          end_at INTEGER,
+          all_day INTEGER NOT NULL DEFAULT 0,
+          location TEXT,
+          organizer TEXT,
+          attendees TEXT,
+          description TEXT,
+          rrule TEXT,
+          status TEXT NOT NULL DEFAULT 'captured'
+            CHECK (status IN ('captured', 'confirmed', 'dismissed')),
+          source TEXT NOT NULL DEFAULT 'email'
+            CHECK (source IN ('email', 'ics', 'caldav', 'manual')),
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY (source_message_id, account_id) REFERENCES emails(message_id, account_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_events_account_start ON events(account_id, start_at);
+        CREATE INDEX idx_events_message ON events(source_message_id, account_id);
+
+        CREATE VIRTUAL TABLE event_embeddings USING vec0(embedding FLOAT[${EMBEDDING_DIM}]);
+
+        CREATE TABLE event_embedding_index (
+          rowid INTEGER PRIMARY KEY,
+          event_id TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (event_id, model_id)
+        );
+        CREATE INDEX idx_event_emb_lookup ON event_embedding_index(event_id, model_id);
+
+        CREATE VIRTUAL TABLE event_fts USING fts5(
+          title, location, description,
+          content='events',
+          content_rowid='rowid',
+          tokenize='unicode61 remove_diacritics 2'
+        );
+
+        -- vec0 tables do not FK-cascade; drop the vector when its index row goes.
+        CREATE TRIGGER trg_event_emb_delete
+        AFTER DELETE ON event_embedding_index BEGIN
+          DELETE FROM event_embeddings WHERE rowid = OLD.rowid;
+        END;
+
+        -- An event deletion cascades to its embedding index rows and its FTS entry.
+        CREATE TRIGGER trg_events_delete
+        AFTER DELETE ON events BEGIN
+          DELETE FROM event_embedding_index WHERE event_id = OLD.id;
+          INSERT INTO event_fts(event_fts, rowid, title, location, description)
+          VALUES ('delete', OLD.rowid, OLD.title, OLD.location, OLD.description);
+        END;
+
+        CREATE TRIGGER trg_events_insert
+        AFTER INSERT ON events BEGIN
+          INSERT INTO event_fts(rowid, title, location, description)
+          VALUES (new.rowid, new.title, new.location, new.description);
+        END;
+
+        CREATE TRIGGER trg_events_update
+        AFTER UPDATE ON events
+        WHEN old.title IS NOT new.title OR old.location IS NOT new.location
+          OR old.description IS NOT new.description
+        BEGIN
+          INSERT INTO event_fts(event_fts, rowid, title, location, description)
+          VALUES ('delete', OLD.rowid, OLD.title, OLD.location, OLD.description);
+          INSERT INTO event_fts(rowid, title, location, description)
+          VALUES (new.rowid, new.title, new.location, new.description);
+        END;
+      `);
+    },
+  },
 ];

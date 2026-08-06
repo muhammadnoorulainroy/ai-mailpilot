@@ -89,13 +89,46 @@ function yearRange(year: number): { from: number; to: number } {
 }
 /**
  * Monday-to-Sunday range for the week containing `now`, shifted by `offsetWeeks` (0 this week,
- * -1 last week).
+ * -1 last week, +1 next week).
  */
 function weekRange(now: Date, offsetWeeks: number): { from: number; to: number } {
   const dow = (now.getDay() + 6) % 7;
   const monday = dayOffset(now, -dow + offsetWeeks * 7);
   return { from: startOfDay(monday), to: endOfDay(dayOffset(monday, 6)) };
 }
+/** Range for the next occurrence of a weekday (0 Sunday to 6 Saturday), today included. */
+function nextWeekdayRange(now: Date, targetDow: number): { from: number; to: number } {
+  const delta = (targetDow - now.getDay() + 7) % 7;
+  const d = dayOffset(now, delta);
+  return { from: startOfDay(d), to: endOfDay(d) };
+}
+/** Range for the upcoming Saturday and Sunday, today included when it is the weekend. */
+function weekendRange(now: Date): { from: number; to: number } {
+  const toSat = (6 - now.getDay() + 7) % 7;
+  const sat = dayOffset(now, toSat);
+  return { from: startOfDay(sat), to: endOfDay(dayOffset(sat, 1)) };
+}
+
+/** Weekday names in English and French mapped to JS day-of-week (0 Sunday to 6 Saturday). */
+const WEEKDAYS: Record<string, number> = {
+  sunday: 0,
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6,
+  dimanche: 0,
+  lundi: 1,
+  mardi: 2,
+  mercredi: 3,
+  jeudi: 4,
+  vendredi: 5,
+  samedi: 6,
+};
+const WEEKDAY_ALT = Object.keys(WEEKDAYS)
+  .sort((a, b) => b.length - a.length)
+  .join('|');
 
 /**
  * Detect a time expression in a chat query and return its absolute date range, or null when
@@ -131,6 +164,14 @@ export function parseTimeScope(query: string, now: number): TimeScope | null {
   const named: Array<[RegExp, () => { from: number; to: number }, string]> = [
     [/\baujourd'?hui\b|\btoday\b/i, () => ({ from: startOfDay(N), to: endOfDay(N) }), 'today'],
     [
+      /\btomorrow\b|\bdemain\b/i,
+      () => {
+        const d = dayOffset(N, 1);
+        return { from: startOfDay(d), to: endOfDay(d) };
+      },
+      'tomorrow',
+    ],
+    [
       /\byesterday\b|\bhier\b/i,
       () => {
         const d = dayOffset(N, -1);
@@ -138,11 +179,18 @@ export function parseTimeScope(query: string, now: number): TimeScope | null {
       },
       'yesterday',
     ],
+    [/\bthis\s+weekend\b|\bce\s+week-?end\b/i, () => weekendRange(N), 'this weekend'],
+    [/\bnext\s+week\b|\b(?:la\s+)?semaine\s+prochaine\b/i, () => weekRange(N, 1), 'next week'],
     [/\bthis\s+week\b|\bcette\s+semaine\b/i, () => weekRange(N, 0), 'this week'],
     [
       /\blast\s+week\b|\b(?:la\s+)?semaine\s+(?:derni(?:è|e)re|pass(?:é|e)e)\b/i,
       () => weekRange(N, -1),
       'last week',
+    ],
+    [
+      /\bnext\s+month\b|\b(?:le\s+)?mois\s+prochain\b/i,
+      () => monthRange(N.getFullYear(), N.getMonth() + 1),
+      'next month',
     ],
     [
       /\bthis\s+month\b|\bce\s+mois(?:-ci)?\b/i,
@@ -153,6 +201,11 @@ export function parseTimeScope(query: string, now: number): TimeScope | null {
       /\blast\s+month\b|\b(?:le\s+)?mois\s+(?:dernier|pass(?:é|e))\b/i,
       () => monthRange(N.getFullYear(), N.getMonth() - 1),
       'last month',
+    ],
+    [
+      /\bnext\s+year\b|\b(?:l'?)?ann(?:é|e)e\s+prochaine\b/i,
+      () => yearRange(N.getFullYear() + 1),
+      'next year',
     ],
     [/\bthis\s+year\b|\bcette\s+ann(?:é|e)e\b/i, () => yearRange(N.getFullYear()), 'this year'],
     [
@@ -166,10 +219,26 @@ export function parseTimeScope(query: string, now: number): TimeScope | null {
     if (hit) return { ...range(), label, matched: hit[0]! };
   }
 
-  m =
-    /\brecent(?:ly)?\b|\blately\b|\br(?:é|e)cemment\b|\br(?:é|e)cents?\b|\b(?:ces\s+)?derniers\s+jours\b/i.exec(
-      query,
-    );
+  // A weekday name ("Friday", "vendredi"), optionally prefixed with on/this/next, resolves to the
+  // next occurrence of that day. Placed after the fixed phrases so "next week" is not shadowed.
+  m = new RegExp(`\\b(?:on|this|next|ce|le)?\\s*(${WEEKDAY_ALT})\\b`, 'i').exec(query);
+  if (m) {
+    const dow = WEEKDAYS[m[1]!.toLowerCase()]!;
+    return { ...nextWeekdayRange(N, dow), label: m[1]!.toLowerCase(), matched: m[0]! };
+  }
+
+  // A superlative recency qualifier ("most recent", "latest", "le plus récent") asks for the newest
+  // matching item ("my most recent contract" = the newest contract), a preference version dedup
+  // handles, not for mail received in a recent window; leave it to normal retrieval so the topic is
+  // not hard-filtered to the last 30 days.
+  const superlativeRecent = /\bmost\s+recent\b|\blatest\b|\bplus\s+r(?:é|e)cent(?:e)?\b/i.test(
+    query,
+  );
+  m = superlativeRecent
+    ? null
+    : /\brecent(?:ly)?\b|\blately\b|\br(?:é|e)cemment\b|\br(?:é|e)cents?\b|\b(?:ces\s+)?derniers\s+jours\b/i.exec(
+        query,
+      );
   if (m) {
     return {
       from: startOfDay(dayOffset(N, -RECENT_DAYS)),

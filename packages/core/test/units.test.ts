@@ -58,8 +58,14 @@ import {
   isAggregateQuery,
   matchNamedDocument,
   filenameMatchScore,
+  aggregateScopeNote,
   dedupeDocumentVersions,
   expandQueryBilingual,
+  bilingualExpansionTerms,
+  withExpansionTerms,
+  parseQueryAnalysis,
+  detectDateConflicts,
+  extractDates,
   rankChunksByLexicalOverlap,
   makeThinkSplitter,
   parseRerankOrder,
@@ -396,6 +402,110 @@ describe('normalizeForMatch / normalizeFilename', () => {
   });
 });
 
+describe('F7 cross-lingual retrieval + date detection', () => {
+  it('reaches a French-named document from an English query via bilingual expansion (was the F7 miss)', () => {
+    const files = ['Contrat Habitation ADHE-20260603-bba7c844.pdf', 'Health insurance info.pdf'];
+    const q = 'what is the coverage period of my home insurance contract document';
+    // The raw English query cannot reach the French contract; "insurance" instead pulls the WRONG
+    // English health-insurance file (the F7 bug: English query never targets the French document).
+    expect(matchNamedDocument(q, files)?.index).toBe(1);
+    // With bilingual expansion the query carries "contrat"/"habitation" and correctly targets index 0.
+    const expanded = withExpansionTerms(q, bilingualExpansionTerms(q));
+    expect(matchNamedDocument(expanded, files)?.index).toBe(0);
+  });
+
+  it('boosts a date chunk for an English "coverage period" question (was missed by the French-only regex)', () => {
+    const chunks = [
+      // Shares the query words "coverage"/"period" but holds NO date.
+      {
+        text: 'This section explains the coverage period concept and what a period means in general.',
+      },
+      // The actual answer: French period with dates, only "periode" overlaps the query lexically.
+      { text: 'Les garanties sont accordees pour la periode du 08/08/2025 au 31/08/2026.' },
+    ];
+    // "coverage"/"period" now trigger date intent, so the chunk with the real dates wins despite less
+    // lexical overlap. Before the fix (French-only WANTS_DATES) the first chunk would win on tokens.
+    const ranked = rankChunksByLexicalOverlap(chunks, 'what is the coverage period');
+    expect(ranked[0]!.text).toContain('08/08/2025');
+  });
+
+  it('parses a query-analysis object and drops junk / empty results', () => {
+    const ok = parseQueryAnalysis('{"expansionTerms":["contrat","habitation"],"wantsDates":true}');
+    expect(ok).toEqual({ expansionTerms: ['contrat', 'habitation'], wantsDates: true });
+    // Tolerates surrounding prose and normalizes/dedupes terms.
+    expect(
+      parseQueryAnalysis('here: {"expansionTerms":["Contrat"," contrat "],"wantsDates":false}'),
+    ).toEqual({
+      expansionTerms: ['contrat'],
+      wantsDates: false,
+    });
+    expect(parseQueryAnalysis('{"expansionTerms":[],"wantsDates":false}')).toBeNull();
+    expect(parseQueryAnalysis('not json at all')).toBeNull();
+  });
+
+  it('withExpansionTerms appends only new terms', () => {
+    expect(withExpansionTerms('home insurance', ['assurance', 'home', 'habitation'])).toBe(
+      'home insurance assurance habitation',
+    );
+    expect(withExpansionTerms('home insurance', [])).toBe('home insurance');
+  });
+});
+
+describe('detectDateConflicts (conflict/temporal surfacing)', () => {
+  const email = (subject: string, body = '', date = 0): RetrievedEmail => ({
+    messageId: subject,
+    subject,
+    fromAddr: 'x@y.z',
+    date,
+    body,
+    bodyFormat: 'text',
+    distance: 0,
+  });
+
+  it('flags a rescheduled event: same topic, different dates', () => {
+    const items = [
+      email('Reminder: Video interview on 2 June 2025 9:05 PM'),
+      email('Reminder: Video interview on 4 June 2025 9:05 PM'),
+      email('Technical Interview with Wizdaa', 'rescheduled to 11 June 2025'),
+    ];
+    const note = detectDateConflicts(items, true);
+    expect(note).toBeTruthy();
+    expect(note).toContain('DIFFERENT dates');
+    expect(note).toContain('rescheduled');
+  });
+
+  it('does not fire when the shared-topic emails agree on the date', () => {
+    const items = [
+      email('Reminder: Video interview on 2 June 2025'),
+      email('Confirmation: Video interview on 02 June 2025'), // same date, re-worded
+    ];
+    expect(detectDateConflicts(items, true)).toBeNull();
+  });
+
+  it('does not fire for a non-date question', () => {
+    const items = [
+      email('Video interview on 2 June 2025'),
+      email('Video interview on 4 June 2025'),
+    ];
+    expect(detectDateConflicts(items, false)).toBeNull();
+  });
+
+  it('does not fire when the emails share no topic (distinct events)', () => {
+    const items = [
+      email('Dentist appointment on 2 June 2025'),
+      email('Rent payment due 4 June 2025'),
+    ];
+    expect(detectDateConflicts(items, true)).toBeNull();
+  });
+
+  it('extractDates parses natural and numeric dates and collapses re-wordings', () => {
+    expect([...extractDates('meeting on 2 June 2025 and 02 June 2025')]).toEqual(['2 june 2025']);
+    const d = extractDates('due 11 juin 2025 or 04/06/2025');
+    expect(d.has('11 juin 2025')).toBe(true);
+    expect(d.has('04/06/2025')).toBe(true);
+  });
+});
+
 describe('matchNamedDocument (filename-targeted retrieval)', () => {
   const files = [
     'StagesEtranger-1.pdf',
@@ -498,6 +608,48 @@ describe('rankChunksByLexicalOverlap date-range boost', () => {
   });
 });
 
+describe('rankChunksByLexicalOverlap amount boost (cross-lingual value questions)', () => {
+  it('ranks the franchise table above prose when an English question asks for a deductible', () => {
+    // The French table shares no wording with the English question; the amounts are the only signal.
+    const chunks = [
+      { text: 'ADH exerce sous le controle de l ACPR, 4 place de Budapest, 75436 PARIS Cedex 09.' },
+      {
+        text: 'EVENEMENTS CLIMATIQUES Garanties accordees Franchises Montants assures Tempete/grele/neige 230 € non indexes 3 500 € par piece principale assuree',
+      },
+      { text: 'Nous contacter par telephone du lundi au vendredi de 9h a 18h.' },
+    ];
+    const ranked = rankChunksByLexicalOverlap(
+      chunks,
+      'What is the deductible for storm damage in my home insurance?',
+    );
+    expect(ranked[0]!.text).toContain('230 €');
+  });
+
+  it('leaves ranking untouched when the question does not ask for a value', () => {
+    const chunks = [{ text: 'plain chunk without figures' }, { text: 'another 230 € amount here' }];
+    const ranked = rankChunksByLexicalOverlap(chunks, 'who sent this and when did they write');
+    expect(ranked[0]!.text).toBe('plain chunk without figures');
+  });
+});
+
+describe('aggregateScopeNote (per-course average is not a semester GPA)', () => {
+  it('emits a scope note for an aggregate question', () => {
+    const note = aggregateScopeNote(true);
+    expect(note).toMatch(/course's own figure/i);
+    expect(note).toMatch(/not a programme-wide or semester GPA/i);
+  });
+
+  it('states the note declaratively, since a weak model echoes imperative wording to the user', () => {
+    // Regression: an imperative note ("report X, otherwise say Y") was reproduced verbatim in an answer.
+    const note = aggregateScopeNote(true)!;
+    expect(note).not.toMatch(/\breport\b|\botherwise\b|\bsay\b/i);
+  });
+
+  it('emits nothing for a non-aggregate question', () => {
+    expect(aggregateScopeNote(false)).toBeNull();
+  });
+});
+
 describe('dedupeDocumentVersions (collapse old/new document versions)', () => {
   /** Builds an attachment-bearing retrieved-email fixture keyed by filename. */
   const item = (attachmentName: string, date: number): RetrievedEmail => ({
@@ -520,6 +672,17 @@ describe('dedupeDocumentVersions (collapse old/new document versions)', () => {
     );
     expect(out).toContain(adh2026);
     expect(out).not.toContain(adh2025);
+  });
+
+  it('keeps EVERY version when the query asks for a specific value or clause', () => {
+    // Measured on the real corpus: only the 2025 contract carries the storm-damage franchise table;
+    // the 2026 renewal does not contain it at all, so collapsing would destroy the only answer.
+    const out = dedupeDocumentVersions(
+      [adh2025, adh2026],
+      'What is the deductible for storm damage in my home insurance?',
+    );
+    expect(out).toContain(adh2025);
+    expect(out).toContain(adh2026);
   });
 
   it('keeps the version whose filename matches a year named in the query', () => {
@@ -685,6 +848,15 @@ describe('parseTimeScope (time-scoped retrieval)', () => {
     expect(inRange(recent, new Date(2026, 5, 1).getTime())).toBe(true);
   });
 
+  it('does not scope a superlative recency qualifier, leaving it to normal retrieval', () => {
+    // "most recent X" means the newest X, not mail from the last 30 days; version dedup handles it.
+    expect(
+      parseTimeScope('what is the start date of my most recent insurance contract', now),
+    ).toBeNull();
+    expect(parseTimeScope('mon contrat le plus récent', now)).toBeNull();
+    expect(parseTimeScope('my latest bank statement', now)).toBeNull();
+  });
+
   it('requires a preposition for a bare year so codes are not misread', () => {
     expect(parseTimeScope('what happened in 2018?', now)!.label).toBe('2018');
     expect(parseTimeScope('error code 2018 reference', now)).toBeNull();
@@ -695,6 +867,36 @@ describe('parseTimeScope (time-scoped retrieval)', () => {
     expect(stripTimeScope('what did Maxime send last month', scope)).toBe('what did Maxime send');
     const pure = parseTimeScope('this week', now)!;
     expect(stripTimeScope('this week', pure)).toBe('this week');
+  });
+
+  it('scopes future expressions for calendar queries (EN + FR)', () => {
+    const startOfToday = new Date(2026, 5, 17, 0, 0, 0).getTime();
+
+    const tomorrow = parseTimeScope('am I free tomorrow?', now)!;
+    expect(tomorrow.label).toBe('tomorrow');
+    expect(inRange(tomorrow, new Date(2026, 5, 18, 10).getTime())).toBe(true);
+    expect(inRange(tomorrow, now)).toBe(false);
+
+    const nextWeek = parseTimeScope("what's on next week", now)!;
+    expect(nextWeek.label).toBe('next week');
+    expect(nextWeek.from).toBeGreaterThan(now);
+
+    const nextMonth = parseTimeScope('meetings next month', now)!;
+    expect(new Date(nextMonth.from).getMonth()).toBe(6);
+    expect(new Date(nextMonth.from).getFullYear()).toBe(2026);
+
+    const friday = parseTimeScope('am I free friday?', now)!;
+    expect(new Date(friday.from).getDay()).toBe(5);
+    expect(friday.from).toBeGreaterThanOrEqual(startOfToday);
+
+    const vendredi = parseTimeScope('suis-je libre vendredi', now)!;
+    expect(new Date(vendredi.from).getDay()).toBe(5);
+
+    const semaineProchaine = parseTimeScope('mes rendez-vous la semaine prochaine', now)!;
+    expect(semaineProchaine.label).toBe('next week');
+
+    const weekend = parseTimeScope("what's happening this weekend", now)!;
+    expect(new Date(weekend.from).getDay()).toBe(6);
   });
 });
 
@@ -1246,15 +1448,15 @@ describe('topic discovery sampling and label hygiene', () => {
         calls.push('recent');
         return [summary('m1', 'r@a.com'), summary('dup', 'z@a.com')];
       },
-      listSummariesRandom: () => {
+      listSummariesSeeded: () => {
         calls.push('historical');
         return [summary('m2', 'h@b.com')];
       },
-      listUncategorizedSummaries: () => {
+      listUncategorizedSummariesStable: () => {
         calls.push('uncat');
         return [summary('m3', 'u@c.com')];
       },
-      listSummariesByDomain: () => {
+      listSummariesByDomainSeeded: () => {
         calls.push('domain');
         return [summary('m4', 'd@github.com'), summary('dup', 'z@a.com')];
       },
@@ -1286,9 +1488,9 @@ describe('topic discovery sampling and label hygiene', () => {
     const emails = {
       listSummaries: () =>
         Array.from({ length: 200 }, (_, i) => summary(`m${i}`, `u${i % 5}@x.com`)),
-      listSummariesRandom: () => [],
-      listUncategorizedSummaries: () => [],
-      listSummariesByDomain: () => [],
+      listSummariesSeeded: () => [],
+      listUncategorizedSummariesStable: () => [],
+      listSummariesByDomainSeeded: () => [],
       listSenders: () => Array.from({ length: 250 }, (_, i) => ({ fromAddr: `u${i % 5}@x.com` })),
     };
     const categories = { reconcileAutoCategories: vi.fn(() => 0) };
@@ -1318,9 +1520,9 @@ describe('topic discovery sampling and label hygiene', () => {
     const emails = {
       listSummaries: () =>
         Array.from({ length: 200 }, (_, i) => summary(`m${i}`, `u${i % 5}@x.com`)),
-      listSummariesRandom: () => [],
-      listUncategorizedSummaries: () => [],
-      listSummariesByDomain: () => [],
+      listSummariesSeeded: () => [],
+      listUncategorizedSummariesStable: () => [],
+      listSummariesByDomainSeeded: () => [],
       listSenders: () => Array.from({ length: 250 }, (_, i) => ({ fromAddr: `u${i % 5}@x.com` })),
     };
     const categories = { reconcileAutoCategories: vi.fn() };
@@ -2053,7 +2255,12 @@ describe('CategoryImprovementService', () => {
       },
       listForAccount: () => [{ id: 'c1', label: 'Broad Bucket', description: 'many kinds' }],
       getCentroidEntries: () => [
-        { categoryId: 'c1', label: 'Broad Bucket', vector: Float32Array.from([1, 0]), emailCount: 100 },
+        {
+          categoryId: 'c1',
+          label: 'Broad Bucket',
+          vector: Float32Array.from([1, 0]),
+          emailCount: 100,
+        },
       ],
       getEffectivePrototypeEntries: () => [
         {
@@ -2274,6 +2481,138 @@ describe('LlmClient 429 backoff', () => {
   });
 });
 
+describe('LlmClient think:false native routing', () => {
+  const makeClient = () =>
+    createLlmClient(
+      () =>
+        ({
+          baseUrl: 'http://local/v1',
+          embeddingModel: 'bge-m3',
+          generationModel: 'g',
+          embeddingDimensions: 1024,
+          chatRerank: true,
+          categorizeUseChatProvider: false,
+        }) as never,
+    );
+
+  it('routes think:false to Ollama /api/chat with think disabled and format json', async () => {
+    let calledUrl = '';
+    let sentBody: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      calledUrl = url;
+      sentBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: { role: 'assistant', content: '{"ok":1}' } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const answer = await makeClient().chat({
+        messages: [{ role: 'user', content: 'hi' }],
+        think: false,
+        responseFormat: 'json_object',
+        maxTokens: 500,
+      });
+      expect(answer).toBe('{"ok":1}');
+      expect(calledUrl).toBe('http://local/api/chat');
+      expect(sentBody.think).toBe(false);
+      expect(sentBody.format).toBe('json');
+      expect((sentBody.options as Record<string, unknown>).num_predict).toBe(500);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('falls back to the OpenAI-compatible path when the native endpoint 404s', async () => {
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      urls.push(url);
+      if (url.endsWith('/api/chat')) return new Response('not found', { status: 404 });
+      return new Response(
+        JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'fallback' } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const answer = await makeClient().chat({
+        messages: [{ role: 'user', content: 'hi' }],
+        think: false,
+      });
+      expect(answer).toBe('fallback');
+      expect(urls).toEqual(['http://local/api/chat', 'http://local/v1/chat/completions']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('LlmClient chatStream reasoning capture', () => {
+  it('forwards a separate reasoning stream and closes it before the answer', async () => {
+    // Ollama's OpenAI-compatible stream puts a reasoning model's chain of thought in `reasoning`
+    // while `content` stays empty; the client must forward it and synthesize </think> so the chat
+    // splitter can separate thinking from the answer instead of labelling the whole answer as think.
+    const body =
+      [
+        'data: {"choices":[{"delta":{"content":"","reasoning":"Think"}}]}',
+        'data: {"choices":[{"delta":{"content":"","reasoning":"ing"}}]}',
+        'data: {"choices":[{"delta":{"content":"Answer"}}]}',
+        'data: {"choices":[{"delta":{"content":" text"}}]}',
+        'data: [DONE]',
+      ].join('\n') + '\n';
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const client = createLlmClient(
+        () =>
+          ({
+            baseUrl: 'http://local/v1',
+            embeddingModel: 'bge-m3',
+            generationModel: 'qwen3:8b',
+            embeddingDimensions: 1024,
+            chatRerank: true,
+            categorizeUseChatProvider: false,
+          }) as never,
+      );
+      let out = '';
+      for await (const d of client.chatStream({ messages: [{ role: 'user', content: 'hi' }] })) {
+        out += d;
+      }
+      expect(out).toBe('Thinking</think>Answer text');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('leaves a non-reasoning stream untouched (no synthesized tag)', async () => {
+    const body =
+      ['data: {"choices":[{"delta":{"content":"Plain"}}]}', 'data: [DONE]'].join('\n') + '\n';
+    const fetchMock = vi.fn(async () => new Response(body, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const client = createLlmClient(
+        () =>
+          ({
+            baseUrl: 'http://local/v1',
+            embeddingModel: 'bge-m3',
+            generationModel: 'llama3.1',
+            embeddingDimensions: 1024,
+            chatRerank: true,
+            categorizeUseChatProvider: false,
+          }) as never,
+      );
+      let out = '';
+      for await (const d of client.chatStream({ messages: [{ role: 'user', content: 'hi' }] })) {
+        out += d;
+      }
+      expect(out).toBe('Plain');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe('config PATCH llm merge', () => {
   it('a partial llm patch preserves keys the caller did not send', () => {
     const stored = LlmConfigSchema.parse({
@@ -2370,7 +2709,12 @@ describe('redactConfig (M8)', () => {
     expect(safeLlm.chatApiKeySet).toBe(true);
     expect(safe.locale).toBe('en');
     // Feature flags carry no secrets and are exposed so the UI can reflect them.
-    expect(safe.features).toEqual({ multiPrototypeCategories: false });
+    expect(safe.features).toEqual({
+      multiPrototypeCategories: false,
+      clusterRepresentativeSampling: false,
+      crossEncoderRerank: false,
+      llmQueryUnderstanding: false,
+    });
   });
 
   it('enforces chat tuning bounds and accepts null to clear back to default', () => {

@@ -332,8 +332,16 @@ async function loadConfigIfAuthed(): Promise<void> {
     applyChatProvider(provider);
 
     $<HTMLInputElement>('toggle-auto-index').checked = cfg.autoIndex;
+    $<HTMLInputElement>('toggle-auto-triage').checked = cfg.autoTriage ?? true;
+    $<HTMLInputElement>('toggle-calendar-events').checked = cfg.calendarEvents ?? true;
     $<HTMLInputElement>('toggle-multi-prototype').checked =
       cfg.features?.multiPrototypeCategories ?? false;
+    $<HTMLInputElement>('toggle-cluster-sampling').checked =
+      cfg.features?.clusterRepresentativeSampling ?? false;
+    $<HTMLInputElement>('toggle-cross-encoder-rerank').checked =
+      cfg.features?.crossEncoderRerank ?? false;
+    $<HTMLInputElement>('toggle-query-understanding').checked =
+      cfg.features?.llmQueryUnderstanding ?? false;
   } catch (err) {
     setStatus('models-status', err instanceof Error ? err.message : String(err), 'error');
     populateModelSelects(null, null, null);
@@ -456,10 +464,80 @@ function attachHandlers(): void {
     }
   });
 
+  $<HTMLInputElement>('toggle-auto-triage').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ autoTriage: input.checked });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the priority setting: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
+  $<HTMLInputElement>('toggle-calendar-events').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ calendarEvents: input.checked });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the calendar setting: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
   $<HTMLInputElement>('toggle-multi-prototype').addEventListener('change', async (e) => {
     const input = e.target as HTMLInputElement;
     try {
       await coreClient.updateConfig({ features: { multiPrototypeCategories: input.checked } });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the experimental toggle: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
+  $<HTMLInputElement>('toggle-cluster-sampling').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ features: { clusterRepresentativeSampling: input.checked } });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the experimental toggle: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
+  $<HTMLInputElement>('toggle-cross-encoder-rerank').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ features: { crossEncoderRerank: input.checked } });
+    } catch (err) {
+      input.checked = !input.checked;
+      setStatus(
+        'models-status',
+        `Could not save the experimental toggle: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  });
+
+  $<HTMLInputElement>('toggle-query-understanding').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    try {
+      await coreClient.updateConfig({ features: { llmQueryUnderstanding: input.checked } });
     } catch (err) {
       input.checked = !input.checked;
       setStatus(

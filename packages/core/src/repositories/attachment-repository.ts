@@ -82,7 +82,7 @@ export class AttachmentRepository {
       ),
       deleteChunks: db.prepare('DELETE FROM attachment_chunks WHERE attachment_id = ?'),
       insertChunk: db.prepare(
-        'INSERT INTO attachment_chunks (attachment_id, message_id, account_id, chunk_index, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO attachment_chunks (attachment_id, message_id, account_id, chunk_index, text, context, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ),
       insertVec: db.prepare('INSERT INTO attachment_chunk_embeddings (embedding) VALUES (?)'),
       findEmbRow: db.prepare(
@@ -147,19 +147,31 @@ export class AttachmentRepository {
     this.stmts.setStatus.run(status, error, charCount, Date.now(), id);
   }
 
-  /** Replace an attachment's chunks, dropping stale embeddings and FTS via triggers, and return rowids. */
+  /**
+   * Replace an attachment's chunks, dropping stale embeddings and FTS via triggers, and return
+   * rowids. `context` situates every chunk in its parent document and is indexed alongside the text.
+   */
   replaceChunks(
     attachmentId: string,
     messageId: string,
     accountId: string,
     chunks: string[],
+    context: string | null = null,
   ): number[] {
     const tx = this.db.transaction(() => {
       this.stmts.deleteChunks.run(attachmentId);
       const now = Date.now();
       const rowids: number[] = [];
       chunks.forEach((text, i) => {
-        const r = this.stmts.insertChunk.run(attachmentId, messageId, accountId, i, text, now);
+        const r = this.stmts.insertChunk.run(
+          attachmentId,
+          messageId,
+          accountId,
+          i,
+          text,
+          context,
+          now,
+        );
         rowids.push(Number(r.lastInsertRowid));
       });
       return rowids;
@@ -181,8 +193,7 @@ export class AttachmentRepository {
     const buf = vectorToBuffer(vector instanceof Float32Array ? vector : Float32Array.from(vector));
     const tx = this.db.transaction(() => {
       const existing = this.stmts.findEmbRow.get(chunkRowid, model) as
-        | { rowid: number }
-        | undefined;
+        { rowid: number } | undefined;
       if (existing) {
         this.stmts.updateVec.run(buf, existing.rowid);
         return;

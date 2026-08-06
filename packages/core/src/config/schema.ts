@@ -18,7 +18,7 @@ export const LlmConfigSchema = z.object({
   baseUrl: z.string().url().default('http://localhost:11434/v1'),
   apiKey: z.string().optional(),
   embeddingModel: z.string().default('bge-m3'),
-  generationModel: z.string().default('qwen3:8b'),
+  generationModel: z.string().default('llama3.1'),
   chatModel: z.string().optional(),
   embeddingDimensions: z.number().int().positive().default(1024),
   chatTopK: z.number().int().min(1).max(50).nullable().optional(),
@@ -39,6 +39,12 @@ export const LlmConfigSchema = z.object({
 export const FeaturesConfigSchema = z.object({
   /** Phase 4: allow a category to carry multiple prototype centroids (nearest-prototype matching). */
   multiPrototypeCategories: z.boolean().default(false),
+  /** Sample discovery by content-cluster representatives instead of by sender, for variety coverage. */
+  clusterRepresentativeSampling: z.boolean().default(false),
+  /** Rerank chat retrieval with a local cross-encoder sidecar (ml/rerank_server.py) instead of an LLM. */
+  crossEncoderRerank: z.boolean().default(false),
+  /** Run an LLM query-understanding pass before chat retrieval (cross-language terms, date intent). */
+  llmQueryUnderstanding: z.boolean().default(false),
 });
 
 /** Zod schema for the full application configuration. */
@@ -46,6 +52,9 @@ export const AppConfigSchema = z.object({
   version: z.number().int().default(1),
   locale: z.enum(['en', 'fr']).default('en'),
   autoIndex: z.boolean().default(false),
+  /** After auto-indexing new mail, also run a triage/priority pass so the briefing stays current. */
+  autoTriage: z.boolean().default(true),
+  calendarEvents: z.boolean().default(true),
   indexedFolders: z.array(z.string()).default([]),
   llm: LlmConfigSchema.default(() => LlmConfigSchema.parse({})),
   features: FeaturesConfigSchema.default(() => FeaturesConfigSchema.parse({})),

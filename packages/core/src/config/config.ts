@@ -54,6 +54,8 @@ export interface SafeConfig {
   version: number;
   locale: AppConfig['locale'];
   autoIndex: boolean;
+  autoTriage: boolean;
+  calendarEvents: boolean;
   indexedFolders: string[];
   llm: Omit<AppConfig['llm'], 'apiKey' | 'chatApiKey'> & { chatApiKeySet: boolean };
   features: AppConfig['features'];
@@ -68,6 +70,8 @@ export function redactConfig(config: AppConfig): SafeConfig {
     version: config.version,
     locale: config.locale,
     autoIndex: config.autoIndex,
+    autoTriage: config.autoTriage,
+    calendarEvents: config.calendarEvents,
     indexedFolders: config.indexedFolders,
     llm: {
       baseUrl: config.llm.baseUrl,
@@ -87,6 +91,9 @@ export function redactConfig(config: AppConfig): SafeConfig {
     // Feature flags carry no secrets; expose them so the UI can reflect and toggle them.
     features: {
       multiPrototypeCategories: config.features.multiPrototypeCategories,
+      clusterRepresentativeSampling: config.features.clusterRepresentativeSampling,
+      crossEncoderRerank: config.features.crossEncoderRerank,
+      llmQueryUnderstanding: config.features.llmQueryUnderstanding,
     },
   };
 }

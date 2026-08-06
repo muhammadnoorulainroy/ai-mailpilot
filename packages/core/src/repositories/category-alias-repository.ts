@@ -98,8 +98,7 @@ export class CategoryAliasRepository {
   /** Resolve free text to the category it is an alias of, or null. Case and accent insensitive. */
   findByAlias(accountId: string, text: string): CategoryRow | null {
     const row = this.stmts.findByAlias.get(accountId, normalizeForMatch(text)) as
-      | JoinedCategoryRow
-      | undefined;
+      JoinedCategoryRow | undefined;
     if (!row) return null;
     return {
       id: row.id,

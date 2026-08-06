@@ -2,8 +2,14 @@
  * Read-only aggregation service that assembles the "Today's Focus" priority view
  * from triage data, grouping emails into sections with counts and carryover.
  */
-import type { PriorityRange, PriorityResponse, PriorityEmailDto } from '@ai-mailpilot/shared';
+import type {
+  CapturedEvent,
+  PriorityRange,
+  PriorityResponse,
+  PriorityEmailDto,
+} from '@ai-mailpilot/shared';
 import type { PriorityEmail, TriageRepository } from '../repositories/triage-repository.js';
+import type { CalendarEventRepository } from '../repositories/calendar-event-repository.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SECTION_LIMIT = 50;
@@ -26,8 +32,11 @@ export interface PriorityOptions {
  * carryover only applies to the bounded ranges (today and week).
  */
 export class PriorityService {
-  /** Creates the service over the triage repository. */
-  constructor(private triage: TriageRepository) {}
+  /** Creates the service over the triage repository, optionally attaching captured events to rows. */
+  constructor(
+    private triage: TriageRepository,
+    private events?: CalendarEventRepository,
+  ) {}
 
   /**
    * Aggregates the priority sections, counts, and carryover for an account
@@ -87,6 +96,16 @@ export class PriorityService {
           )
         : [];
 
+    const sections = [needsAction, important, summaries, carryover, lowPriority];
+    const eventsByMessage = this.events
+      ? this.events.mapByMessages(
+          accountId,
+          sections.flat().map((e) => e.messageId),
+        )
+      : new Map<string, CapturedEvent>();
+    const dto = (e: PriorityEmail): PriorityEmailDto =>
+      toDto(e, eventsByMessage.get(e.messageId) ?? null);
+
     return {
       accountId,
       range: opts.range,
@@ -99,17 +118,17 @@ export class PriorityService {
         lowPriority: counts.lowPriority,
         unclassified,
       },
-      needsAction: needsAction.map(toDto),
-      important: important.map(toDto),
-      summaries: summaries.map(toDto),
-      carryover: carryover.map(toDto),
-      lowPriority: lowPriority.map(toDto),
+      needsAction: needsAction.map(dto),
+      important: important.map(dto),
+      summaries: summaries.map(dto),
+      carryover: carryover.map(dto),
+      lowPriority: lowPriority.map(dto),
     };
   }
 }
 
-/** Maps an internal priority email row to the wire-facing DTO shape. */
-function toDto(e: PriorityEmail): PriorityEmailDto {
+/** Maps an internal priority email row to the wire-facing DTO shape, attaching any captured event. */
+function toDto(e: PriorityEmail, event: CapturedEvent | null): PriorityEmailDto {
   return {
     messageId: e.messageId,
     folder: e.folder,
@@ -126,5 +145,6 @@ function toDto(e: PriorityEmail): PriorityEmailDto {
     importanceScore: e.importanceScore,
     suggestedAction: e.suggestedAction,
     shortSummary: e.shortSummary,
+    event,
   };
 }

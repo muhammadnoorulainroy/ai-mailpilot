@@ -19,6 +19,19 @@ function sameModel(a: string, b: string): boolean {
 }
 
 /**
+ * Reasoning models that emit a <think> block before the answer (qwen3 chat, QwQ, DeepSeek-R1). The
+ * chat stream splitter and the /no_think control are only correct for these; a non-reasoning model
+ * like llama3.1 would otherwise stream its whole answer through the think channel. qwen3-embedding is
+ * excluded: it is an embedding model, never a generation model.
+ */
+const REASONING_MODEL = /^(qwen3(?!-embedding)|qwq|deepseek-r1)/i;
+
+/** True when the generation model reasons in <think> tags, so the splitter and /no_think apply. */
+export function isReasoningModel(modelId: string): boolean {
+  return REASONING_MODEL.test(canonicalizeModelId(modelId));
+}
+
+/**
  * Pick the model for user-facing assistant/chat calls.
  *
  * Cloud mode requires an explicit cloud chat model and never falls back to the local generation

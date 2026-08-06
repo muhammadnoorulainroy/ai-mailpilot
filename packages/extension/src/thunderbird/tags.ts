@@ -7,7 +7,14 @@ import { coreClient } from '../api-client/core-client.js';
 import { MailboxSnapshot } from './mailbox.js';
 import { loadSyncPrefs } from '../settings/sync-prefs.js';
 
-const KEY_PREFIX = 'mailpilot_';
+/** Namespace prefix marking a Thunderbird tag as MailPilot-managed (never a user-owned signal). */
+export const KEY_PREFIX = 'mailpilot_';
+
+/**
+ * Prefix for a MailPilot tag's visible label when the user already owns a tag with the same name.
+ * Keeps the user's tag untouched while still creating a distinct MailPilot tag Thunderbird accepts.
+ */
+const DISAMBIGUATION_PREFIX = 'AI: ';
 
 const PAGE_SIZE = 500;
 
@@ -22,9 +29,19 @@ const PALETTE: string[] = [
   '#0D5A2B',
 ];
 
-/** Derive a Thunderbird-safe tag key from a category id, namespaced with the MailPilot prefix. */
-function tagKeyFor(categoryId: string): string {
-  return (KEY_PREFIX + categoryId).toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+/**
+ * Derive a Thunderbird-safe MailPilot tag key from a category's canonical key, falling back to its
+ * id only when the canonical key is missing. Keying on the canonical key (stable across id churn)
+ * means a category reset/re-discovery that mints new ids reuses the same tag instead of colliding.
+ */
+export function tagKeyFor(cat: { id: string; canonicalKey?: string }): string {
+  const base = cat.canonicalKey && cat.canonicalKey.length > 0 ? cat.canonicalKey : cat.id;
+  return (KEY_PREFIX + base).toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+}
+
+/** Whether a Thunderbird tag is MailPilot-owned (safe to create, rename, adopt, or clean). */
+function isMailpilotTag(key: string): boolean {
+  return key.startsWith(KEY_PREFIX);
 }
 
 /**
@@ -43,28 +60,101 @@ function colorFor(index: number): string {
 }
 
 /**
- * Ensure one Thunderbird tag per category. Creates missing tags, renames tags whose label
- * changed, and returns a categoryId to tagKey map for setting tags on messages.
+ * Ensure one Thunderbird tag per category and return a categoryId to tagKey map for setting tags on
+ * messages. Collision-safe and non-destructive to user tags:
+ * - Exact key present: reuse it, renaming only the visible label when the category label changed.
+ * - Key absent but a MailPilot tag already shows this label (e.g. left over from an old category id
+ *   after a reset): adopt that tag's key instead of creating a duplicate label.
+ * - A non-MailPilot user tag already shows this label: never touch it; create the MailPilot tag under
+ *   a disambiguated visible label ("AI: <label>") so Thunderbird accepts it.
+ * Never updates, renames, or deletes a non-MailPilot tag.
  */
-async function ensureCategoryTags(categories: CategoryDto[]): Promise<Map<string, string>> {
+export async function ensureCategoryTags(categories: CategoryDto[]): Promise<Map<string, string>> {
   const existing = await browser.messages.tags.list();
   const byKey = new Map(existing.map((t) => [t.key, t]));
+  // Visible labels currently taken, mapped to the tag key that owns each (case-insensitive). Kept
+  // current as we create and rename, so no two tags ever collide on a label.
+  const labelOwner = new Map<string, string>();
+  const mailpilotKeyByLabel = new Map<string, string>();
+  for (const t of existing) {
+    labelOwner.set(t.tag.toLowerCase(), t.key);
+    if (isMailpilotTag(t.key)) mailpilotKeyByLabel.set(t.tag.toLowerCase(), t.key);
+  }
+  // Every key this run wants. Adoption may only claim a TRUE orphan (a leftover tag whose key is not
+  // some other category's own key), so two categories never collapse onto one tag.
+  const desiredKeys = new Set(categories.filter((c) => c).map((c) => tagKeyFor(c!)));
+
+  /** A visible label free for `ownKey` to take (case-insensitive), preferring the category's own. */
+  const pickLabel = (desired: string, ownKey: string): string => {
+    const free = (label: string): boolean => {
+      const owner = labelOwner.get(label.toLowerCase());
+      return owner === undefined || owner === ownKey;
+    };
+    if (free(desired)) return desired;
+    const ai = `${DISAMBIGUATION_PREFIX}${desired}`;
+    if (free(ai)) return ai;
+    for (let n = 2; ; n++) {
+      const candidate = `${ai} (${n})`;
+      if (free(candidate)) return candidate;
+    }
+  };
+  const claimLabel = (key: string, oldLabel: string | undefined, newLabel: string): void => {
+    if (oldLabel !== undefined && labelOwner.get(oldLabel.toLowerCase()) === key) {
+      labelOwner.delete(oldLabel.toLowerCase());
+    }
+    labelOwner.set(newLabel.toLowerCase(), key);
+  };
 
   const result = new Map<string, string>();
+  const usedKeys = new Set<string>();
   for (let i = 0; i < categories.length; i++) {
     const cat = categories[i];
     if (!cat) continue;
 
-    const key = tagKeyFor(cat.id);
+    const key = tagKeyFor(cat);
     const color = colorFor(i);
-    const tag = byKey.get(key);
+    const existingTag = byKey.get(key);
 
-    if (!tag) {
-      await browser.messages.tags.create(key, cat.label, color);
-    } else if (tag.tag !== cat.label) {
-      await browser.messages.tags.update(key, { tag: cat.label });
+    // Our own tag already exists: reuse it, renaming only when the label changed. Skip if the key was
+    // already claimed this run (defensive against two categories deriving the same key).
+    if (existingTag && !usedKeys.has(key)) {
+      const label = pickLabel(cat.label, key);
+      if (existingTag.tag !== label) {
+        try {
+          await browser.messages.tags.update(key, { tag: label });
+          claimLabel(key, existingTag.tag, label);
+          existingTag.tag = label;
+        } catch (err) {
+          console.warn('[MailPilot] failed to rename tag', key, err);
+        }
+      }
+      result.set(cat.id, key);
+      usedKeys.add(key);
+      continue;
+    }
+
+    // Adopt a leftover MailPilot tag with this label (old id-keyed tag after a reset), but only a true
+    // orphan: never one that is some other category's own key or already claimed this run.
+    const adoptKey = mailpilotKeyByLabel.get(cat.label.toLowerCase());
+    if (adoptKey && !usedKeys.has(adoptKey) && !desiredKeys.has(adoptKey)) {
+      result.set(cat.id, adoptKey);
+      usedKeys.add(adoptKey);
+      continue;
+    }
+
+    // Create under a label free of any current tag (user or MailPilot). A residual collision only
+    // warns; it never aborts tagging for the rest of the account.
+    const label = pickLabel(cat.label, key);
+    try {
+      await browser.messages.tags.create(key, label, color);
+      byKey.set(key, { key, tag: label, color, ordinal: '' });
+      claimLabel(key, undefined, label);
+      if (isMailpilotTag(key)) mailpilotKeyByLabel.set(label.toLowerCase(), key);
+    } catch (err) {
+      console.warn('[MailPilot] failed to create tag', key, err);
     }
     result.set(cat.id, key);
+    usedKeys.add(key);
   }
 
   return result;

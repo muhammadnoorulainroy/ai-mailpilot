@@ -13,6 +13,8 @@ import { EMBEDDING_DIM } from '../db/schema.js';
 const UpdateConfigBody = z.object({
   locale: z.enum(['en', 'fr']).optional(),
   autoIndex: z.boolean().optional(),
+  autoTriage: z.boolean().optional(),
+  calendarEvents: z.boolean().optional(),
   indexedFolders: z.array(z.string()).optional(),
   llm: LlmConfigSchema.partial().optional(),
   features: FeaturesConfigSchema.partial().optional(),
@@ -67,6 +69,9 @@ export async function registerConfigRoutes(app: FastifyInstance, ctx: AppContext
 
     if (parsed.data.locale) ctx.config.locale = parsed.data.locale;
     if (parsed.data.autoIndex !== undefined) ctx.config.autoIndex = parsed.data.autoIndex;
+    if (parsed.data.autoTriage !== undefined) ctx.config.autoTriage = parsed.data.autoTriage;
+    if (parsed.data.calendarEvents !== undefined)
+      ctx.config.calendarEvents = parsed.data.calendarEvents;
     if (parsed.data.indexedFolders) ctx.config.indexedFolders = parsed.data.indexedFolders;
 
     if (Object.keys(llmPatch).length > 0) {

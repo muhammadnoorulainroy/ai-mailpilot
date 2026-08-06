@@ -19,6 +19,7 @@ import { TriageRepository, type TriageBucket } from '../src/repositories/triage-
 import { CategorizeJobRepository } from '../src/repositories/categorize-job-repository.js';
 import type { LlmCategorizeProgress } from '../src/services/llm-categorize-orchestrator.js';
 import { DashboardService } from '../src/services/dashboard-service.js';
+import { EmailUserLabelRepository } from '../src/repositories/email-user-label-repository.js';
 import { PriorityService } from '../src/services/priority-service.js';
 import { EmailAssistantService } from '../src/services/email-assistant-service.js';
 import type { TriageMetadata } from '@ai-mailpilot/shared';
@@ -867,7 +868,7 @@ describe('DashboardService coverage counts (triage vs category wiring bug)', () 
   it('reports uncategorized from category assignments, independent of triage', () => {
     const acct = accounts.create({ address: 'dash@x.y', kind: 'work' });
     const triage = new TriageRepository(db);
-    const dash = new DashboardService(emails, triage, categories);
+    const dash = new DashboardService(emails, triage, categories, new EmailUserLabelRepository(db));
     const cat = categories.create({ accountId: acct.id, label: 'C', source: 'auto' });
     const now = Date.now();
 
@@ -1712,5 +1713,44 @@ describe('EmailAssistantService', () => {
     expect(out.draft).toBe(
       'Hello Claire,\n\nThank you for the update, Claire. I appreciate the information regarding the review process.\n\nBest regards,\nNoor',
     );
+  });
+});
+
+describe('EmailRepository seeded pool draws (deterministic discovery)', () => {
+  let accountId: string;
+
+  beforeEach(() => {
+    accountId = accounts.create({ address: 'w@x.com', kind: 'work' }).id;
+    const rows = Array.from({ length: 200 }, (_, i) => ({
+      messageId: `m${i}`,
+      accountId,
+      folder: '/INBOX',
+      subject: `subject ${i}`,
+      fromAddr: i % 3 === 0 ? `u${i}@shop.com` : `u${i}@other.com`,
+      date: i,
+      hasAttachments: false,
+    }));
+    emails.upsertBatch(rows);
+  });
+
+  it('listSummariesSeeded returns the same subset for the same seed and differs by seed', () => {
+    const a = emails.listSummariesSeeded(accountId, 40, 12345).map((e) => e.messageId);
+    const b = emails.listSummariesSeeded(accountId, 40, 12345).map((e) => e.messageId);
+    expect(a).toEqual(b); // deterministic
+    expect(a).toHaveLength(40);
+
+    const c = emails.listSummariesSeeded(accountId, 40, 999).map((e) => e.messageId);
+    expect(c).not.toEqual(a); // a different seed draws a different subset
+
+    // It spreads across the corpus, not just the newest rows (a plain date sort would return m199..m160).
+    const newestByDate = new Set(Array.from({ length: 40 }, (_, i) => `m${199 - i}`));
+    expect(a.every((id) => newestByDate.has(id))).toBe(false);
+  });
+
+  it('listSummariesByDomainSeeded is deterministic and only returns the requested domain', () => {
+    const a = emails.listSummariesByDomainSeeded(accountId, 'shop.com', 10, 7);
+    const b = emails.listSummariesByDomainSeeded(accountId, 'shop.com', 10, 7);
+    expect(a.map((e) => e.messageId)).toEqual(b.map((e) => e.messageId)); // deterministic
+    expect(a.every((e) => e.fromAddr?.endsWith('@shop.com'))).toBe(true);
   });
 });

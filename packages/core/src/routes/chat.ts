@@ -7,7 +7,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import type { ChatSource, ChatStreamEvent } from '../services/chat-service.js';
-import { resolveActiveChatModel } from '../util/chat-model.js';
+import { resolveActiveChatModel, isReasoningModel } from '../util/chat-model.js';
 
 const ChatBody = z.object({
   accountId: z.string().min(1),
@@ -57,6 +57,9 @@ export async function registerChatRoutes(app: FastifyInstance, ctx: AppContext):
     topK?: number;
     snippetChars?: number;
     rerank?: boolean;
+    rerankWithLlm?: boolean;
+    analyzeQuery?: boolean;
+    cloud?: boolean;
     thinking?: boolean;
     answerTokens?: number;
   }> {
@@ -72,7 +75,14 @@ export async function registerChatRoutes(app: FastifyInstance, ctx: AppContext):
       topK: caps.topK,
       snippetChars: caps.snippetChars,
       rerank: llm.chatRerank,
-      thinking: !cloud,
+      // An LLM listwise rerank is trusted only for a strong cloud model; a weak local model can invert
+      // the correct order, so local keeps fusion order (unless the cross-encoder sidecar is enabled).
+      rerankWithLlm: cloud,
+      analyzeQuery: ctx.config.features.llmQueryUnderstanding,
+      cloud,
+      // Engage the <think> splitter only for a local reasoning model (qwen3 etc.); a non-reasoning
+      // default like llama3.1 must stream its answer directly, not through the think channel.
+      thinking: !cloud && isReasoningModel(answerModel),
       answerTokens: cloud ? CLOUD_ANSWER_TOKENS : undefined,
     };
   }

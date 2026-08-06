@@ -9,8 +9,10 @@ import type {
   AttachmentRepository,
   AttachmentStatus,
 } from '../repositories/attachment-repository.js';
+import type { EmailRepository } from '../repositories/email-repository.js';
 import { extractAttachmentText } from './attachment-extract.js';
 import { chunkText } from '../util/chunk.js';
+import { buildChunkContext } from '../util/text.js';
 
 const MAX_TEXT_CHARS = 200_000;
 const MAX_CHUNKS = 200;
@@ -27,10 +29,11 @@ export interface IngestResult {
  * Idempotent, so an already-extracted attachment is skipped on re-sync. Runs fully local.
  */
 export class AttachmentService {
-  /** Wire up the embedding client, attachment store, and logger. */
+  /** Wire up the embedding client, the attachment and email stores, and a logger. */
   constructor(
     private llm: LlmClient,
     private attachments: AttachmentRepository,
+    private emails: EmailRepository,
     private logger: Logger,
   ) {}
 
@@ -70,11 +73,29 @@ export class AttachmentService {
       return { status: 'empty', chunks: 0 };
     }
 
-    const rowids = this.attachments.replaceChunks(id, meta.messageId, meta.accountId, chunks);
+    // The context header situates the chunk in its document (filename, sender, date, subject). It is
+    // stored and indexed for keyword search (contextual BM25), but NOT prepended to the embedding
+    // input: an ablation on this mailbox showed the metadata header pulls the vector off the chunk's
+    // content and lowers dense top-K, while indexing it for BM25 lifts recall. See the vault note.
+    const email = this.emails.findById(meta.messageId, meta.accountId);
+    const context = buildChunkContext({
+      filename: meta.filename,
+      subject: email?.subject,
+      fromAddr: email?.fromAddr,
+      date: email?.date,
+    });
+
+    const rowids = this.attachments.replaceChunks(
+      id,
+      meta.messageId,
+      meta.accountId,
+      chunks,
+      context || null,
+    );
     try {
       for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
         const batch = chunks.slice(i, i + EMBED_BATCH);
-        const vectors = await this.llm.embedBatch(batch, embeddingModelId);
+        const vectors = await this.llm.embedBatch(batch, embeddingModelId, 'attachment');
         if (vectors.length !== batch.length) {
           throw new Error(
             `attachment embedding count mismatch: requested ${batch.length}, got ${vectors.length}`,
