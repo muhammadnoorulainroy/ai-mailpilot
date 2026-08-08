@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "AI-powered email intelligence platform - semantic organization, RAG chat, and MCP interface for Thunderbird, powered by local AI.",
+  "description": "AI Powered Local-first email categorization, priority triage, grounded chat, and message assistance for Thunderbird.",
   "workspaces": [
     "packages/shared",
     "packages/core",
@@ -35,7 +35,6 @@
     "ai",
     "local-ai",
     "ollama",
-    "mcp",
     "embeddings",
     "clustering",
     "rag",

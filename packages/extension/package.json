@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "AI MailPilot Thunderbird Extension - sidebar, context menus, onboarding, chat UI",
+  "description": "AI MailPilot Thunderbird extension - synchronization, dashboard, grounded chat, and message assistance",
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch",

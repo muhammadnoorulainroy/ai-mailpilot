@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "AI MailPilot Core Server - embedding engine, clustering, categorization, RAG, MCP interface",
+  "description": "AI MailPilot Core - encrypted storage, categorization, triage, retrieval, and local-first AI orchestration",
   "main": "./dist/server.js",
   "scripts": {
     "build": "tsup",
