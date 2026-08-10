@@ -1,477 +1,336 @@
-# AI MailPilot - Project Plan
+# AI MailPilot: Implementation Status and Roadmap
 
-**Date**: April 2026 - revised
-**Author**: Muhammad Noor Ul Ain
-**Program**: CPS2 Master's - University Jean Monnet & Ecole des Mines de Saint-Etienne
-**Repository**: https://github.com/muhammadnoorulainroy/ai-mailpilot
+**Project:** CPS2 master's personal project
+**Repository:** <https://github.com/muhammadnoorulainroy/ai-mailpilot>
 
----
+This document records the current engineering state of AI MailPilot. It replaces the original
+schedule-based project plan, which described several ideas that were later rejected or deferred.
+Claims below are based on the current TypeScript and Python source, database migrations, extension
+manifest, and automated tests.
 
-## Vision
+## 1. Product Goal
 
-AI MailPilot is an open-source, privacy-first Thunderbird extension that uses local AI to intelligently organize your inbox. It automatically classifies incoming emails into actionable categories (urgent, summarize, spam, personal), discovers semantic clusters of related emails, lets users chat with their mailbox using RAG, and can federate spam and category knowledge across an organization without sharing email content.
+AI MailPilot addresses a practical problem: a large mailbox contains useful information, deadlines,
+and actions, but the user must spend time searching and maintaining folders before that information
+is usable.
 
-**Target**: Thunderbird Add-on Store (ATN), millions of potential users in academic and professional organizations.
+The product adds four forms of assistance to Thunderbird:
 
----
+1. Personalized semantic categories that can be corrected and maintained without silently
+   replacing the user's organization.
+2. A date-scoped priority view that separates actionable mail from important updates and routine
+   summaries.
+3. Grounded question answering across email, extracted attachment text, and captured calendar
+   events.
+4. Per-message summaries and editable reply drafts.
 
-## Architecture Overview
+The governing product rule is conservative automation: leaving an uncertain message uncategorized
+is preferable to giving it a confident but incorrect label. Taxonomy changes require review when
+they may alter the visible organization.
 
-AI MailPilot is a two-piece system: a Thunderbird extension that owns the user interface and email access, and a Core Server that owns the AI intelligence. The two communicate via a local REST API. An optional MCP wrapper exposes the same intelligence to external AI clients (Claude Desktop, VS Code Copilot) for power users, but this is configuration-only and not part of the primary product.
+## 2. Runtime Architecture
 
-```
-+--------------------------------------------------------+
-|                                                        |
-|           THUNDERBIRD EXTENSION (Primary UI)           |
-|                                                        |
-|  - Dashboard (urgent, summaries, mailing lists)        |
-|  - Categories sidebar (multi-label tags)               |
-|  - Chat panel (Ask your mailbox)                       |
-|  - Context menus (categorize, find similar)            |
-|  - Settings (LLM URL, models, federation toggle)       |
-|  - Onboarding wizard                                   |
-|                                                        |
-|  Reads emails directly from Thunderbird APIs           |
-|  (no separate IMAP path)                               |
-|                                                        |
-+--------------+-----------------------------------------+
-               |
-               | REST (HTTP/JSON)
-               | - push email text + metadata
-               | - request embeddings, classifications, RAG answers
-               v
-+--------------+-----------------------------------------+
-|                                                        |
-|        AI MAILPILOT CORE SERVER (Local Process)        |
-|                                                        |
-|  Interfaces:                                           |
-|  - REST API (Fastify)                                  |
-|  - MCP wrapper (optional, low priority)                |
-|                                                        |
-|  Engines:                                              |
-|  - Embedding engine (calls LLM runtime)                |
-|  - Triage classifier (urgent/summarize/spam/personal)  |
-|  - Personal email detector (dual-signal)               |
-|  - LLM topic discovery + centroid similarity           |
-|    (multi-label, NOT K-means or HDBSCAN)               |
-|  - Category manager (centroids + learning loop)        |
-|  - RAG engine (retrieval + generation)                 |
-|  - Draft reply generator (for urgent emails)           |
-|  - Awaiting Response tracker                           |
-|  - Mailing list detector                               |
-|                                                        |
-|  Storage:                                              |
-|  - SQLite with sqlite-vec extension (one DB file)      |
-|    - account_id-scoped tables                          |
-|    - vectors + metadata in single transaction model    |
-|                                                        |
-+--------------+-----------------------------------------+
-               |
-               | OpenAI-compatible API
-               v
-+--------------+-----------------------------------------+
-|                                                        |
-|              LLM RUNTIME (Configurable)                |
-|                                                        |
-|  Mode 1: Local Ollama (default, fully private)         |
-|  Mode 2: Institutional server (VPN/local network)      |
-|  Mode 3: LM Studio, vLLM, or any OpenAI-compatible     |
-|                                                        |
-|  Same API contract for all modes                       |
-|                                                        |
-+--------------------------------------------------------+
+AI MailPilot is an npm-workspaces monorepo with three shipped packages:
 
-OPTIONAL: MCP wrapper on Core Server lets external AI
-clients (Claude Desktop, VS Code Copilot) call the same
-intelligence. Wired up via configuration docs in README.
+| Package | Responsibility |
+| --- | --- |
+| `@ai-mailpilot/extension` | Thunderbird mailbox access, synchronization, settings, dashboard, message assistant, tag application, and folder moves |
+| `@ai-mailpilot/core` | Authenticated Fastify API, AI orchestration, retrieval, categorization, triage, persistence, and background jobs |
+| `@ai-mailpilot/shared` | TypeScript API contracts, configuration types, model presets, and shared constants |
+
+The extension reads mail through Thunderbird WebExtension APIs and pushes selected content to Core
+over authenticated HTTP on `localhost:3420`. Core has no active IMAP client and stores no mailbox
+password. This keeps Thunderbird as the source of truth for message state.
+
+Core uses one SQLCipher-encrypted SQLite database. Normal tables, FTS5 indexes, and `sqlite-vec`
+vector tables share the same transaction boundary and backup unit. The application does not require
+a separate vector database.
+
+### 2.1 Main component flow
+
+```text
+Thunderbird WebExtension
+  -> authenticated localhost API
+  -> Fastify routes and validation
+  -> application services
+  -> account-scoped repositories
+  -> encrypted SQLite, FTS5, and sqlite-vec
+
+Application services
+  -> local OpenAI-compatible endpoint for embeddings and default generation
+  -> optional cloud OpenAI-compatible endpoint for explicitly enabled generation tasks
 ```
 
-### Key Architectural Decisions (Meeting 2)
+### 2.2 Local and cloud model roles
 
-1. **No separate IMAP connector in Core**. Thunderbird already has IMAP. The extension reads emails via Thunderbird APIs and pushes content to Core. This avoids double-fetching and keeps Thunderbird as source of truth for email state.
+The model client exposes two logical providers:
 
-2. **OpenAI-compatible LLM API**. Core treats the LLM runtime as a black box with a standard API. Works with local Ollama, institutional servers, LM Studio, vLLM. User configures URL, port, optional credentials.
+- `main` is the configured local endpoint and is always used for embeddings.
+- `chat` uses the optional chat endpoint when configured and otherwise resolves to the local
+  generation endpoint.
 
-3. **sqlite-vec for vectors, not a separate vector DB**. SQLite with the sqlite-vec extension handles both regular persistence and vector search in a single file. Production-grade (used by Spotify and others), simpler stack, easier backup/restore. Avoids running a separate Qdrant/LanceDB process.
+Cloud configuration is not one global permission. Chat uses the selected chat provider;
+opened-message summary and draft endpoints additionally request confirmation; Refine and Priority
+have separate toggles; and cloud discovery requires a global option plus per-account consent.
 
-4. **LLM topic discovery, not K-means or HDBSCAN**. K-means is single-label and requires K upfront. HDBSCAN has no production JS library. Instead: sample emails, ask LLM to identify topics with descriptions, compute centroids from matched emails, classify new emails by cosine similarity to all centroids (multi-label via threshold). Naturally multi-label, human-meaningful from day one.
+## 3. Implemented Features
 
-5. **External MCP clients are configuration-only**. Drop the planned Local MCP Client and CLI. The MCP wrapper on Core is low priority. README documents how to connect Claude Desktop or Copilot for power users.
+### 3.1 Account selection and synchronization
 
-6. **Two deployment modes supported, MVP defaults to local**. Core Server is deployable both locally (per-user, default) and institutionally (org-hosted, future). Same code, transport-agnostic. MVP ships local mode; institutional mode is a configuration swap, not a rewrite.
+**Status: implemented**
 
-7. **account_id baked into every data model from day one**. Multi-account support (Gmail + work institutional + personal) is cheap to add now, expensive to retrofit. All records carry account scope.
+- Discovers supported Thunderbird mail accounts and applies per-account indexing controls.
+- Work and institutional accounts are indexable by default. Personal accounts require explicit
+  enablement for indexing and have an additional discovery-consent control.
+- Synchronizes configured folders in bounded batches and avoids fetching unchanged message bodies.
+- Auto-indexing can process newly arrived mail; optional auto-triage can update the priority view in
+  the same workflow.
+- Force sync repairs incomplete or stale body capture.
+- Core receives message data from the extension; it never logs in to the mail server independently.
 
-8. **Bootstrap from existing folder structure on first run**. The professor already has years of folder curation. We treat each existing folder as an implicit category, compute its centroid from current contents, and use it as training data. No clean slate. His investment becomes training.
+### 3.2 Local embeddings and searchable storage
 
----
+**Status: implemented**
 
-## Functional Requirements
+- `bge-m3` is the standard embedding model and must return 1024 values.
+- Embeddings are generated locally, canonicalized by model identifier, and updated only when message
+  content changes.
+- FTS5 indexes sender, subject, and body text. `sqlite-vec` stores email, category, and attachment
+  vectors.
+- PDF, DOCX, and text-like attachments are extracted, chunked, indexed lexically, and embedded.
+- Extraction is bounded by page, character, and chunk limits. Unsupported or encrypted formats are
+  recorded without blocking the rest of synchronization.
 
-### Always-On Email Triage (NEW from Meeting 2)
+### 3.3 Two-pass categorization
 
-Inspired by the n8n workflow the professor referenced, every incoming email is classified into one of four buckets:
+**Status: implemented**
 
-| Bucket | Action | What user sees |
-|--------|--------|----------------|
-| Urgent | Summarize + draft reply | Top of dashboard, ready-to-edit response |
-| Summarize | Brief summary | Mailing list digest section of dashboard |
-| Spam | Filter out | Hidden by default, optional review |
-| Personal | Excluded from work workflows | Separate filter, never federated |
+The categorizer separates cheap, high-precision decisions from expensive, ambiguous ones.
 
-This classification is in addition to the multi-label semantic categories that the user discovers through clustering.
+1. **Organize (fast)** ranks active category prototypes by cosine similarity. It assigns the top
+   category only when the top score is at least `0.78` and leads the runner-up by at least `0.10`.
+2. **Refine (accurate AI)** clusters unresolved mail for efficient processing, shortlists plausible
+   existing categories, and uses a strong deterministic gate for unambiguous cases. Remaining cases
+   are proposed by the selected generation model.
+3. A deterministic adjudicator verifies that each model result belongs to the email's shortlist and
+   is supported by embedding rank, margin, and independent text evidence. It may accept, override,
+   or abstain.
+4. Automatic Refine results are capped at two labels. User corrections can express a wider personal
+   organization and are never overwritten by automatic reruns.
 
-### Dashboard View (NEW)
+The language model cannot create a category during Refine. It chooses among existing candidates;
+new taxonomy elements use the discovery workflow described below.
 
-First thing the user sees when opening the extension. Shows:
-- Urgent items requiring response (with auto-drafts)
-- Mailing list summaries (digests of recent activity)
-- Recent activity overview
-- Spam count (collapsed)
-- Personal emails (separate view)
+### 3.4 Category discovery and maintenance
 
-### Multi-Label Semantic Categories
+**Status: implemented, with experimental options**
 
-Beyond the four triage buckets, emails get semantic tags discovered through LLM topic discovery and centroid similarity:
-- "Student Applications", "Research - AAAI", "Department Meetings", etc.
-- An email can have multiple tags (multi-label via similarity threshold)
-- Category names support `/` as hierarchy separator (e.g., `CPS2/Applications/2026`). UI renders as tree.
-- User can rename, merge, split, delete, create tags
-- System learns from confirmations and corrections (centroid running mean)
+There are two related discovery paths:
 
-### Existing Folder Structure Import (NEW)
+- **Initial Re-discover** selects a bounded, deterministic view of the inbox and asks the model to
+  name useful purpose-based topics. Cluster-representative sampling is available as an experimental
+  alternative to sender-oriented sampling.
+- **Residual discovery** selects uncategorized and low-confidence automatic assignments, excludes
+  every user-confirmed assignment, and groups the residual with bounded deterministic leader
+  clustering. A local model names candidate clusters; deterministic cohesion, separation,
+  duplicate, and naming checks decide whether a proposal is safe to show.
+
+Accepted candidates are stored as inactive suggestions. The review queue supports:
 
-On first run, AI MailPilot scans the user's existing folder tree in Thunderbird and offers to use it as a starting point:
-- Each existing folder becomes an implicit category
-- Centroid computed from emails currently in that folder
-- New emails get suggested for these existing folders, not just newly discovered categories
-- User can keep, rename, merge, or ignore each imported category
-- Respects existing organization rather than replacing it
-
-### Bulk Operations (NEW)
-
-Single-email categorization is too slow for inboxes with thousands of emails. The dashboard supports:
-- Select multiple emails -> apply tag or move to folder in one action
-- "Auto-categorize this folder right now" (background batch with progress)
-- Per-rule actions: "All emails from this mailing list always go to Folder X"
-
-### Mailing List Detection and Per-List Rules (NEW)
-
-Mailing lists deserve different treatment than one-off emails:
-- Auto-detect mailing lists via `List-Unsubscribe` header and `From` patterns
-- Group emails by list
-- Per-list digest in dashboard ("This week on the AAAI list: 12 emails, key topics...")
-- Per-list rules: "Always summarize, never urgent" or "Always move to Newsletters folder"
+- adding a new category;
+- merging overlapping automatic categories;
+- splitting a loose automatic category into validated children; and
+- retiring an empty automatic category.
 
-### Awaiting Response Tracking (NEW)
+Applying a proposal is transactional. Category identifiers and canonical keys remain stable;
+aliases preserve prior names; user provenance survives approved moves; and no structural proposal
+changes the taxonomy before approval.
 
-The professor explicitly wants to ensure he replies to everyone who needs an answer:
-- Emails classified as Urgent are tracked
-- System detects when a reply has been sent (Sent folder check)
-- "Awaiting Response" view shows urgent emails that have not received a reply
-- Removes false anxiety: he can see what genuinely needs his attention
+### 3.5 Learning from corrections
 
-### Chat with Mailbox (Inside Thunderbird)
+**Status: implemented**
 
-- Sidebar tab in Thunderbird extension
-- Natural language queries
-- RAG: retrieves relevant emails, feeds to LLM, returns answer with sources
-- Conversation history for follow-ups
-- Sources are clickable to jump to source emails
-
-### Federated Learning (Tier 3)
-
-Two primary use cases:
-- **Spam improvement**: collective spam detection. Each user sees different spam, federation helps catch new patterns faster.
-- **Cross-team awareness**: knowing if a colleague has already acted on a shared institutional email.
-
-Privacy guarantees:
-- Personal emails never federated
-- Only centroids and aggregated signals shared
-- Email content stays local
-
----
-
-## Scope Tiers
-
-### Tier 1 - Core (MUST)
-The Thunderbird-only product. Ships as a complete app.
-
-- Thunderbird extension scaffold (sidebar, context menus, settings, dashboard)
-- Onboarding wizard (detect LLM runtime, model presets, choose folders, import existing folder structure)
-- Email push from extension to Core (text + metadata via Thunderbird APIs)
-- Multi-account support (account_id on every record)
-- Embedding computation via OpenAI-compatible API (local Ollama or institutional)
-- sqlite-vec for vector storage (no separate vector DB process)
-- Triage classification (urgent / summarize / spam / personal)
-- Personal email detector (conservative defaults, strictly excluded from federation)
-- LLM topic discovery + centroid similarity for multi-label categorization
-- Category names support `/` hierarchy separator, UI renders as tree
-- Category manager (rename, merge, split, delete, create)
-- Email categorization with confidence scores and explanations
-- Multi-label tag and folder assignment
-- Bulk operations (select N emails -> apply tag or move)
-- Existing folder structure bootstrap (use current folders as initial categories)
-- Mailing list detection and per-list rules
-- Awaiting Response tracking (urgent items without a reply yet)
-- Learning loop (centroid updates, classification feedback)
-- Dashboard view (urgent + drafts, mailing list digests, awaiting response, recent)
-- Auto-draft reply generation for urgent emails (always user-reviewed, never auto-sent)
-- Auto-classify on new email arrival (opt-in)
-- DB migration framework from day 1 (schema versioning in Core)
-- Structured logging (pino) to local file, exportable diagnostics
-- Category export/import (JSON, GDPR compliance and backup safety)
-- i18n (English + French)
-- Progress indicators for all long-running tasks
-- Graceful degradation (LLM offline, model missing, Core not running)
-
-### Tier 2 - RAG Chat (SHOULD)
-Chat panel inside Thunderbird extension.
-
-- Chat UI tab in Thunderbird sidebar
-- Query embedding -> sqlite-vec similarity search -> LLM answer
-- Source attribution with clickable links
-- Conversation history (multi-turn)
-- Search filters (date range, folder, sender)
-
-### Tier 3 - Shared Vocabulary + Spam Federation (COULD)
-Org-wide intelligence sharing, scoped conservatively. Not full federated learning (that has Byzantine robustness, differential privacy, and other research-grade requirements out of scope here). Instead, two concrete features that deliver most of the value safely.
-
-- Lightweight central server (Node.js)
-- Organization authentication (OIDC or org SSO, deferred until institutional mode)
-- **Shared category vocabulary**: organization-curated category labels (e.g., "Student Applications", "AAAI Submissions") that all users can adopt. Centroids are local per user, but vocabulary is shared. Avoids the privacy/robustness issues of model federation while still solving the "everyone reinvents the same categories" problem.
-- **Shared spam signals**: aggregated spam fingerprints (sender domains, message hashes, not content). Each user's spam corrections improve everyone's spam detection.
-- **Cross-team awareness**: when multiple users receive the same email (CC chains, mailing lists), surface who has already acted on it. No email content shared, just message-id + action-taken signals.
-- Personal emails strictly excluded from federation
-- Extension works standalone OR with org server (configurable)
-
-### Optional - MCP Wrapper (LOW PRIORITY)
-- Thin MCP server interface on Core
-- Exposes existing REST endpoints as MCP tools
-- Documented in README for Claude Desktop / Copilot users
-- No custom MCP client built by us
-
-### Future Work (NOT in this iteration)
-- Knowledge graph / Graphify (alternative to vector retrieval)
-- Federated knowledge graph
-- Architecture supports plugging these in later
-
----
-
-## Model and Runtime Choices
-
-### LLM Runtime Modes
-
-The user picks one of three modes during onboarding:
-
-| Mode | Description | Privacy |
-|------|-------------|---------|
-| Local Ollama (default) | Runs models on user's machine | Fully private |
-| Institutional Server | Org-hosted LLM accessible via VPN | Stays within org |
-| Custom OpenAI-compatible | User provides URL + credentials | Depends on provider |
-
-All modes use the same OpenAI-compatible API. Configuration includes URL, port, optional auth.
-
-### Model Presets (when using local Ollama)
-
-| Preset | Embedding Model | Generation Model | Total Size | Min RAM |
-|--------|----------------|-----------------|-----------|---------|
-| Lightweight | nomic-embed-text (274 MB) | phi3.5:3.8b (2.2 GB) | ~2.5 GB | 4 GB |
-| Recommended | bge-m3 (1.2 GB) | mistral:7b (4.1 GB) | ~5.3 GB | 8 GB |
-| Maximum Quality | bge-m3 (1.2 GB) | mistral-nemo:12b (7.1 GB) | ~8.3 GB | 16 GB |
-| Custom | User's choice | User's choice | Varies | Varies |
-
-### Why These Models
-
-- **bge-m3** (embedding): Best multilingual quality. Handles French + English natively. 1024 dimensions.
-- **nomic-embed-text** (embedding fallback): Smaller, faster. 768 dimensions.
-- **mistral:7b** (generation): French company (Mistral AI). Excellent French support. Fits 8B hardware limit.
-- **phi3.5:3.8b** (generation fallback): Half the size, runs on weaker hardware.
-- **mistral-nemo:12b** (generation premium): Best quality, needs 16GB+ RAM.
-
----
-
-## Storage Architecture
-
-**Single database**: SQLite via better-sqlite3 with the **sqlite-vec** extension for vector search. One file, one transaction model, easy backup, no separate process.
-
-### Schema (high level)
-
-- `accounts` - account_id, address, type (personal/work/institutional)
-- `categories` - id, account_id, label (supports `/` hierarchy), description, source (auto/user/imported), created_at, updated_at
-- `emails` - message_id, account_id, folder, subject, from, date, has_attachments
-- `embeddings` (sqlite-vec virtual table) - email_id, model_id, vector
-- `centroids` (sqlite-vec virtual table) - category_id, model_id, vector
-- `email_categories` - email_id, category_id, confidence, assigned_by (user/auto)
-- `triage` - email_id, bucket (urgent/summarize/spam/personal), reasoning, classified_at
-- `awaiting_response` - email_id, marked_urgent_at, replied_at (null if no reply yet)
-- `drafts` - email_id, draft_body, model_used, approved (bool)
-- `mailing_lists` - list_id, account_id, name, rules (json)
-- `conversations` - id, account_id, history (json), updated_at
-- `migrations` - version, applied_at
-
-All vectors keyed by `(email_id, model_id)` or `(category_id, model_id)` so model changes invalidate cleanly without data loss.
-
----
-
-## Timeline - 12 Weeks
-
-### Phase 0: Foundation (Weeks 1-2)
-**Goal**: Working Core Server + extension skeleton + LLM runtime integration
-
-| Week | Deliverables |
-|------|-------------|
-| W1 | DONE: Repository setup, monorepo, build pipeline, CI, ESLint, Prettier, Vitest, Vite (extension), tsup (core), Fastify, i18n (EN+FR). Health endpoint working. |
-| W2 | OpenAI-compatible client in Core (configurable URL, optional auth header). sqlite-vec integration with schema migration framework. pino logging to local file. account_id baked into schema. Onboarding wizard UI in extension (detect runtime, pick mode, model preset, choose folders, scan existing folder structure). Settings page (LLM URL, models, mode toggle). REST API contracts finalized. Email-push endpoint in Core. Thunderbird API integration in extension (read folders, read messages, fetch full body). |
-
-**Milestone 1**: Core Server runs locally with persistent DB. Extension installs in Thunderbird, talks to Core, user can configure runtime mode, select folders, and existing folder structure is imported as categories.
-
----
-
-### Phase 1: Embedding Pipeline (Weeks 3-4)
-**Goal**: Emails get embedded and cached efficiently
-
-| Week | Deliverables |
-|------|-------------|
-| W3 | Extension fetches email content via Thunderbird APIs and pushes to Core. Text preprocessing in Core (strip HTML, normalize, truncate to model token limit). Embedding service via OpenAI-compatible API. sqlite-vec persistence (store/retrieve by message_id + model_id). |
-| W4 | Batch embedding orchestrator (paginated processing, progress tracking, pause/resume). Auto-index listener for new email events (opt-in). Cache invalidation on model change (re-index workflow with user confirmation). Progress UI in extension sidebar with cancel/pause controls. |
-
-**Milestone 2**: User indexes a folder, sees real-time progress, embeddings cached in sqlite-vec. Auto-index works for new emails. Switching models triggers controlled re-index.
-
----
-
-### Phase 2: Triage + Multi-Label Categorization + Dashboard (Weeks 5-7)
-**Goal**: Triage buckets + LLM topic discovery + dashboard with actionable views
-
-| Week | Deliverables |
-|------|-------------|
-| W5 | Triage classifier in Core (LLM with structured JSON output: urgent / summarize / spam / personal + reasoning). Personal email detector (conservative defaults, dual-signal: heuristic + LLM). Spam detection. Mailing list detection (List-Unsubscribe header, sender patterns). Auto-draft reply generation for urgent emails. REST endpoints for triage and drafts. Awaiting Response tracking (Sent folder watcher). |
-| W6 | LLM topic discovery (sample N emails -> identify topics -> compute centroids from matched emails). Centroid storage in sqlite-vec. Threshold-based multi-label assignment. Category UI in extension (list with hierarchy support via `/` separator). Manual category editing (rename, merge, split, delete, create). Existing folder structure import wizard. |
-| W7 | Email categorization flow (right-click -> ranked categories with confidence + explanations). Multi-label tag and folder suggestions. Learning loop (centroid running mean on confirmations, correction handling). Dashboard view (urgent + drafts, mailing list digests, awaiting response, recent activity, spam count, personal section). Bulk operations UI (select N emails -> apply tag or move). Per-mailing-list rules. |
-
-**Milestone 3**: Full Tier 1 loop works end-to-end. Professor opens Thunderbird, dashboard shows urgent items with drafts + mailing list digests + awaiting response. Existing folders imported as categories. Bulk operations functional.
-
----
-
-### Phase 3: Polish & Ship Core (Weeks 8-9)
-**Goal**: Production-quality release
-
-| Week | Deliverables |
-|------|-------------|
-| W8 | Thunderbird tag and folder sync (changes from extension reflect on IMAP server). Edge cases (empty folders, single-email categories, LLM unavailable, Core not running, DB locked, disk full, network drop mid-batch). Error handling and structured logging (pino). Performance optimization on 5000+ email mailbox. Category export/import (JSON). Diagnostics export button in settings. |
-| W9 | Full i18n pass (EN + FR). Accessibility (keyboard nav, screen reader labels, focus management). Help panel inside extension. Onboarding polish. ATN packaging and manifest compliance. Core Server installer/launcher per platform (Windows/Mac/Linux). First ATN submission. |
-
-**Milestone 4**: Tier 1 submitted to Thunderbird Add-on Store. Production-quality on 5000+ email mailbox.
-
----
-
-### Phase 4: RAG Chat (Weeks 10-11)
-**Goal**: Ask your mailbox inside Thunderbird
-
-| Week | Deliverables |
-|------|-------------|
-| W10 | Chat UI tab in Thunderbird sidebar. Query embedding -> sqlite-vec similarity search -> top-k retrieval -> context assembly -> LLM generation. REST endpoints for chat. Conversation persistence in DB. |
-| W11 | Source attribution with clickable references to source emails. Multi-turn conversation history. Search filters (date range, folder, sender, category). Personal emails excluded from chat results by default (toggle to include). Performance optimization for large result sets. Optional: thin MCP wrapper on Core + README docs for Claude Desktop / Copilot integration (configuration-only, no custom client). |
-
-**Milestone 5**: Professor asks natural language questions inside Thunderbird and gets sourced answers. Personal emails respected.
-
----
-
-### Phase 5: Shared Vocabulary + Spam Federation + Final Polish (Week 12)
-**Goal**: Org-wide intelligence (conservative scope) + release
-
-| Week | Deliverables |
-|------|-------------|
-| W12 | If time allows: lightweight central server (Node.js + Fastify) for shared vocabulary and spam fingerprint aggregation. Strict personal email exclusion enforced client-side before any upload. Cross-team awareness signals (message_id-based, no content). Final docs (README, CONTRIBUTING, user guide, privacy policy). Demo video. ATN listing update with screenshots. |
-
-**Milestone 6**: Final product delivered. Org-wide federation prototype runs at Ecole des Mines if time permits, else clearly documented for future work.
-
----
-
-## Technology Stack
-
-| Component | Technology | Rationale |
-|-----------|-----------|-----------|
-| Language | TypeScript (strict mode) | Type safety, maintainability |
-| Core Server runtime | Node.js 20+ | Ecosystem, libraries, OpenAI-compatible clients |
-| Core Server framework | Fastify | Lightweight, fast, schema-based |
-| Extension API | Thunderbird MailExtension API (WebExtension) | Only supported API for TB 115+ |
-| Build tool | Vite (extension) + tsup (core) | Fast TS compilation |
-| Monorepo | npm workspaces | Shared types between core and extension |
-| Linting | ESLint + Prettier | Code consistency |
-| Testing | Vitest | Fast, TS-native |
-| LLM runtime | OpenAI-compatible API (Ollama default, institutional / LM Studio / vLLM / custom) | Same contract for all modes, no vendor lock-in |
-| Embedding model (default) | bge-m3 | Best multilingual (FR+EN), 1024 dim |
-| Generation model (default) | mistral:7b | French company, fits 8B limit |
-| Storage (everything) | SQLite via better-sqlite3 + sqlite-vec extension | Single file, vector + SQL in one DB, no separate process, easy backup |
-| Migrations | Lightweight versioned migrations in Core | Required from day 1 |
-| Logging | pino to local file | Structured, exportable diagnostics |
-| Clustering / categorization | LLM topic discovery + cosine similarity to centroids | Multi-label, no preset K, no missing JS library |
-| Email source | Thunderbird APIs (NOT separate IMAP) | Single source of truth, no double-fetching |
-| IPC (Extension <-> Core) | HTTP REST localhost:3420 with bearer token (MVP) | Simple. Native Messaging upgrade path for production. |
-| Deployment modes | Local Core (MVP default) OR institutional Core (config swap) | Both supported, MVP ships local |
-| Config storage (Extension) | browser.storage.local | Native to WebExtension |
-| Heavy computation | Worker threads (Core) | Non-blocking embeddings, similarity batches |
-| i18n | Thunderbird i18n API (browser.i18n) | Native, follows ATN conventions |
-| CI/CD | GitHub Actions | Automated build, lint, test |
-| Distribution | ATN (extension) + npm/binary (core) | Official channels |
-
----
-
-## Repository Structure
-
-```
-ai-mailpilot/
-├── .github/
-│   └── workflows/
-│       └── ci.yml
-├── packages/
-│   ├── shared/        # Shared types and constants
-│   ├── core/          # Core server (Fastify + AI engines + sqlite-vec)
-│   └── extension/     # Thunderbird extension (UI + Thunderbird API integration)
-├── docs/
-│   ├── PROJECT_PLAN.md
-│   ├── COMPETITIVE_ANALYSIS.md
-│   └── AI_MailPilot_Overview.docx
-├── package.json
-├── LICENSE
-├── README.md
-└── CONTRIBUTING.md
+- A user correction atomically replaces the selected message's category assignments with
+  `assigned_by = user` provenance.
+- Automatic category jobs skip user-confirmed messages.
+- A correction immediately nudges the relevant aggregate prototype. When at least three trusted
+  examples exist, a full rebuild derives the prototype from user-confirmed members.
+- If experimental multi-prototype categories are enabled, a broad category can retain its aggregate
+  prototype and several sub-prototypes. Matching uses the nearest prototype for that category.
+- Automatic evidence may bootstrap a category without trusted examples, but it does not displace a
+  user-grounded prototype.
+
+### 3.6 Existing Thunderbird organization
+
+**Status: partially implemented**
+
+- Synchronization records non-MailPilot Thunderbird tags and meaningful folder names separately
+  from AI-owned categories.
+- The dashboard summarizes existing organization, and discovery can use aggregated labels and
+  representative subjects as weak hints.
+- AI-created Thunderbird tags use a `mailpilot_` namespace and collision-safe canonical keys.
+- Applying AI tags does not remove the user's own tags.
+- Folder organization is previewed before messages move and records a ledger that supports rollback.
+
+The API can propose existing labels that may seed categories, but a complete select-and-import UI is
+not implemented.
+
+### 3.7 Priority triage and calendar capture
+
+**Status: implemented**
+
+- The triage model returns a bucket plus structured action, reply, deadline, importance, suggested
+  action, and short-summary fields.
+- Deterministic normalization prevents routine code-platform notifications from becoming urgent
+  solely because they contain urgent-sounding words.
+- Today's Focus supports Today, Last 7 days, and All ranges; Needs Action, Important Updates,
+  Summaries, and Low Priority sections; and a 14-day carryover for unresolved actionable mail.
+- Done, Snooze, Dismiss, and Reset are persisted and survive reclassification.
+- Event extraction rides on the triage call. Captured meetings, appointments, and dated deadlines
+  appear in priority results, are retrievable by chat, and can be exported as `.ics` files.
+
+Calendar capture does not write directly to Google Calendar, Outlook Calendar, or a CalDAV server.
+
+### 3.8 Chat and retrieval-augmented generation
+
+**Status: implemented**
+
+- Retrieves lexical and semantic candidates from emails and attachments, fuses rankings, and can
+  rerank the result before generation.
+- Understands explicit dates and relative time windows, sender and topic references, aggregate
+  questions, named documents, follow-up questions, and English/French term expansion.
+- Deduplicates versions of similar documents and surfaces conflicting or rescheduled information
+  rather than silently choosing one version.
+- Includes captured calendar events in relevant date and schedule questions.
+- Stores conversations and a bounded summary of older turns for context management.
+- Streams grounded answers with source metadata that the extension can open in Thunderbird.
+
+Experimental options provide a local cross-encoder reranker and a model-based query-understanding
+step. Both are disabled by default.
+
+### 3.9 Opened-message assistant
+
+**Status: implemented**
+
+- Generates and caches a structured summary for the opened message, including key points, action
+  required, reply required, deadline, suggested action, and attachment status.
+- Invalid or truncated model JSON degrades to safe defaults instead of crashing the panel.
+- Generates a professional, editable reply draft with an optional instruction for tone, language,
+  or content.
+- Opens the Thunderbird reply composer with the draft. It never sends mail automatically.
+- Summary cache keys include message content, attachment state, model, and provider, so stale results
+  are regenerated after relevant input changes.
+
+## 4. Data Model
+
+The schema currently contains 26 forward migrations. Major storage groups are:
+
+| Area | Stored data |
+| --- | --- |
+| Accounts and email | Account metadata, headers, bodies, sync state, and user label snapshots |
+| Search | Email and attachment FTS5 indexes; email, attachment, and category vectors |
+| Categorization | Categories, aliases, assignments, prototype indexes, model decisions, jobs, and corrections |
+| Discovery | Suggestions, structural proposal children, evidence, status, and audit records |
+| Priority | Triage verdicts, structured metadata, resolution state, and captured calendar events |
+| Assistance | Conversations, conversation messages and summaries, and cached email summaries |
+| Reliability | Model-scoped failure records and job progress |
+
+All account-owned repository operations are scoped by `account_id`. Destructive taxonomy changes
+run inside SQLite transactions.
+
+## 5. Security Boundaries
+
+### 5.1 Controls implemented
+
+- Core binds to `localhost` and protects every route except health and pairing with a 256-bit bearer
+  token.
+- Pairing codes are six digits, single-use, valid for 15 minutes, and limited to ten attempts.
+- API input is validated with Zod or explicit route validation.
+- API responses expose a safe configuration shape and never return authentication or model API keys.
+- The database is encrypted with a random 256-bit key. Existing plaintext databases are migrated
+  through a recoverable backup-and-rekey procedure.
+- Database, key, configuration, and log paths use platform-specific application-data directories;
+  creation requests owner-only permissions.
+- Discovery has an audit trail and separate account eligibility checks.
+- Retrieved email and attachment text is marked as untrusted reference data in model prompts.
+- Markdown rendering escapes untrusted HTML before displaying model output.
+
+### 5.2 Residual risks
+
+- The database key and encrypted database live under the same operating-system account. Full account
+  compromise can expose both. This is encryption at rest, not hardware-backed secret isolation.
+- CORS currently accepts all origins. Bearer authentication still protects the API, but a stricter
+  extension-origin policy would reduce exposure if the token is compromised.
+- Some privacy guarantees rely on callers selecting the correct logical model provider. Additional
+  type-level routing constraints would reduce the chance of a future call-site error.
+- Cloud providers receive the request-specific context needed for enabled cloud tasks. Their own
+  retention and processing terms remain outside AI MailPilot's control.
+- Logs avoid routine body content, but operational errors and model diagnostics still require a
+  deliberate redaction review before broad distribution.
+
+## 6. Reliability and Performance
+
+- Incremental synchronization, embedding caching, batched work, bounded clustering coresets, and
+  per-account progress reduce repeat work on large mailboxes.
+- Processing failures are model-scoped and retried with bounded behavior. Malformed structured model
+  output is salvaged or rejected conservatively.
+- Long categorization jobs can be stopped and retain completed progress. Interrupted jobs are
+  detected after Core restarts.
+- Proposal application uses transactions so category, assignment, alias, prototype, and proposal
+  state commit or roll back together.
+- Local model timeouts remain possible. Batch triage falls back to smaller work units, but repeated
+  local inference timeouts still require a faster model, more context capacity, or a cloud opt-in.
+
+## 7. Verification
+
+The repository uses Vitest for Core and extension behavior, strict TypeScript, ESLint, Prettier, and
+build checks. Tests cover repositories and migrations, encryption and pairing, categorization gates
+and adversarial label cases, corrections, category proposals and rollback, attachment extraction,
+retrieval and conversation memory, priority state, event capture, message-assistant behavior, tag
+collisions, folder matching, and UI formatting helpers.
+
+The CI matrix runs on Node.js 20 and 22. The local release gate is:
+
+```bash
+npm run typecheck
+npm run lint
+npm run format:check
+npm test
+npm run build
 ```
 
-The previously-planned `cli` package has been removed - it was redundant given Claude Desktop and VS Code Copilot already exist as MCP clients, and per the professor's guidance the project should focus on Thunderbird.
+The test suite establishes deterministic behavior and guards regressions. It does not establish
+real-world classification accuracy. A labelled multilingual evaluation corpus and measured
+precision, recall, calibration, and latency remain necessary for a quantitative claim.
 
----
+## 8. Deliberately Deferred or Experimental Work
 
-## Risk Register
+| Item | Current position |
+| --- | --- |
+| Multi-prototype category matching | Implemented behind an experimental flag; off by default |
+| Cluster-representative initial discovery | Implemented behind an experimental flag; off by default |
+| Local cross-encoder reranking | Implemented behind an experimental flag; requires Python dependencies |
+| Model-based query understanding | Implemented behind an experimental flag; off by default |
+| Python UMAP/HDBSCAN clustering | Standalone evaluation sidecar, not wired into the production Core path |
+| Existing-label category import | Suggestion API exists; apply UI is incomplete |
+| Direct calendar-provider write | Not implemented; `.ics` export is implemented |
+| Parent/child category hierarchy | Not implemented |
+| Taxonomy version-diff UI | Not implemented |
+| Federated learning | Not implemented; research/future work only |
+| MCP server | Not implemented |
+| Institutional control plane | Not implemented |
 
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| Thunderbird WebExtension API does not expose required email data (full body, threading, etc.) | Medium | High | Prototype in W2 before committing. If gaps exist, fall back to a read-only IMAP adapter only for missing fields (extension still owns state). |
-| LLM topic discovery quality on small mailboxes | Medium | Medium | Allow manual category creation as primary escape hatch. Use existing folder import to bootstrap. Re-run topic discovery as more emails are categorized. |
-| Triage classifier accuracy | High | Medium | Use few-shot prompts with structured JSON output. User corrections feed back into per-user thresholds. Track accuracy metrics. |
-| Personal email detection accuracy | High | High | Dual-signal (heuristic + LLM both must agree to mark "work"). Conservative default to personal when uncertain. Audit log of federated items. |
-| LLM runtime latency for bulk triage on 5000+ emails | High | High | Run as background batch with progress UI. Allow overnight indexing. Document expected time. Plan v2 with classifier head for speed. |
-| sqlite-vec performance at 100k+ vectors | Low | Medium | Production-tested at much larger scale (Spotify). Benchmark in W2 with synthetic data. Fallback: switch to Qdrant only if hit ceiling. |
-| Auto-draft reply quality or inappropriate content | Medium | Medium | Always require user review. Show "AI Draft" banner. Never auto-send. Track accept/reject rates. |
-| Embedding model change invalidates all data | Medium | High | Lock model after first index. Re-index requires explicit user confirmation. Document trade-off. |
-| Category labels lost on uninstall or migration | Low | High | Export/import as JSON from settings. Document backup workflow. |
-| Cross-team awareness leaks personal info | Medium | High | Strict opt-in. Personal emails strictly excluded. Audit log of what got shared. |
-| Core Server lifecycle UX on user laptops | High | High | MVP uses HTTP REST on localhost (simple). Document startup. Plan Native Messaging Host upgrade for production (auto-spawned by Thunderbird). |
-| Localhost REST API accessible to other apps | Medium | High | Bearer token auth (token exchanged via browser.storage.local). DNS rebinding protection. Upgrade to Native Messaging removes this concern entirely. |
-| Multi-account schema retrofitting | Low | High | Already mitigated: account_id baked in from day 1. |
-| Scope creep into Tier 3 at expense of Tier 1 quality | High | High | Strict milestone gates. Tier 1 must ship to ATN before Tier 3 starts. |
-| MCP wrapper drifts from REST API | Low | Low | Keep MCP wrapper as thin adapter generated from REST schema. |
+## 9. Next Engineering Priorities
 
----
+1. Build a privacy-safe labelled evaluation set and publish categorization, retrieval, triage, and
+   latency measurements by language and model.
+2. Complete the user-label-to-category import flow with preview, explicit selection, and rollback.
+3. Harden localhost transport with a restricted CORS policy, broader log redaction, and clearer key
+   backup/recovery guidance.
+4. Add browser-level end-to-end tests for onboarding, synchronization, proposal review, Priority,
+   chat citations, message assistance, tag collisions, and folder rollback.
+5. Validate experimental multi-prototype and cross-encoder modes before considering either as a
+   default.
 
-## Success Criteria
-
-| Criterion | Metric |
-|-----------|--------|
-| Technical depth | Two-piece architecture with Thunderbird Extension + Core. sqlite-vec for vector storage. LLM topic discovery for multi-label categorization. OpenAI-compatible runtime abstraction. Learning loop. RAG. Multi-account. Migration framework. Optional MCP wrapper. |
-| Usability | Zero-to-organized in under 5 minutes. Dashboard shows urgent items + drafts + mailing list digests + awaiting response on first launch after indexing. Existing folder structure imported as starter categories. |
-| Problem-solving | Professor sees urgent emails with auto-drafts on dashboard. Categories are meaningful and respect his existing folder organization. Personal emails correctly filtered. Bulk operations let him categorize hundreds of emails in seconds. Mailing lists get their own digests. |
-| Impact | Published on ATN. Handles 5000+ email mailbox. Works on 8B model hardware. Can be deployed locally (default) OR institutionally (config swap). |
-| Code quality | TypeScript strict mode. > 80% test coverage on Core services. CI passes on all PRs. Migrations versioned. Logs structured. |
-| Privacy | Email content never leaves the local machine in default mode. Personal emails strictly excluded from any external traffic. Configurable runtime modes. Bearer token auth on localhost. Category export for GDPR compliance. |
+These priorities improve evidence, safety, and usability without expanding the product into
+unimplemented federation or external-agent integrations.
